@@ -1,0 +1,173 @@
+# ===== Workflow 元数据 =====
+name: bug-fix-pipeline
+version: "1.0.0"
+description: "AIOps 智能体工作流 - 诊断 + 修复 + 审批 + 提交（design §8.1）"
+
+# ===== Workflow 入参 =====
+inputs:
+  bug_report:
+    type: object
+    required: true
+    description: "来自 ServiceNow/Alertmanager 的原始事件"
+  repos:
+    type: object
+    required: false
+    description: "服务到仓库的映射；不提供则由 CMDB 查询"
+
+# ===== 节点定义 =====
+nodes:
+  # ===== 诊断阶段（只读，on_failure 负证据策略）=====
+  triage:
+    agent: triage
+    params: { bug: "$.inputs.bug_report" }
+    on_failure: abort
+
+  logs:
+    agent: log-analyst
+    params: { bug: "$.nodes.triage.output.summary" }
+    on_failure: continue
+
+  trace:
+    agent: trace-analyst
+    params: { bug: "$.nodes.triage.output.summary" }
+    on_failure: abort
+
+  metrics:
+    agent: metrics-analyst
+    params: { bug: "$.nodes.triage.output.summary" }
+    on_failure: continue
+
+  infra:
+    agent: infra-locator
+    params: { bug: "$.nodes.triage.output.summary" }
+    on_failure: continue
+
+  locate:
+    agent: code-locator
+    params:
+      bug: "$.nodes.triage.output.summary"
+      target_service: "$.nodes.trace.output.failing_service"
+    on_failure: abort
+
+  know:
+    agent: knowledge-lookup
+    params: { bug: "$.nodes.triage.output.summary" }
+    on_failure: continue
+
+  rca:
+    agent: root-cause
+    params:
+      logs: "$.nodes.logs.output.summary"
+      trace: "$.nodes.trace.output.summary"
+      metrics: "$.nodes.metrics.output.summary"
+      infra: "$.nodes.infra.output.summary"
+      code: "$.nodes.locate.output.summary"
+      know: "$.nodes.know.output.summary"
+    on_failure: abort
+
+  plan:
+    agent: fix-planner
+    params: { rca: "$.nodes.rca.output" }
+    on_failure: abort
+
+  # ===== 修复阶段（并行，join: all）=====
+  fix:
+    agent: fix-implementer
+    params: { plan: "$.nodes.plan.output" }
+    retry: 2
+
+  remediate:
+    agent: infra-remediator
+    params: { plan: "$.nodes.plan.output" }
+    retry: 1
+
+  # ===== 合并审批节点（join: all —— 等待 fix + remediate 都完成，保证合并展示）=====
+  approve-changes:
+    kind: approval
+    name: "审批修复方案"
+    join: all
+    required_edges: [fix, remediate]
+    params:
+      diff: "$.nodes.fix.output.diff"
+      k8s_changes: "$.nodes.remediate.output.changes"
+      plan: "$.nodes.plan.output"
+    approvers: ["lead-engineer", "security-team"]
+    timeout: 3600
+    on_reject: abort
+
+  # ===== 测试阶段 =====
+  test:
+    agent: tester
+    params:
+      fix: "$.nodes.fix.output"
+      remediate: "$.nodes.remediate.output"
+    retry: 1
+
+  review:
+    agent: reviewer
+    params: { diff: "$.nodes.fix.output.diff" }
+
+  approve-commit:
+    kind: approval
+    name: "审批代码提交"
+    params:
+      diff: "$.nodes.fix.output.diff"
+      test: "$.nodes.test.output"
+    approvers: ["lead-engineer"]
+    timeout: 7200
+    on_reject: abort
+
+  commit:
+    agent: committer
+    params:
+      diff: "$.nodes.fix.output.diff"
+      test: "$.nodes.test.output"
+
+  recap:
+    agent: postmortem
+    params:
+      rca: "$.nodes.rca.output"
+      fix: "$.nodes.fix.output"
+      remediate: "$.nodes.remediate.output"
+      status: "$.nodes.commit.status"
+
+# ===== 边定义（when 条件边 + skip 传播）=====
+edges:
+  # 诊断链
+  - { from: triage, to: logs }
+  - { from: triage, to: trace }
+  - { from: triage, to: metrics }
+  - { from: triage, to: infra }
+  - { from: triage, to: locate }
+  - { from: triage, to: know }
+  - { from: trace, to: locate }
+  - { from: logs, to: rca }
+  - { from: trace, to: rca }
+  - { from: metrics, to: rca }
+  - { from: infra, to: rca }
+  - { from: locate, to: rca }
+  - { from: know, to: rca }
+  - { from: rca, to: plan }
+
+  # 修复链（并行，join: all）
+  - { from: plan, to: fix }
+  - { from: plan, to: remediate }
+  - { from: fix, to: approve-changes }
+  - { from: remediate, to: approve-changes }
+
+  # 审批通过 → 测试；拒绝 → 复盘
+  - { from: approve-changes, to: test, when: "$.nodes.approve-changes.output.approved == true" }
+  - { from: approve-changes, to: recap, when: "$.nodes.approve-changes.output.approved == false" }
+
+  # 测试通过/失败都有出口
+  - { from: test, to: review, when: "$.nodes.test.output.passed == true" }
+  - { from: test, to: recap, when: "$.nodes.test.output.passed == false" }
+
+  # 审查通过/失败都有出口
+  - { from: review, to: approve-commit, when: "$.nodes.review.output.approved == true" }
+  - { from: review, to: recap, when: "$.nodes.review.output.approved == false" }
+
+  # 审批 → 提交
+  - { from: approve-commit, to: commit, when: "$.nodes.approve-commit.output.approved == true" }
+  - { from: approve-commit, to: recap, when: "$.nodes.approve-commit.output.approved == false" }
+  - { from: commit, to: recap }

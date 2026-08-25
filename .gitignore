@@ -1,0 +1,29 @@
+# 环境 / 密钥
+.env
+*.env
+!*.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 本地运行时数据
+*.db
+*.sqlite3
+data/
+tmp/
+workspace/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

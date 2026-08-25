@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentflow"
+version = "0.1.0"
+description = "AIOps Bug Fix 智能体平台后端 — design-v5.2 (M0-M2 脚手架)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+
+dependencies = [
+    # 智能体运行时（design §5 锁定 2.0.3；升级前需重跑 S-001/S-011）
+    "agentscope==2.0.3",
+    "pyyaml>=6.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "python-dotenv>=1.0",
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    # DeepSeek（OpenAI 兼容）经 AgentScope OpenAI 模型接入
+    "openai>=1.60",
+    # 生产适配器（M6 前为占位）
+    "aiosqlite>=0.20",
+    "psycopg[binary]>=3.1",
+    "kafka-python>=2.0",
+    "redis>=5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "ruff>=0.5",
+]
+
+[tool.setuptools.packages.find]
+include = ["agentflow*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
