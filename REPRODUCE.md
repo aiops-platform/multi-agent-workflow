@@ -150,15 +150,46 @@ curl -s --max-time 8 -X POST "http://localhost:18080/checkout?orderId=ORD2026081
 
 ---
 
-## 6. 停止 / 清理
+## 6. M4 沙箱验证（独立执行 Pod，design §4.1 / §10.2）
+
+### 6.1 构建沙箱镜像 + 加载
+```bash
+cd $BACKEND
+# exec 服务是纯 stdlib（http.server），零 pip 依赖 → 离线可建
+docker build -t agentflow-sandbox:latest -f docker/sandbox/Dockerfile .
+# 需要 Java 编译（fix-implementer/tester 编译 Java 代码）时：
+#   docker build --build-arg WITH_JDK=1 -t agentflow-sandbox:latest -f docker/sandbox/Dockerfile .
+minikube image load agentflow-sandbox:latest
+```
+
+### 6.2 K8s 端到端验证
+```bash
+cd $BACKEND
+./venv/bin/python scripts/verify_sandbox.py
+# 期望输出：
+#   run_python: 沙箱 python OK 42        （沙箱 Pod 内真实执行）
+#   write_file /workspace: written       （挂载卷可写）
+#   超时限制: sleep2/timeout1 → timed_out（§10.2 生效）
+#   destroyed=True
+```
+
+> 说明：
+> - 本地联调用 **kubectl port-forward**（macOS 宿主不可路由 pod IP）；生产环境 Worker 在集群内直连 pod IP/ClusterIP。
+> - 沙箱 Pod 安全基线：非特权 + drop ALL capabilities + cpu 2/mem 4Gi + /workspace 卷（§10.2）。
+> - Action Executor（§10.3）：`scale_deployment[0,10]` / `restart_pod` / `patch_resources` / `delete_temp_file` 均带白名单校验，代码见 `agentflow/sandbox/action_executor.py`。
+
+---
+
+## 7. 停止 / 清理
 
 ```bash
-pkill -f 'kubectl.*port-forward'    # 停端口转发
+pkill -f 'kubectl.*port-forward'    # 停端口转发（含沙箱）
+kubectl -n agentflow delete pods -l app=agentflow-sandbox   # 清沙箱 Pod（如有）
 minikube stop                        # 停集群（保留集群数据）
 # 彻底清理：minikube delete && kubectl delete ns order
 ```
 
-## 7. 常见问题
+## 8. 常见问题
 
 | 现象 | 处理 |
 |---|---|
@@ -170,9 +201,12 @@ minikube stop                        # 停集群（保留集群数据）
 | 场景2 根因误判为场景1 的磁盘问题 | **日志窗口被污染** → 恢复上一场景 + `curl -X DELETE :19200/app-logs` 清窗后重注入 |
 | trace-analyst 把 order-service（Feign 超时）当故障服务 | get_trace 会区分「业务根因」（warranty fin 缺参）与「下游调用症状」（feign/timeout）；若仍误判，重跑一次或确保窗口干净 |
 | AgentScope streaming 收尾警告 | 无碍功能；可 `stream=False` 消除 |
+| 沙箱 Pod Error / 无法连接 | 查 `kubectl -n agentflow logs <pod>`；本地连沙箱必须 port-forward（pod IP 不可路由） |
+| 沙箱镜像构建卡死 | 网络受限 → 用纯 stdlib exec 服务（`docker/sandbox/Dockerfile` 默认无 apt/pip）；需 Java 才开 `WITH_JDK=1` |
 
-## 8. 依赖
+## 9. 依赖
 
 - 服务镜像：`order-service:latest`、`warranty-service:v1`、`gateway-service:v1`（需先构建/load 进 minikube）
 - ES 8.13.4 / Prometheus v2.53.0 / Grafana / Kibana / Filebeat（manifests 引用公共镜像，minikube 自动拉取）
 - DeepSeek API Key（`deepseek-v4-flash`）
+- 沙箱镜像：`agentflow-sandbox:latest`（本地 build + `minikube image load`，纯 stdlib 离线可建）
