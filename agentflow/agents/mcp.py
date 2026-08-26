@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from agentscope.tool import FunctionTool, Toolkit
 
-from .tools import build_l1_tools
+from .tools import build_l1_tools, build_l2_tools
 
 
 def build_toolkit(
@@ -24,13 +24,15 @@ def build_toolkit(
     mcp_clients: list | None = None,
     cmdb=None,
     datasource=None,
+    sandbox_client=None,
+    action_executor=None,
 ) -> Toolkit:
-    """为 agent 构建 Toolkit：L1 只读工具（mock / 真实数据源 / MCP client）。
+    """为 agent 构建 Toolkit：L1 只读工具 + L2 执行工具（§4.1 推理/执行分离）。
 
-    - ``use_mock=True``：L1 工具用 ``FunctionTool`` 包装 mock 实现（本地联调），
-      不依赖任何数据源凭证；传 ``cmdb`` 时 ``locate_code`` 走 CMDB（§9.4）；
-      传 ``datasource`` 时日志/指标/基础设施工具绑定真实 testbed。
-    - 数据源就绪：传 ``mcp_clients``（每个数据源一个 client），并置 use_mock=False。
+    - L1（只读，mock/真实数据源/MCP）：传 ``cmdb``→CMDB，传 ``datasource``→真实 testbed。
+    - L2（执行）：传 ``sandbox_client``（SandboxClient）→ 沙箱 run/write 工具；
+      传 ``action_executor``（ActionExecutor）→ §10.3 白名单动作工具。
+      未传执行器时 L2 工具不可用（本地不接沙箱时）。
     """
     if use_mock:
         tools = [
@@ -43,6 +45,13 @@ def build_toolkit(
             for t in build_l1_tools(agent_name, use_mock=True, cmdb=cmdb, datasource=datasource)
             if t["func"] is not None
         ]
+        for t in build_l2_tools(agent_name, sandbox_client=sandbox_client, action_executor=action_executor):
+            if t["func"] is None:
+                continue
+            tools.append(FunctionTool(
+                func=t["func"], name=t["name"], description=t["description"],
+                is_read_only=False,  # L2 是执行工具，非只读
+            ))
         return Toolkit(tools=tools)
     # 真实数据源路径：全部经 MCP client
     return Toolkit(tools=[], mcps=list(mcp_clients or []))

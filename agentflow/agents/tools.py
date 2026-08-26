@@ -113,6 +113,54 @@ def tools_for_agent(agent_name: str) -> list[ToolSpec]:
 
 
 # ======================================================================
+# L2 工具（经 SandboxClient / ActionExecutor 执行，design §4.1 / §10.3）
+# ======================================================================
+async def _l2_sandbox_run_python(sandbox_client, code: str, timeout: int = 300) -> dict:
+    r = await sandbox_client.run_python(code, timeout=timeout)
+    return {"rc": r.rc, "stdout": r.stdout, "stderr": r.stderr, "timed_out": r.timed_out}
+
+
+async def _l2_sandbox_run_shell(sandbox_client, cmd: str, timeout: int = 300) -> dict:
+    r = await sandbox_client.run_shell(cmd, timeout=timeout)
+    return {"rc": r.rc, "stdout": r.stdout, "stderr": r.stderr, "timed_out": r.timed_out}
+
+
+async def _l2_sandbox_write_file(sandbox_client, path: str, content: str) -> dict:
+    return await sandbox_client.write_file(path, content)
+
+
+async def _l2_action(sandbox_action_executor, action: str, namespace: str, **params) -> dict:
+    return await sandbox_action_executor.execute(action, namespace=namespace, **params)
+
+
+def build_l2_tools(agent_name: str, *, sandbox_client=None, action_executor=None) -> list[dict]:
+    """为 agent 生成 L2 执行工具（沙箱 gRPC/HTTP + ActionExecutor，§4.1/§10.3）。
+
+    工具名与 Tool Registry 一致；未提供对应执行器时返回空（联调未接沙箱时 L2 不可用）。
+    """
+    from functools import partial
+
+    tools = []
+    for spec in tools_for_agent(agent_name):
+        if spec.level != "L2":
+            continue
+        if spec.name in ("sandbox_run_python", "sandbox_run_shell", "sandbox_write_file") and sandbox_client is not None:
+            handler = {
+                "sandbox_run_python": _l2_sandbox_run_python,
+                "sandbox_run_shell": _l2_sandbox_run_shell,
+                "sandbox_write_file": _l2_sandbox_write_file,
+            }[spec.name]
+            tools.append({"name": spec.name, "description": spec.description,
+                          "parameters": {"type": "object", "properties": {}},
+                          "func": partial(handler, sandbox_client)})
+        elif spec.name in ("scale_deployment", "restart_pod", "patch_resources") and action_executor is not None:
+            tools.append({"name": spec.name, "description": spec.description,
+                          "parameters": {"type": "object", "properties": {}},
+                          "func": partial(_l2_action, action_executor, spec.name)})
+    return tools
+
+
+# ======================================================================
 # L1 mock 实现（本地联调用，testbed 就绪前提供确定性数据）
 # ======================================================================
 async def _mock_query_logs(service: str, level: str = "ERROR", **_: Any) -> dict:

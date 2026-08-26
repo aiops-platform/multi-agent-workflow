@@ -23,6 +23,7 @@ dependencies = [
     "openai>=1.60",
     # 生产适配器（M6 前为占位）
     "aiosqlite>=0.20",
+    "kubernetes>=30",
     "psycopg[binary]>=3.1",
     "kafka-python>=2.0",
     "redis>=5.0",
