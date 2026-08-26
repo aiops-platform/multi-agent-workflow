@@ -2,6 +2,11 @@
 
 > 目标：从零重现「故障注入 → 真实数据源采集 → AI 诊断链 → 根因输出」全过程。
 > 对应 `design-v5.2.md` + `SCENARIOS.md`，诊断链为真实 DeepSeek + 真实 testbed 数据源。
+> **两场景均已用 `../agentflow-testbed` 实测通过**（场景1 → infra_issue 0.88；场景2 → code_bug 0.95）。
+
+> ⚠️ **重要：每场景要在「干净日志窗口」运行**。诊断链查询 ES 最近 15 分钟日志，
+> 连续跑两个场景会互相污染（场景1 的 IOException 残留会干扰场景2 的定位）。
+> 场景切换前清空 ES index：`curl -X DELETE http://localhost:19200/app-logs`（filebeat 会自动重建）。
 
 **目录约定**：
 - `BACKEND` = `/Users/bo.gong/Documents/accenture/workspace/multi-agent-workflow/backend`
@@ -133,6 +138,9 @@ cd $BACKEND && source ../spike/.env
 # 期望输出：root_cause_type: code_bug（warranty-service fin 缺参），命中期望
 ```
 
+> 建议在触发结账后 **60s 内**跑诊断：此时 order-service 的 Feign 超时 ERROR 尚未落日志，
+> 窗口里只有 warranty 的 fin 缺参 ERROR，信号最干净（order 超时属于「下游调用症状」）。
+
 ### 5.4 恢复
 ```bash
 cd $TESTBED && bash fault-inject/scenario2-recover.sh
@@ -159,6 +167,8 @@ minikube stop                        # 停集群（保留集群数据）
 | ES 起不来（vm.max_map_count） | minikube docker driver 下未见此问题；若出现：`minikube ssh` 内 `sysctl -w vm.max_map_count=262144` |
 | 诊断输出 `{"note":"no_api_key"}` | 没读到 DEEPSEEK_API_KEY → `source ../spike/.env` 或检查 backend/.env |
 | trace-analyst 输出 `{}` | max_iters 不足 → 脚本已对 trace-analyst 用 12 |
+| 场景2 根因误判为场景1 的磁盘问题 | **日志窗口被污染** → 恢复上一场景 + `curl -X DELETE :19200/app-logs` 清窗后重注入 |
+| trace-analyst 把 order-service（Feign 超时）当故障服务 | get_trace 会区分「业务根因」（warranty fin 缺参）与「下游调用症状」（feign/timeout）；若仍误判，重跑一次或确保窗口干净 |
 | AgentScope streaming 收尾警告 | 无碍功能；可 `stream=False` 消除 |
 
 ## 8. 依赖

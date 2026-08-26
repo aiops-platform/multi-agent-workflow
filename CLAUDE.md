@@ -35,9 +35,12 @@ make lint      # ruff 检查
     （SCENARIOS §5.2），数据源切换只换 adapter。ES index `app-logs`（字段是 `app.traceId`
     驼峰，不是 `trace_id`）、Prometheus cAdvisor（`container_*`）、kubectl namespace `order`。
     `get_trace`：ES 按 traceId 重建调用链判故障 span（testbed 的 traceId 未跨服务共享，
-    无 traceId 回退时间窗）。联调脚本 `scripts/diagnose_scenario{1,2}.py`
-    （需 `source ../spike/.env` 供 DEEPSEEK_API_KEY）。trace-analyst 需 `max_iters≥12`
-    （2 个工具 + 链合成，默认 6 会迭代耗尽返回 {}）。
+    无 traceId 回退时间窗）；**故障 span 启发式**：优先「错误非下游调用症状」（feign/
+    Read timed out/Connection refused 视为症状）的服务=业务根因。联调脚本
+    `scripts/diagnose_scenario{1,2}.py`（需 `source ../spike/.env` 供 DEEPSEEK_API_KEY）。
+    trace-analyst 需 `max_iters≥12`（2 个工具 + 链合成，默认 6 会迭代耗尽返回 {}），
+    prompt 已强化区分「业务根因 vs 下游调用症状」。**场景复现需干净日志窗口**：
+    连续跑两场景会互相污染，切换前 `curl -X DELETE :19200/app-logs` 清窗。
 
 ## 结构速览
 

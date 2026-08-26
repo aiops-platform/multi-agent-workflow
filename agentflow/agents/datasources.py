@@ -139,8 +139,7 @@ class RealDataSourceAdapter:
         for svc, slogs in spans.items():
             has_error = any(l["level"] == "ERROR" for l in slogs)
             completed = any(
-                ("完成" in l["message"] or "成功" in l["message"] or "成功" in l["message"])
-                for l in slogs
+                ("完成" in l["message"] or "成功" in l["message"]) for l in slogs
             )
             first_error = next((l["message"] for l in slogs if l["level"] == "ERROR"), None)
             span = {
@@ -149,8 +148,23 @@ class RealDataSourceAdapter:
                 "first_error": first_error,
             }
             chain.append(span)
-            if has_error and not completed and failing is None:
-                failing = svc
+
+        # 判定故障 span：优先「错误非下游调用症状」的服务（根因），
+        # 其次才是有 ERROR 未完成的服务。
+        # 下游调用症状特征：feign / Read timed out / Connection refused / executing http
+        def _is_downstream_symptom(span: dict) -> bool:
+            err = (span.get("first_error") or "").lower()
+            return any(k in err for k in (
+                "feign", "read timed out", "connect timed out",
+                "connection refused", "executing ", "could not connect",
+            ))
+
+        errored = [s for s in chain if s["has_error"] and not s["completed"]]
+        origin = [s for s in errored if not _is_downstream_symptom(s)]
+        if origin:
+            failing = origin[0]["service"]
+        elif errored:
+            failing = errored[0]["service"]
 
         return {
             "trace_id": trace_id, "total": len(logs),

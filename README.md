@@ -9,7 +9,7 @@
 | **M0** | Workflow 版本冻结 + DAG 语义（join/skip）+ State Model | ✅ 已实现（见 `agentflow/core` + `statestore`） |
 | **M1** | AgentScope 适配层（2.0.3 锁定）+ 15-agent 编队 + 工具治理 | 🟡 骨架就绪（`agents/`），mock 数据源可跑 |
 | **M2** | DAG Executor + Node Attempt + Retry + Resume | ✅ 已实现（见 `executor/`），含复杂拓扑补测 |
-| **M3** | Workspace（Git base_sha 冻结 + 分支隔离）+ CMDB 驱动 | ✅ 已实现（见 `workspace/`），31 tests |
+| **M3** | Workspace（Git base_sha 冻结 + 分支隔离）+ CMDB 驱动 | ✅ 已实现（见 `workspace/`），37 tests |
 | M4 | Sandbox（独立 Pod + 安全基线）+ Tool Policy + Resource Limits | ⏳ 后续里程碑 |
 
 > AgentScope 版本**锁定 2.0.3**（design §5）。升级前必须重跑 S-001/S-011。
@@ -51,7 +51,7 @@ workflows/
 └── bug-fix-pipeline.yaml   # design §8.1 完整示例
 scripts/
 └── diagnose_scenario1.py   # 场景1 真实联调：DeepSeek + 真实数据源诊断链
-tests/                 # M0-M3 语义测试（36 tests）
+tests/                 # M0-M3 语义测试（37 tests）
 ```
 
 ## testbed 真实联调（场景1 + 场景2 已验证 ✅）
@@ -69,14 +69,17 @@ cd ../../agentflow-testbed && bash fault-inject/scenario1-recover.sh
 # 3. 场景2：注入故障（warranty fin 缺参 + 吞异常）→ 诊断 → 恢复
 bash fault-inject/scenario2.sh
 curl -s --max-time 8 -X POST "http://localhost:18080/checkout?orderId=ORD20260819001"   # 触发（挂起）
-cd ../backend && ./venv/bin/python scripts/diagnose_scenario2.py
-# → root_cause_type: code_bug（warranty-service fin 缺参），置信度 0.92，命中期望
+cd ../backend && source ../spike/.env && ./venv/bin/python scripts/diagnose_scenario2.py
+# → root_cause_type: code_bug（warranty-service fin 缺参），命中期望
 cd ../../agentflow-testbed && bash fault-inject/scenario2-recover.sh
 ```
 
+> ⚠️ 每场景需**干净日志窗口**：连续跑两个场景会互相污染（场景1 残留干扰场景2 定位）。
+> 切换前清 ES：`curl -X DELETE :19200/app-logs`。
+
 数据源与工具签名一致（SCENARIOS §5.2），mock/真实切换只换 adapter，agent 定义不变。
 `get_trace`：ES 按 traceId 重建调用链并判定故障 span（真实 testbed 的 traceId 未跨服务共享，
-无 traceId 时回退最近时间窗）。
+无 traceId 时回退最近时间窗；故障 span 优先「业务根因」而非「feign 下游调用症状」）。
 
 ## 设计要点对照
 
