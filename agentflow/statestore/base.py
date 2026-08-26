@@ -114,3 +114,22 @@ class StateStore(ABC):
         self, run_id: str, node_id: str, external_operation_id: str
     ) -> dict | None:
         """幂等复用：查同 run 同节点同 external_operation_id 的成功记录。"""
+
+    # ---- audit_logs（§8.8 审计表 / §9.5 审计字段）----
+    @abstractmethod
+    async def append_audit(
+        self,
+        tenant_id: str,
+        *,
+        tool_name: str,
+        decision: str,
+        run_id: str,
+        node_id: str,
+        input_masked: str | None = None,
+        actor: str | None = None,
+    ) -> None: ...
+
+    @abstractmethod
+    async def get_audit_logs(
+        self, *, tenant_id: str | None = None, run_id: str | None = None, limit: int = 100
+    ) -> list[dict]: ...

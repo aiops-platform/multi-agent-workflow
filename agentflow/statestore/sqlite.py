@@ -59,6 +59,17 @@ CREATE TABLE IF NOT EXISTS node_attempts (
     external_operation_id TEXT,
     error                TEXT
 );
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id     TEXT NOT NULL,
+    tool_name     TEXT NOT NULL,
+    decision      TEXT NOT NULL,
+    run_id        TEXT,
+    node_id       TEXT,
+    input_masked  TEXT,
+    actor         TEXT,
+    ts            TEXT
+);
 """
 
 
@@ -242,3 +253,25 @@ class SqliteStateStore(StateStore):
         d = dict(row)
         d["output"] = json.loads(d["output"]) if d.get("output") else None
         return d
+
+    # ---- audit_logs ----
+    async def append_audit(self, tenant_id, *, tool_name, decision, run_id, node_id, input_masked=None, actor=None) -> None:
+        await self._c.execute(
+            "INSERT INTO audit_logs(tenant_id, tool_name, decision, run_id, node_id, input_masked, actor, ts)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (tenant_id, tool_name, decision, run_id, node_id, input_masked, actor,
+             __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()),
+        )
+        await self._c.commit()
+
+    async def get_audit_logs(self, *, tenant_id=None, run_id=None, limit=100) -> list[dict]:
+        sql = "SELECT * FROM audit_logs WHERE 1=1"
+        params: list = []
+        if tenant_id:
+            sql += " AND tenant_id=?"; params.append(tenant_id)
+        if run_id:
+            sql += " AND run_id=?"; params.append(run_id)
+        sql += " ORDER BY id DESC LIMIT ?"; params.append(limit)
+        cur = await self._c.execute(sql, params)
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]

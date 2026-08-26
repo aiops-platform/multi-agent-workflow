@@ -2,6 +2,7 @@
 """InMemory StateStore（本地测试 / 单进程 MVP）。"""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from .base import APPROVAL_WAITING, StateStore
@@ -15,6 +16,7 @@ class InMemoryStateStore(StateStore):
         self._approvals: dict[str, dict] = {}
         self._attempts: dict[str, dict] = {}
         self._attempt_seq: int = 0
+        self._audit: list[dict] = []
 
     # ---- workflow_snapshots ----
     async def save_snapshot(self, tenant_id: str, snapshot: dict) -> str:
@@ -116,3 +118,20 @@ class InMemoryStateStore(StateStore):
             ):
                 return a
         return None
+
+    # ---- audit_logs ----
+    async def append_audit(self, tenant_id, *, tool_name, decision, run_id, node_id, input_masked=None, actor=None) -> None:
+        self._audit.append({
+            "tenant_id": tenant_id, "tool_name": tool_name, "decision": decision,
+            "run_id": run_id, "node_id": node_id, "input_masked": input_masked,
+            "actor": actor,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        })
+
+    async def get_audit_logs(self, *, tenant_id=None, run_id=None, limit=100) -> list[dict]:
+        out = [
+            a for a in self._audit
+            if (tenant_id is None or a["tenant_id"] == tenant_id)
+            and (run_id is None or a["run_id"] == run_id)
+        ]
+        return out[-limit:]

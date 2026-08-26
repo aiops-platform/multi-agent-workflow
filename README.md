@@ -11,6 +11,7 @@
 | **M2** | DAG Executor + Node Attempt + Retry + Resume | ✅ 已实现（见 `executor/`），含复杂拓扑补测 |
 | **M3** | Workspace（Git base_sha 冻结 + 分支隔离）+ CMDB 驱动 | ✅ 已实现（见 `workspace/`），37 tests |
 | **M4** | Sandbox（独立 Pod + 安全基线）+ Tool Policy + Action Executor | ✅ 已实现（见 `sandbox/`），K8s 端到端验证通过，52 tests |
+| **M5** | Approval（CAS + Timeout + Sweeper）+ Notification + Audit Log | ✅ 已实现（见 `approval/` + `audit/`），60 tests |
 
 > AgentScope 版本**锁定 2.0.3**（design §5）。升级前必须重跑 S-001/S-011。
 
@@ -46,7 +47,9 @@ agentflow/
 │   └── datasources.py # 真实数据源适配（ES/Prometheus/kubectl，testbed 联调）
 ├── workspace/         # M3：WorkspaceManager（base_sha 冻结/分支隔离/无 git_pull）+ CMDB
 ├── sandbox/           # M4：exec 服务(纯 stdlib) + SandboxClient + SandboxOrchestrator + ActionExecutor + ToolPolicy
-├── api/               # 控制面 FastAPI（M5 前最小形态）
+├── approval/          # M5：审批超时 Sweeper（§8.9）+ 通知
+├── audit/             # M5：审计日志（§9.5 字段 + 输入脱敏）
+├── api/               # 控制面 FastAPI（sweeper 后台任务 + GET /audit）
 └── service.py         # RunService：create / approve / resume 编排
 workflows/
 └── bug-fix-pipeline.yaml   # design §8.1 完整示例

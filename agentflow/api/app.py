@@ -6,13 +6,18 @@ M0-M2 形态：进程内直接执行（无 Worker 池）。JWT → 派生 tenant
 """
 from __future__ import annotations
 
+import asyncio
+
 import yaml
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from ..approval.notifier import ApprovalNotifier
+from ..approval.sweeper import ApprovalSweeper
 from ..config import Settings, get_settings
 from ..core.workflow import Workflow
 from ..executor.dag_executor import WorkflowNodeFailed
+from ..queue import build_queue
 from ..service import RunService
 from ..statestore import build_state_store, connect_state_store
 
@@ -20,6 +25,7 @@ settings: Settings = get_settings()
 
 app = FastAPI(title="agentflow 控制面", version="0.1.0")
 service: RunService | None = None
+sweeper: ApprovalSweeper | None = None
 
 
 class RunRequest(BaseModel):
@@ -44,11 +50,14 @@ def _service() -> RunService:
 
 
 async def init() -> RunService:
-    """应用启动时调用：初始化 StateStore 并注入 runner。"""
-    global service
+    """应用启动时调用：初始化 StateStore + Queue，并启动审批超时 Sweeper（§8.9）。"""
+    global service, sweeper
     store = build_state_store(settings)
     await connect_state_store(store)
+    queue = build_queue(settings)
     service = RunService(store)
+    sweeper = ApprovalSweeper(store, queue, ApprovalNotifier(), interval=60)
+    asyncio.create_task(sweeper.run_forever())
     return service
 
 
@@ -85,6 +94,12 @@ async def approve(run_id: str, node_id: str, req: ApproveRequest) -> dict:
         )
     except (ValueError, AssertionError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/audit")
+async def audit(tenant_id: str | None = None, run_id: str | None = None, limit: int = 100) -> list[dict]:
+    """审计日志查询（§9.5：tenant_id/tool_name/decision/run_id/node_id/input 脱敏/ts）。"""
+    return await _service().store.get_audit_logs(tenant_id=tenant_id, run_id=run_id, limit=limit)
 
 
 @app.get("/health")
