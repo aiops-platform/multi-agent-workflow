@@ -23,6 +23,9 @@ data/
 tmp/
 workspace/
 
+# 沙箱镜像构建产物
+docker/sandbox/wheels/
+
 # IDE / OS
 .idea/
 .vscode/

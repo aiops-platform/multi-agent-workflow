@@ -31,6 +31,11 @@ make lint      # ruff 检查
 9. **工具权限**（§9.5）：`build_agent` 默认 DONT_ASK + agent 注册工具的 allow 规则。
    没有 allow 规则时 DONT_ASK 下工具全部 DENY（联调踩过：agent 只能靠提示词推理）。
    `build_permission_context` 生成上下文；租户 deny 规则 M5 接入。
+9.5 **沙箱（M4）**：`sandbox/exec_service.py` 是**纯 stdlib http.server**（镜像零 pip 依赖，
+   离线可建；加 Java 用 `--build-arg WITH_JDK=1`，默认关）。SandboxClient 本地联调经
+   `kubectl port-forward`（macOS 宿主不可路由 pod IP；生产 Worker 在集群内直连 ClusterIP）。
+   ActionExecutor 动作是**有限集合 + 白名单**（§10.3），新增动作需评审。
+   ToolPolicy：deny 优先 → allow → 兜底 DENY（§9.5）。
 10. **真实数据源**（testbed 联调）：`datasources.py` 的 adapter 与 mock 工具签名一致
     （SCENARIOS §5.2），数据源切换只换 adapter。ES index `app-logs`（字段是 `app.traceId`
     驼峰，不是 `trace_id`）、Prometheus cAdvisor（`container_*`）、kubectl namespace `order`。
@@ -52,11 +57,13 @@ agents/      15-agent 编队 + AgentScope 适配 + 工具治理（M1 骨架）
              ├ datasources.py  真实数据源适配（ES/Prometheus/kubectl，testbed）
              └ scopes.py       build_permission_context（§9.5 DONT_ASK+allow）
 workspace/   WorkspaceManager + CMDB（M3）
+sandbox/     M4：exec 服务(纯 stdlib) + SandboxClient + Orchestrator + ActionExecutor + ToolPolicy
 queue/ lock/ 可插拔队列/锁（memory + M6 stub）
 service.py   RunService：create / approve / resume 编排
 api/         控制面 FastAPI
 workflows/   bug-fix-pipeline.yaml（design §8.1）
-scripts/     diagnose_scenario1.py（真实联调）
+scripts/     diagnose_scenario{1,2}.py（真实联调）+ verify_sandbox.py
+docker/sandbox/  沙箱镜像（stdlib-only 离线可建）
 ```
 
 ## 测试

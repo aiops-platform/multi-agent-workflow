@@ -19,6 +19,25 @@ from agentflow.sandbox.client import SandboxClient  # noqa: E402
 from agentflow.sandbox.orchestrator import SandboxOrchestrator  # noqa: E402
 
 
+async def _port_forward(pod: str, namespace: str, port: int) -> "subprocess.Popen":
+    """本地联调：kubectl port-forward 暴露沙箱端口到 localhost（生产 Worker 在集群内直连 ClusterIP）。"""
+    import subprocess
+
+    proc = subprocess.Popen(
+        ["kubectl", "-n", namespace, "port-forward", f"pod/{pod}", f"{port}:{port}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    # 等待端口就绪
+    for _ in range(20):
+        try:
+            with __import__("socket").create_connection(("127.0.0.1", port), timeout=1):
+                return proc
+        except OSError:
+            __import__("time").sleep(1)
+    proc.terminate()
+    raise RuntimeError("port-forward 未就绪")
+
+
 async def main() -> None:
     orch = SandboxOrchestrator(namespace="agentflow")
     # 确保 namespace 存在
@@ -29,9 +48,14 @@ async def main() -> None:
 
     print("==> 拉起沙箱 Pod ...")
     info = await orch.create("run_demo", "team-alpha", "order-service")
-    print(f"    pod={info['pod']} base_url={info['base_url']}")
+    print(f"    pod={info['pod']}（in-cluster ip={info['ip']}）")
 
-    client = SandboxClient(info["base_url"])
+    # 本地联调：port-forward 到 localhost（生产环境 Worker 在集群内直连 pod ip）
+    pf = await _port_forward(info["pod"], "agentflow", 44772)
+    base_url = "http://localhost:44772"
+    print(f"    port-forward 就绪 → {base_url}")
+
+    client = SandboxClient(base_url)
     try:
         print("==> health:")
         print("   ", json.dumps(await client.health(), ensure_ascii=False))
@@ -53,6 +77,7 @@ async def main() -> None:
         print(f"    timed_out={r.timed_out} rc={r.rc}")
     finally:
         await client.aclose()
+        pf.terminate()
 
     print("==> 销毁沙箱 Pod ...")
     ok = await orch.destroy(info["pod"])

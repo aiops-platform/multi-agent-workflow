@@ -10,7 +10,7 @@
 | **M1** | AgentScope 适配层（2.0.3 锁定）+ 15-agent 编队 + 工具治理 | 🟡 骨架就绪（`agents/`），mock 数据源可跑 |
 | **M2** | DAG Executor + Node Attempt + Retry + Resume | ✅ 已实现（见 `executor/`），含复杂拓扑补测 |
 | **M3** | Workspace（Git base_sha 冻结 + 分支隔离）+ CMDB 驱动 | ✅ 已实现（见 `workspace/`），37 tests |
-| M4 | Sandbox（独立 Pod + 安全基线）+ Tool Policy + Resource Limits | ⏳ 后续里程碑 |
+| **M4** | Sandbox（独立 Pod + 安全基线）+ Tool Policy + Action Executor | ✅ 已实现（见 `sandbox/`），K8s 端到端验证通过，52 tests |
 
 > AgentScope 版本**锁定 2.0.3**（design §5）。升级前必须重跑 S-001/S-011。
 
@@ -45,14 +45,34 @@ agentflow/
 ├── agents/            # M1：15-agent 编队 + AgentScope 适配 + 工具治理 + 权限上下文
 │   └── datasources.py # 真实数据源适配（ES/Prometheus/kubectl，testbed 联调）
 ├── workspace/         # M3：WorkspaceManager（base_sha 冻结/分支隔离/无 git_pull）+ CMDB
+├── sandbox/           # M4：exec 服务(纯 stdlib) + SandboxClient + SandboxOrchestrator + ActionExecutor + ToolPolicy
 ├── api/               # 控制面 FastAPI（M5 前最小形态）
 └── service.py         # RunService：create / approve / resume 编排
 workflows/
 └── bug-fix-pipeline.yaml   # design §8.1 完整示例
 scripts/
-└── diagnose_scenario1.py   # 场景1 真实联调：DeepSeek + 真实数据源诊断链
-tests/                 # M0-M3 语义测试（37 tests）
+├── diagnose_scenario1.py   # 场景1 真实联调：DeepSeek + 真实数据源诊断链
+└── diagnose_scenario2.py   # 场景2 真实联调
+docker/sandbox/             # 沙箱镜像（stdlib-only，离线可建；WITH_JDK=1 加 Java）
+tests/                 # M0-M4 语义测试（52 tests）
 ```
+
+## M4 沙箱（独立执行 Pod）
+
+```bash
+# 1. 构建沙箱镜像（stdlib-only 离线可建；需要 Java 编译时加 --build-arg WITH_JDK=1）
+docker build -t agentflow-sandbox:latest -f docker/sandbox/Dockerfile .
+minikube image load agentflow-sandbox:latest
+
+# 2. K8s 端到端验证（拉起沙箱 Pod → exec → 销毁）
+./venv/bin/python scripts/verify_sandbox.py
+```
+
+- `sandbox/exec_service.py`：纯 stdlib http.server，零依赖；§10.2 限制（300s/1MB/10 并发/写白名单）
+- `sandbox/orchestrator.py`：K8s 动态拉起/销毁沙箱 Pod（非特权 + drop ALL + cpu 2/mem 4Gi + /workspace 卷）
+- `sandbox/action_executor.py`：§10.3 白名单动作（scale[0,10]/restart/patch_resources 范围/delete_temp 路径）
+- `sandbox/policy.py`：§9.5 租户工具策略（deny 优先→allow→兜底 DENY）
+- L2 工具（sandbox_run_python/shell/write_file）经 SandboxClient 进沙箱（§4.1 推理/执行分离）
 
 ## testbed 真实联调（场景1 + 场景2 已验证 ✅）
 

@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 """沙箱 exec 服务（运行在沙箱 Pod 内，design §10.2 生产安全基线）。
 
-- 提供 shell / python / write 三个执行端点
+**纯 Python stdlib 实现**（http.server + json）：镜像零 pip 依赖，
+离线可构建（python:3.12-slim + 本文件即可）。
+
+- 提供 /exec（shell）/python（执行代码）/write（写文件，白名单）/health
 - 强制限制（§10.2）：
   - ``max_execution_seconds``：300s
   - ``max_stdout_bytes``：1MB
-  - ``max_concurrent_processes``：10（信号量）
-  - ``writable_allowlist``：仅 /workspace 与 /tmp 可写（write 端点校验）
+  - ``max_concurrent_processes``：10（线程信号量）
+  - ``writable_allowlist``：仅 /workspace 与 /tmp（write 校验，resolve 兼容符号链接）
 
-启动：``uvicorn agentflow.sandbox.exec_service:app --port 44772``
+启动：``python -m agentflow.sandbox.exec_service [--port 44772] [--self-test]``
 """
 from __future__ import annotations
 
@@ -17,12 +20,11 @@ import json
 import os
 import subprocess
 import sys
-import time
+import threading
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
 MAX_EXECUTION_SECONDS = int(os.environ.get("SBX_MAX_EXEC_SECONDS", 300))
 MAX_STDOUT_BYTES = int(os.environ.get("SBX_MAX_STDOUT_BYTES", 1_048_576))  # 1MB
@@ -31,24 +33,26 @@ WRITABLE_ALLOWLIST = [Path(p) for p in os.environ.get(
     "SBX_WRITABLE", "/workspace:/tmp"
 ).split(":") if p]
 
-app = FastAPI(title="agentflow-sandbox-exec", version="0.1.0")
-_sem = asyncio.Semaphore(MAX_CONCURRENT)
+_sem = threading.Semaphore(MAX_CONCURRENT)
 
 
-class ExecRequest(BaseModel):
-    cmd: str
+@dataclass
+class ExecRequest:
+    cmd: str = ""
     cwd: str | None = None
     timeout: int = MAX_EXECUTION_SECONDS
 
 
-class PythonRequest(BaseModel):
-    code: str
+@dataclass
+class PythonRequest:
+    code: str = ""
     timeout: int = MAX_EXECUTION_SECONDS
 
 
-class WriteRequest(BaseModel):
-    path: str
-    content: str
+@dataclass
+class WriteRequest:
+    path: str = ""
+    content: str = ""
 
 
 def _truncate(out: bytes) -> str:
@@ -57,88 +61,136 @@ def _truncate(out: bytes) -> str:
     )
 
 
-async def _run(args: list[str], cwd: str | None, timeout: int, **kw) -> dict[str, Any]:
-    async with _sem:
+def _run_sync(args: list[str], cwd: str | None, timeout: int, **kw: Any) -> dict[str, Any]:
+    with _sem:
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *args, cwd=cwd,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                **kw,
+            proc = subprocess.run(
+                args, cwd=cwd, capture_output=True,
+                timeout=min(timeout, MAX_EXECUTION_SECONDS), **kw,
             )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-                timed_out = False
-            except asyncio.TimeoutError:
-                proc.kill()
-                stdout, stderr = await proc.communicate()
-                timed_out = True
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            proc = subprocess.CompletedProcess(args, -1, b"", b"timed out")
+            timed_out = True
         except FileNotFoundError as exc:
             return {"rc": 127, "stdout": "", "stderr": str(exc), "timed_out": False}
     return {
         "rc": proc.returncode,
-        "stdout": _truncate(stdout),
-        "stderr": _truncate(stderr),
+        "stdout": _truncate(proc.stdout or b""),
+        "stderr": _truncate(proc.stderr or b""),
         "timed_out": timed_out,
     }
 
 
-@app.post("/exec")
 async def exec_cmd(req: ExecRequest) -> dict:
     if not req.cmd.strip():
-        raise HTTPException(400, "cmd 为空")
-    return await _run(["/bin/sh", "-c", req.cmd], req.cwd, min(req.timeout, MAX_EXECUTION_SECONDS))
+        return {"rc": 2, "stdout": "", "stderr": "cmd 为空", "timed_out": False}
+    return await asyncio.to_thread(_run_sync, ["/bin/sh", "-c", req.cmd], req.cwd, req.timeout)
 
 
-@app.post("/python")
 async def exec_python(req: PythonRequest) -> dict:
     if not req.code.strip():
-        raise HTTPException(400, "code 为空")
-    # 用独立子进程跑，隔离 + 可超时
-    py = sys.executable
-    return await _run([py, "-c", req.code], None, min(req.timeout, MAX_EXECUTION_SECONDS))
+        return {"rc": 2, "stdout": "", "stderr": "code 为空", "timed_out": False}
+    return await asyncio.to_thread(_run_sync, [sys.executable, "-c", req.code], None, req.timeout)
 
 
-@app.post("/write")
 async def write_file(req: WriteRequest) -> dict:
     p = Path(req.path)
-    # §10.2 writable_allowlist：只允许 /workspace 与 /tmp
-    resolved = p.resolve()
+    # §10.2 writable_allowlist（resolve 兼容 /tmp → /private/tmp 符号链接）
+    resolved = str(p.resolve())
     allowed = any(
-        str(resolved).startswith(str(base.resolve()))
-        for base in WRITABLE_ALLOWLIST if base.exists()
+        resolved == str(base.resolve()) or resolved.startswith(str(base.resolve()) + "/")
+        for base in WRITABLE_ALLOWLIST
     )
     if not allowed:
-        raise HTTPException(403, f"路径不在可写白名单: {req.path}（仅 {WRITABLE_ALLOWLIST}）")
+        return {"written": False, "error": f"路径不在可写白名单: {req.path}（仅 {WRITABLE_ALLOWLIST}）"}
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(req.content, encoding="utf-8")
     return {"written": True, "path": str(p), "bytes": len(req.content.encode("utf-8"))}
 
 
-@app.get("/health")
-async def health() -> dict:
-    return {
-        "status": "ok",
-        "limits": {
-            "max_execution_seconds": MAX_EXECUTION_SECONDS,
-            "max_stdout_bytes": MAX_STDOUT_BYTES,
-            "max_concurrent_processes": MAX_CONCURRENT,
-            "writable_allowlist": [str(p) for p in WRITABLE_ALLOWLIST],
-        },
-    }
+# ======================================================================
+# stdlib HTTP 层
+# ======================================================================
+def _body(handler: BaseHTTPRequestHandler) -> dict:
+    length = int(handler.headers.get("Content-Length", 0) or 0)
+    raw = handler.rfile.read(length) if length else b"{}"
+    try:
+        return json.loads(raw.decode("utf-8")) if raw else {}
+    except json.JSONDecodeError:
+        return {}
 
 
-def _self_test() -> None:  # pragma: no cover - 本地自检
+class _Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):  # 静默访问日志
+        pass
+
+    def _send(self, code: int, payload: dict) -> None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _dispatch(self, route: str) -> None:
+        body = _body(self)
+        try:
+            if route == "/exec":
+                result = asyncio.run(exec_cmd(ExecRequest(**body)))
+            elif route == "/python":
+                result = asyncio.run(exec_python(PythonRequest(**body)))
+            elif route == "/write":
+                result = asyncio.run(write_file(WriteRequest(**body)))
+            else:
+                self._send(404, {"error": "not found"})
+                return
+            self._send(200, result)
+        except Exception as exc:  # noqa: BLE001
+            self._send(500, {"error": str(exc)})
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/exec":
+            self._dispatch("/exec")
+        elif self.path == "/python":
+            self._dispatch("/python")
+        elif self.path == "/write":
+            self._dispatch("/write")
+        else:
+            self._send(404, {"error": f"unknown: {self.path}"})
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/health":
+            self._send(200, {
+                "status": "ok",
+                "limits": {
+                    "max_execution_seconds": MAX_EXECUTION_SECONDS,
+                    "max_stdout_bytes": MAX_STDOUT_BYTES,
+                    "max_concurrent_processes": MAX_CONCURRENT,
+                    "writable_allowlist": [str(p) for p in WRITABLE_ALLOWLIST],
+                },
+            })
+        else:
+            self._send(404, {"error": f"unknown: {self.path}"})
+
+
+def create_server(host: str = "0.0.0.0", port: int = 44772) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), _Handler)
+
+
+def _self_test() -> None:
     async def main() -> None:
-        r = await exec_cmd(ExecRequest(cmd="echo hello && python3 --version && java -version 2>&1"))
-        print(json.dumps(r, indent=1)[:500])
+        r = await exec_cmd(ExecRequest(cmd="echo hello && python3 --version"))
+        print(json.dumps(r, ensure_ascii=False)[:300])
 
     asyncio.run(main())
 
 
 if __name__ == "__main__":  # pragma: no cover
-    import uvicorn
-
     if "--self-test" in sys.argv:
         _self_test()
     else:
-        uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("SBX_PORT", 44772)))
+        port = int(os.environ.get("SBX_PORT", 44772))
+        srv = create_server(port=port)
+        print(f"sandbox-exec listening on :{port}", flush=True)
+        srv.serve_forever()

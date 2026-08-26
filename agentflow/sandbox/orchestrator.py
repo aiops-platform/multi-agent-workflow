@@ -55,8 +55,8 @@ class SandboxOrchestrator:
             image=self.image,
             image_pull_policy="IfNotPresent",
             ports=[client.V1ContainerPort(container_port=SANDBOX_PORT)],
-            command=["python", "-m", "uvicorn", "agentflow.sandbox.exec_service:app",
-                     "--host", "0.0.0.0", "--port", str(SANDBOX_PORT)],
+            # exec 服务（stdlib http.server，端口 SANDBOX_PORT）
+            command=["python", "-m", "agentflow.sandbox.exec_service"],
             resources=client.V1ResourceRequirements(
                 requests={"cpu": "1", "memory": "2Gi"},
                 limits={"cpu": "2", "memory": "4Gi"},  # §10.2 resource_limits
