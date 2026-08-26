@@ -31,6 +31,11 @@ make lint      # ruff 检查
 9. **工具权限**（§9.5）：`build_agent` 默认 DONT_ASK + agent 注册工具的 allow 规则。
    没有 allow 规则时 DONT_ASK 下工具全部 DENY（联调踩过：agent 只能靠提示词推理）。
    `build_permission_context` 生成上下文；租户 deny 规则 M5 接入。
+9.4 **生产适配器（M6）**：`queue/kafka.py`（kafka-python 双队列）、`statestore/postgres.py`
+   （§8.8 完整 PG schema）、`lock/redis.py`（SET NX PX + token 校验防误删，**注意 redis get
+   返回 bytes，token 比较需 decode**）。配置驱动切换（config.py）。真实 broker/DB 的故障恢复
+   （Kafka 重放 / PG 回滚）需生产环境专项验证（§14）；本地已测 Worker SIGKILL 恢复 +
+   消息重放幂等。
 9.5 **沙箱（M4）**：`sandbox/exec_service.py` 是**纯 stdlib http.server**（镜像零 pip 依赖，
    离线可建；加 Java 用 `--build-arg WITH_JDK=1`，默认关）。SandboxClient 本地联调经
    `kubectl port-forward`（macOS 宿主不可路由 pod IP；生产 Worker 在集群内直连 ClusterIP）。
@@ -58,7 +63,10 @@ agents/      15-agent 编队 + AgentScope 适配 + 工具治理（M1 骨架）
              └ scopes.py       build_permission_context（§9.5 DONT_ASK+allow）
 workspace/   WorkspaceManager + CMDB（M3）
 sandbox/     M4：exec 服务(纯 stdlib) + SandboxClient + Orchestrator + ActionExecutor + ToolPolicy
-queue/ lock/ 可插拔队列/锁（memory + M6 stub）
+approval/    M5：审批超时 Sweeper + 通知
+audit/       M5：审计日志
+queue/ lock/ 可插拔队列/锁（memory + kafka/redis 生产适配器）
+statestore/  StateStore（memory/sqlite + postgres 生产适配器）
 service.py   RunService：create / approve / resume 编排
 api/         控制面 FastAPI
 workflows/   bug-fix-pipeline.yaml（design §8.1）

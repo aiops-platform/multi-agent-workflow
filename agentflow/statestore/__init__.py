@@ -17,7 +17,9 @@ def build_state_store(settings: Settings) -> StateStore:
         # 由调用方（Worker/API）负责 connect()：SQLite 需要异步初始化
         return store
     if settings.state_store == "postgres":
-        raise NotImplementedError("PostgreSQL StateStore 是 M6 适配器，尚未实现")
+        from .postgres import PostgresStateStore
+
+        return PostgresStateStore(f"postgresql://{settings.postgres_dsn}")
     raise ValueError(f"未知 state_store 后端: {settings.state_store!r}")
 
 

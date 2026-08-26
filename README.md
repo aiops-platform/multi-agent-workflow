@@ -12,6 +12,7 @@
 | **M3** | Workspace（Git base_sha 冻结 + 分支隔离）+ CMDB 驱动 | ✅ 已实现（见 `workspace/`），37 tests |
 | **M4** | Sandbox（独立 Pod + 安全基线）+ Tool Policy + Action Executor | ✅ 已实现（见 `sandbox/`），K8s 端到端验证通过，52 tests |
 | **M5** | Approval（CAS + Timeout + Sweeper）+ Notification + Audit Log | ✅ 已实现（见 `approval/` + `audit/`），60 tests |
+| **M6** | 生产适配器（Kafka/PostgreSQL/Redis）+ 故障恢复专项测试 | ✅ 已实现（见 `queue/statestore/lock`），71 tests |
 
 > AgentScope 版本**锁定 2.0.3**（design §5）。升级前必须重跑 S-001/S-011。
 
@@ -41,7 +42,7 @@ agentflow/
 ├── config.py          # LLM + StateStore/Queue/Lock 后端切换（配置驱动）
 ├── core/              # M0：Workflow 模型 + DAG 语义（join/skip）+ 版本冻结
 ├── statestore/        # M0：State Model（InMemory / SQLite，表结构对齐 §8.8）
-├── queue/ lock/       # M0：可插拔队列/锁（memory + M6 stub）
+├── queue/ lock/       # M0/M6：可插拔队列/锁（memory + kafka/redis 生产适配器）
 ├── executor/          # M2：并发 DAG Executor + 幂等 + Retry + Resume
 ├── agents/            # M1：15-agent 编队 + AgentScope 适配 + 工具治理 + 权限上下文
 │   └── datasources.py # 真实数据源适配（ES/Prometheus/kubectl，testbed 联调）
@@ -49,6 +50,7 @@ agentflow/
 ├── sandbox/           # M4：exec 服务(纯 stdlib) + SandboxClient + SandboxOrchestrator + ActionExecutor + ToolPolicy
 ├── approval/          # M5：审批超时 Sweeper（§8.9）+ 通知
 ├── audit/             # M5：审计日志（§9.5 字段 + 输入脱敏）
+├── statestore/postgres.py  # M6：PostgreSQL 生产适配器（§8.8 完整 schema）
 ├── api/               # 控制面 FastAPI（sweeper 后台任务 + GET /audit）
 └── service.py         # RunService：create / approve / resume 编排
 workflows/

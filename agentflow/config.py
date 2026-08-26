@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     # ---- StateStore ----
     state_store: str = "sqlite"  # sqlite | memory | postgres(M6)
     state_db_path: Path = ROOT / "data" / "agentflow.db"
+    postgres_dsn: str = "localhost:5432/agentflow?user=agentflow&password=agentflow"
 
     # ---- Queue ----
     queue: str = "memory"  # memory | kafka(M6)
