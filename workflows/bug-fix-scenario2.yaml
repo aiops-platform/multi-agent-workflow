@@ -1,0 +1,145 @@
+# ===== 场景2 完整修复工作流：结账无响应（warranty fin 缺参 + 吞异常）=====
+# design §3.5：诊断（含负证据）→ 规划 → 修复（沙箱）→ 测试 → 审查 → 审批 → 提交 PR → 复盘
+name: bug-fix-scenario2
+version: "1.0.0"
+description: "场景2 跨服务代码故障完整闭环：诊断 + 沙箱修复 + 审批 + PR"
+
+inputs:
+  bug_report:
+    type: object
+    required: true
+  repos:
+    type: object
+    required: false
+    description: "服务→仓库映射；不提供则由 CMDB 查询"
+
+nodes:
+  # ===== 诊断阶段（metrics/infra 为负证据）=====
+  triage:
+    agent: triage
+    params: { bug: "$.inputs.bug_report" }
+    on_failure: abort
+
+  logs:
+    agent: log-analyst
+    params: { bug: "$.nodes.triage.output.summary" }
+    on_failure: continue
+
+  trace:
+    agent: trace-analyst
+    params: { bug: "$.nodes.triage.output.summary" }
+    on_failure: abort
+
+  metrics:
+    agent: metrics-analyst
+    params: { bug: "$.nodes.triage.output.summary" }
+    on_failure: continue
+
+  infra:
+    agent: infra-locator
+    params: { bug: "$.nodes.triage.output.summary" }
+    on_failure: continue
+
+  locate:
+    agent: code-locator
+    params:
+      bug: "$.nodes.triage.output.summary"
+      target_service: "$.nodes.trace.output.failing_service"
+    on_failure: abort
+
+  know:
+    agent: knowledge-lookup
+    params: { bug: "$.nodes.triage.output.summary" }
+    on_failure: continue
+
+  rca:
+    agent: root-cause
+    params:
+      logs: "$.nodes.logs.output.summary"
+      trace: "$.nodes.trace.output.summary"
+      metrics: "$.nodes.metrics.output.summary"
+      infra: "$.nodes.infra.output.summary"
+      code: "$.nodes.locate.output.summary"
+      know: "$.nodes.know.output.summary"
+    on_failure: abort
+
+  plan:
+    agent: fix-planner
+    params: { rca: "$.nodes.rca.output" }
+    on_failure: abort
+
+  # ===== 修复阶段 =====
+  fix:
+    agent: fix-implementer
+    params:
+      plan: "$.nodes.plan.output"
+      repo_url: "$.nodes.locate.output.repo_url"
+    retry: 1
+
+  test:
+    agent: tester
+    params:
+      fix: "$.nodes.fix.output"
+      plan: "$.nodes.plan.output"
+    retry: 1
+
+  review:
+    agent: reviewer
+    params: { diff: "$.nodes.fix.output.diff" }
+
+  # ===== 提交审批（前置审批）=====
+  approve-commit:
+    kind: approval
+    name: "审批代码提交"
+    params:
+      diff: "$.nodes.fix.output.diff"
+      test: "$.nodes.test.output"
+    approvers: ["lead-engineer"]
+    timeout: 7200
+    on_reject: abort
+
+  commit:
+    agent: committer
+    params:
+      diff: "$.nodes.fix.output.diff"
+      test: "$.nodes.test.output"
+      # 幂等：external_operation_id = PR number
+
+  recap:
+    agent: postmortem
+    params:
+      rca: "$.nodes.rca.output"
+      fix: "$.nodes.fix.output"
+      status: "$.nodes.commit.status"
+
+edges:
+  # 诊断链
+  - { from: triage, to: logs }
+  - { from: triage, to: trace }
+  - { from: triage, to: metrics }
+  - { from: triage, to: infra }
+  - { from: triage, to: locate }
+  - { from: triage, to: know }
+  - { from: trace, to: locate }
+  - { from: logs, to: rca }
+  - { from: trace, to: rca }
+  - { from: metrics, to: rca }
+  - { from: infra, to: rca }
+  - { from: locate, to: rca }
+  - { from: know, to: rca }
+  - { from: rca, to: plan }
+  - { from: plan, to: fix }
+
+  # 修复 → 测试 → 审查
+  - { from: fix, to: test }
+  - { from: test, to: review, when: "$.nodes.test.output.passed == true" }
+  - { from: test, to: recap, when: "$.nodes.test.output.passed == false" }
+
+  # 审查 → 提交审批
+  - { from: review, to: approve-commit, when: "$.nodes.review.output.approved == true" }
+  - { from: review, to: recap, when: "$.nodes.review.output.approved == false" }
+
+  # 审批 → 提交 → 复盘
+  - { from: approve-commit, to: commit, when: "$.nodes.approve-commit.output.approved == true" }
+  - { from: approve-commit, to: recap, when: "$.nodes.approve-commit.output.approved == false" }
+  - { from: commit, to: recap }

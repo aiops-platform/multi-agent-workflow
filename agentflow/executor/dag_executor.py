@@ -69,12 +69,19 @@ def _resolve_param(value: Any, ctx: dict) -> Any:
             rest = path[len("nodes."):]
             parts = rest.split(".")
             node_id = parts[0]
-            rest = ".".join(parts[1:])
+            field_path = ".".join(parts[1:])
             node_output = ctx["nodes"].get(node_id, {}).get("output")
             if node_output is None:
                 return None
+            # "output" 是标准访问器（取节点输出值），不是节点输出的字段
+            if field_path == "output":
+                return node_output
+            if field_path.startswith("output."):
+                field_path = field_path[len("output."):]
+            if not field_path:
+                return node_output
             cur: Any = node_output
-            for p in rest.split("."):
+            for p in field_path.split("."):
                 if p == "":
                     continue
                 if isinstance(cur, dict) and p in cur:

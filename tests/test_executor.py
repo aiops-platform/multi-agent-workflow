@@ -54,6 +54,16 @@ async def test_simple_chain_done() -> None:
     assert set(nodes) == {"a", "b", "c"}
 
 
+async def test_param_resolution_output_accessor() -> None:
+    """$．nodes.X.output（无字段）与 .output.field 都应正确解析（回归：曾把 output 当字段遍历返回 None）。"""
+    from agentflow.executor.dag_executor import resolve_params
+
+    ctx = {"nodes": {"fix": {"status": "done", "output": {"diff": "--- a\n+++ b", "files": ["W.java"]}}}, "inputs": {}}
+    p = resolve_params({"whole": "$.nodes.fix.output", "diff": "$.nodes.fix.output.diff"}, ctx)
+    assert p["whole"]["diff"] == "--- a\n+++ b"  # 整输出可解析
+    assert p["diff"] == "--- a\n+++ b"  # 字段可解析
+
+
 async def test_parallel_with_approval_waiting() -> None:
     ex, _, store, calls = build_executor(PARALLEL_YAML)
     outcome = await ex.run()

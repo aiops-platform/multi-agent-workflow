@@ -13,6 +13,7 @@
 | **M4** | Sandbox（独立 Pod + 安全基线）+ Tool Policy + Action Executor | ✅ 已实现（见 `sandbox/`），K8s 端到端验证通过，52 tests |
 | **M5** | Approval（CAS + Timeout + Sweeper）+ Notification + Audit Log | ✅ 已实现（见 `approval/` + `audit/`），60 tests |
 | **M6** | 生产适配器（Kafka/PostgreSQL/Redis）+ 故障恢复专项测试 | ✅ 已实现（见 `queue/statestore/lock`），71 tests |
+| **M7** | 场景2 修复闭环 E2E（诊断→修复→审批→PR）+ Regression | ✅ 已实现（`run_fix_loop.py`），72 tests |
 
 > AgentScope 版本**锁定 2.0.3**（design §5）。升级前必须重跑 S-001/S-011。
 
@@ -54,10 +55,12 @@ agentflow/
 ├── api/               # 控制面 FastAPI（sweeper 后台任务 + GET /audit）
 └── service.py         # RunService：create / approve / resume 编排
 workflows/
-└── bug-fix-pipeline.yaml   # design §8.1 完整示例
+├── bug-fix-pipeline.yaml   # design §8.1 完整示例
+└── bug-fix-scenario2.yaml  # 场景2 完整修复工作流（诊断→修复→审批→PR，§3.5）
 scripts/
 ├── diagnose_scenario1.py   # 场景1 真实联调：DeepSeek + 真实数据源诊断链
-└── diagnose_scenario2.py   # 场景2 真实联调
+├── diagnose_scenario2.py   # 场景2 真实联调
+└── run_fix_loop.py         # 场景2 修复闭环 E2E（真实工作区 git 修复 + 审批 + PR）
 docker/sandbox/             # 沙箱镜像（stdlib-only，离线可建；WITH_JDK=1 加 Java）
 tests/                 # M0-M4 语义测试（52 tests）
 ```

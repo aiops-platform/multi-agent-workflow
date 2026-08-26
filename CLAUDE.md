@@ -36,7 +36,11 @@ make lint      # ruff 检查
    返回 bytes，token 比较需 decode**）。配置驱动切换（config.py）。真实 broker/DB 的故障恢复
    （Kafka 重放 / PG 回滚）需生产环境专项验证（§14）；本地已测 Worker SIGKILL 恢复 +
    消息重放幂等。
-9.5 **沙箱（M4）**：`sandbox/exec_service.py` 是**纯 stdlib http.server**（镜像零 pip 依赖，
+9.5 **param 解析（M7 修复的潜伏 bug）**：`dag_executor.resolve_params` 中 `$.nodes.X.output`
+   （无字段）与 `.output.field` 都必须正确解析——"output" 是标准访问器，**不能当字段遍历**
+   （曾因遍历 `output["output"]` 返回 None，导致所有 workflow params 静默失效；`when` 条件
+   用 expressions.get_path 无此问题）。改 params 解析必跑 `test_param_resolution_output_accessor`。
+9.6 **沙箱（M4）**：`sandbox/exec_service.py` 是**纯 stdlib http.server**（镜像零 pip 依赖，
    离线可建；加 Java 用 `--build-arg WITH_JDK=1`，默认关）。SandboxClient 本地联调经
    `kubectl port-forward`（macOS 宿主不可路由 pod IP；生产 Worker 在集群内直连 ClusterIP）。
    ActionExecutor 动作是**有限集合 + 白名单**（§10.3），新增动作需评审。
@@ -69,8 +73,8 @@ queue/ lock/ 可插拔队列/锁（memory + kafka/redis 生产适配器）
 statestore/  StateStore（memory/sqlite + postgres 生产适配器）
 service.py   RunService：create / approve / resume 编排
 api/         控制面 FastAPI
-workflows/   bug-fix-pipeline.yaml（design §8.1）
-scripts/     diagnose_scenario{1,2}.py（真实联调）+ verify_sandbox.py
+workflows/   bug-fix-pipeline.yaml（§8.1）+ bug-fix-scenario2.yaml（修复闭环）
+scripts/     diagnose_scenario{1,2}.py + run_fix_loop.py（修复闭环E2E）+ verify_sandbox.py
 docker/sandbox/  沙箱镜像（stdlib-only 离线可建）
 ```
 
