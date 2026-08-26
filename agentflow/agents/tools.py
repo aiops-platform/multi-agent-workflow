@@ -154,6 +154,22 @@ async def _mock_locate_code(service: str, **_: Any) -> dict:
     return {"service": service, "repo_url": f"https://github.com/company/{service}", "base_sha": "abc123"}
 
 
+async def _cmdb_locate_code(cmdb, service: str, **_: Any) -> dict:
+    """CMDB 驱动的 locate_code（design §9.4）：service → RepoSpec。"""
+    spec = await cmdb.get_repo_for_service(service)
+    if spec is None:
+        return {
+            "service": service, "found": False,
+            "summary": f"CMDB 未找到 {service} 对应的 repo（可能未纳管）",
+        }
+    return {
+        "service": service, "found": True,
+        "repo_url": spec.url, "base_sha": spec.base_sha,
+        "suspicious_files": [],
+        "summary": f"CMDB 定位 {service} → {spec.url}",
+    }
+
+
 async def _mock_search_knowledge(query: str, **_: Any) -> dict:
     return {"found": True, "similar_incidents": ["INC0001"], "suggested_actions": []}
 
@@ -169,20 +185,26 @@ MOCK_L1_TOOLS: dict[str, Any] = {
 }
 
 
-def build_l1_tools(agent_name: str, *, use_mock: bool = True) -> list[dict]:
+def build_l1_tools(agent_name: str, *, use_mock: bool = True, cmdb=None) -> list[dict]:
     """为 agent 生成 L1 工具列表（AgentScope FunctionTool 形态）。
 
     ``use_mock=True`` 时绑定 mock 实现（本地联调 / 无数据源时的回退）。
+    传 ``cmdb``（TenantMappingProvider）时，``locate_code`` 走 CMDB 查询（§9.4）。
     数据源就绪后切换为 MCP 工具（mcp.py）。
     """
     tools = []
     for spec in tools_for_agent(agent_name):
         if spec.level != "L1":
             continue
+        func = MOCK_L1_TOOLS.get(spec.name)
+        if spec.name == "locate_code" and cmdb is not None:
+            from functools import partial
+
+            func = partial(_cmdb_locate_code, cmdb)
         tools.append({
             "name": spec.name,
             "description": spec.description,
             "parameters": {"type": "object", "properties": {}},
-            "func": MOCK_L1_TOOLS.get(spec.name),
+            "func": func,
         })
     return tools

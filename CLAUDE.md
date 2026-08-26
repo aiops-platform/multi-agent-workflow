@@ -26,6 +26,8 @@ make lint      # ruff 检查
 6. **版本冻结**（`core/workflow.py`）：Run 用 `workflow_hash` 复用 snapshot，Resume 只读原 snapshot。
 7. **多租户**：所有表带 `tenant_id`；租户身份由 JWT 派生（§9.1），代码里禁止以客户端提交的
    tenant 为授权依据（M5 接入 Gateway 前本地联调可显式传参）。
+8. **Git 版本冻结**（§4.6/§8.7）：`workspace/manager.py` 明确不提供 git_pull；Run 期间工作区
+   HEAD 必须 == base_sha，漂移报 `FrozenVersionMismatch`。每个 Run 用 `aiops/RUN_{run_id}` 分支隔离。
 
 ## 结构速览
 
@@ -34,6 +36,7 @@ core/        Workflow 模型 + DAG 语义 + 版本冻结（M0）
 statestore/  State Model：InMemory / SQLite（M0）
 executor/    并发 DAGExecutor + 幂等 + Retry + Resume（M2）
 agents/      15-agent 编队 + AgentScope 适配 + 工具治理（M1 骨架）
+workspace/   WorkspaceManager + CMDB（M3）
 queue/ lock/ 可插拔队列/锁（memory + M6 stub）
 service.py   RunService：create / approve / resume 编排
 api/         控制面 FastAPI
@@ -46,6 +49,7 @@ workflows/   bug-fix-pipeline.yaml（design §8.1）
 - `tests/test_executor.py`：join/skip/审批 CAS/skip 级联/失败 abort
 - `tests/test_resume.py`：SQLite 断点续跑 + RunService 端到端
 - `tests/test_idempotency.py`：external_operation_id 复用 / retry / 负证据
+- `tests/test_workspace.py`：base_sha 冻结 / 分支隔离 / 幂等 / 无 pull（file:// 本地源）
 - demo 用脚本化 runner（无真实 LLM）；真实模型见 `agents/scopes.py:build_model`
 
 ## 里程碑

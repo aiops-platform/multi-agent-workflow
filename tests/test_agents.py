@@ -28,3 +28,22 @@ async def test_agent_scripted_json_roundtrip() -> None:
     out = await run_agent(agent, {"bug": "订单报价单打印失败"})
     assert out.get("error_type") == "IOException"
     assert out.get("summary") == "磁盘满"
+
+
+async def test_code_locator_cmdb_driven() -> None:
+    """§9.4：code-locator 的 locate_code 走 CMDB（service → RepoSpec）。"""
+    from agentflow.agents.tools import build_l1_tools
+    from agentflow.workspace.cmdb import MockCmdbProvider
+
+    cmdb = MockCmdbProvider(
+        {"team-alpha": {"warranty-service": "https://github.com/company/warranty-service"}}
+    )
+    tools = build_l1_tools("code-locator", use_mock=True, cmdb=cmdb)
+    locate = next(t for t in tools if t["name"] == "locate_code")
+    out = await locate["func"](service="warranty-service")
+    assert out["found"] is True
+    assert out["repo_url"] == "https://github.com/company/warranty-service"
+
+    # CMDB 未纳管的 service → found=False（负证据）
+    out2 = await locate["func"](service="unknown-service")
+    assert out2["found"] is False

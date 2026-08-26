@@ -9,7 +9,8 @@
 | **M0** | Workflow 版本冻结 + DAG 语义（join/skip）+ State Model | ✅ 已实现（见 `agentflow/core` + `statestore`） |
 | **M1** | AgentScope 适配层（2.0.3 锁定）+ 15-agent 编队 + 工具治理 | 🟡 骨架就绪（`agents/`），mock 数据源可跑 |
 | **M2** | DAG Executor + Node Attempt + Retry + Resume | ✅ 已实现（见 `executor/`），含复杂拓扑补测 |
-| M3-M6 | Workspace/Sandbox/Approval/生产适配器 | ⏳ 后续里程碑 |
+| **M3** | Workspace（Git base_sha 冻结 + 分支隔离）+ CMDB 驱动 | ✅ 已实现（见 `workspace/`），31 tests |
+| M4 | Sandbox（独立 Pod + 安全基线）+ Tool Policy + Resource Limits | ⏳ 后续里程碑 |
 
 > AgentScope 版本**锁定 2.0.3**（design §5）。升级前必须重跑 S-001/S-011。
 
@@ -41,12 +42,13 @@ agentflow/
 ├── statestore/        # M0：State Model（InMemory / SQLite，表结构对齐 §8.8）
 ├── queue/ lock/       # M0：可插拔队列/锁（memory + M6 stub）
 ├── executor/          # M2：并发 DAG Executor + 幂等 + Retry + Resume
-├── agents/            # M1：15-agent 编队 + AgentScope 适配 + 工具治理
+├── agents/            # M1：15-agent 编队 + AgentScope 适配 + 工具治理（locate_code 走 CMDB）
+├── workspace/         # M3：WorkspaceManager（base_sha 冻结/分支隔离/无 git_pull）+ CMDB
 ├── api/               # 控制面 FastAPI（M5 前最小形态）
 └── service.py         # RunService：create / approve / resume 编排
 workflows/
 └── bug-fix-pipeline.yaml   # design §8.1 完整示例
-tests/                 # M0/M2 语义测试
+tests/                 # M0-M3 语义测试（31 tests）
 ```
 
 ## 设计要点对照
