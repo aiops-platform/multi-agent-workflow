@@ -9,6 +9,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -18,13 +19,15 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=(ROOT / ".env",),
         env_prefix="AGENTFLOW_",
+        env_nested_delimiter="__",
         extra="ignore",
     )
 
     # ---- LLM（design §16.3：deepseek-v4-flash）----
-    deepseek_api_key: str = ""
-    deepseek_base_url: str = "https://api.deepseek.com/v1"
-    deepseek_model: str = "deepseek-v4-flash"
+    # 兼容两种环境变量：AGENTFLOW_DEEPSEEK_API_KEY（本库）与 DEEPSEEK_API_KEY（spike/.env 惯例）
+    deepseek_api_key: str = Field(default="", validation_alias=AliasChoices("AGENTFLOW_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"))
+    deepseek_base_url: str = Field(default="https://api.deepseek.com/v1", validation_alias=AliasChoices("AGENTFLOW_DEEPSEEK_BASE_URL", "DEEPSEEK_BASE_URL"))
+    deepseek_model: str = Field(default="deepseek-v4-flash", validation_alias=AliasChoices("AGENTFLOW_DEEPSEEK_MODEL", "DEEPSEEK_MODEL"))
 
     # ---- StateStore ----
     state_store: str = "sqlite"  # sqlite | memory | postgres(M6)

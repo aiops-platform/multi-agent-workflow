@@ -14,10 +14,37 @@ from typing import AsyncGenerator
 from agentscope.agent import Agent, ReActConfig
 from agentscope.message import Msg, TextBlock, ToolCallBlock, UserMsg
 from agentscope.model import ChatModelBase
-from agentscope.permission import PermissionContext, PermissionMode
+from agentscope.permission import PermissionBehavior, PermissionContext, PermissionMode, PermissionRule
 from agentscope.state import AgentState
 
 from ..config import Settings, get_settings
+
+
+def build_permission_context(
+    agent_name: str,
+    *,
+    mode: PermissionMode = PermissionMode.DONT_ASK,
+    tenant_id: str = "local",
+    allow_extra: list[str] | None = None,
+) -> PermissionContext:
+    """租户级工具权限上下文（design §9.5：DONT_ASK + allow 规则 = 无人值守 + 安全）。
+
+    把 agent 在 Tool Registry 中注册的 L1 工具加入 allow 规则（白名单免确认执行）；
+    未授权工具在 DONT_ASK 下由 PermissionEngine 一律 DENY 且不执行。叠加租户
+    deny 规则（M5 接入 tenant 配置）后取交集。
+    """
+    from .tools import tools_for_agent
+
+    ctx = PermissionContext(mode=mode)
+    tool_names = [spec.name for spec in tools_for_agent(agent_name)] + (allow_extra or [])
+    for tool in tool_names:
+        ctx.allow_rules.setdefault(tool, []).append(
+            PermissionRule(
+                tool_name=tool, rule_content=None,
+                behavior=PermissionBehavior.ALLOW, source=f"tenant/{tenant_id}",
+            )
+        )
+    return ctx
 
 
 def build_model(settings: Settings | None = None) -> ChatModelBase:
@@ -41,17 +68,23 @@ def build_model(settings: Settings | None = None) -> ChatModelBase:
     )
 
 
-def build_agent(name: str, toolkit, model: ChatModelBase) -> Agent:
+def build_agent(
+    name: str,
+    toolkit,
+    model: ChatModelBase,
+    *,
+    permission_context: PermissionContext | None = None,
+    tenant_id: str = "local",
+) -> Agent:
     from .prompts import SYSTEM_PROMPTS
 
+    ctx = permission_context or build_permission_context(name, tenant_id=tenant_id)
     return Agent(
         name=name,
         system_prompt=SYSTEM_PROMPTS.get(name, "你是 AI 运维平台智能体。"),
         model=model,
         toolkit=toolkit,
-        state=AgentState(
-            permission_context=PermissionContext(mode=PermissionMode.DONT_ASK)
-        ),
+        state=AgentState(permission_context=ctx),
         react_config=ReActConfig(max_iters=6),
     )
 

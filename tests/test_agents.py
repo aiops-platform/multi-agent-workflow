@@ -18,6 +18,20 @@ async def test_toolkit_l1_function_registered() -> None:
     assert "query_logs" in names
 
 
+def test_permission_context_allow_rules_for_agent_tools() -> None:
+    """§9.5：DONT_ASK + allow 规则（agent 注册工具入白名单）。"""
+    from agentscope.permission import PermissionBehavior, PermissionMode
+
+    from agentflow.agents.scopes import build_permission_context
+
+    ctx = build_permission_context("log-analyst", tenant_id="team-alpha")
+    assert ctx.mode == PermissionMode.DONT_ASK
+    allowed = set(ctx.allow_rules.keys())
+    assert "query_logs" in allowed  # log-analyst 注册的 L1 工具已入 allow
+    # 未授权工具（如写类）不应在 allow 里
+    assert "sandbox_run_shell" not in allowed
+
+
 async def test_agent_scripted_json_roundtrip() -> None:
     """§7 输出契约：agent 输出严格 JSON 且可被 extract_json 解析。"""
     toolkit = build_toolkit("log-analyst", use_mock=True)

@@ -42,14 +42,36 @@ agentflow/
 ├── statestore/        # M0：State Model（InMemory / SQLite，表结构对齐 §8.8）
 ├── queue/ lock/       # M0：可插拔队列/锁（memory + M6 stub）
 ├── executor/          # M2：并发 DAG Executor + 幂等 + Retry + Resume
-├── agents/            # M1：15-agent 编队 + AgentScope 适配 + 工具治理（locate_code 走 CMDB）
+├── agents/            # M1：15-agent 编队 + AgentScope 适配 + 工具治理 + 权限上下文
+│   └── datasources.py # 真实数据源适配（ES/Prometheus/kubectl，testbed 联调）
 ├── workspace/         # M3：WorkspaceManager（base_sha 冻结/分支隔离/无 git_pull）+ CMDB
 ├── api/               # 控制面 FastAPI（M5 前最小形态）
 └── service.py         # RunService：create / approve / resume 编排
 workflows/
 └── bug-fix-pipeline.yaml   # design §8.1 完整示例
-tests/                 # M0-M3 语义测试（31 tests）
+scripts/
+└── diagnose_scenario1.py   # 场景1 真实联调：DeepSeek + 真实数据源诊断链
+tests/                 # M0-M3 语义测试（36 tests）
 ```
+
+## testbed 真实联调（场景1 已验证 ✅）
+
+```bash
+# 1. 部署 testbed（services + ES/Prometheus + configmaps + port-forward）
+cd ../testbed && bash scripts/port-forward-all.sh
+
+# 2. 注入场景1 故障（磁盘 + CPU 打满）
+bash fault-inject/scenario1.sh
+
+# 3. 跑真实诊断链（DeepSeek + ES/Prometheus/kubectl 真实工具）
+cd ../backend && source ../spike/.env && ./venv/bin/python scripts/diagnose_scenario1.py
+# → root_cause_type: infra_issue（磁盘打满），命中 SCENARIOS 期望
+
+# 4. 恢复
+bash fault-inject/scenario1-recover.sh
+```
+
+数据源与工具签名一致（SCENARIOS §5.2），mock/真实切换只换 adapter，agent 定义不变。
 
 ## 设计要点对照
 

@@ -23,11 +23,13 @@ def build_toolkit(
     use_mock: bool = True,
     mcp_clients: list | None = None,
     cmdb=None,
+    datasource=None,
 ) -> Toolkit:
-    """为 agent 构建 Toolkit：L1 只读工具（mock 或 MCP client）+ 可选额外 MCP。
+    """为 agent 构建 Toolkit：L1 只读工具（mock / 真实数据源 / MCP client）。
 
     - ``use_mock=True``：L1 工具用 ``FunctionTool`` 包装 mock 实现（本地联调），
-      不依赖任何数据源凭证；传 ``cmdb`` 时 ``locate_code`` 走 CMDB（§9.4）。
+      不依赖任何数据源凭证；传 ``cmdb`` 时 ``locate_code`` 走 CMDB（§9.4）；
+      传 ``datasource`` 时日志/指标/基础设施工具绑定真实 testbed。
     - 数据源就绪：传 ``mcp_clients``（每个数据源一个 client），并置 use_mock=False。
     """
     if use_mock:
@@ -38,7 +40,7 @@ def build_toolkit(
                 description=t["description"],
                 is_read_only=True,
             )
-            for t in build_l1_tools(agent_name, use_mock=True, cmdb=cmdb)
+            for t in build_l1_tools(agent_name, use_mock=True, cmdb=cmdb, datasource=datasource)
             if t["func"] is not None
         ]
         return Toolkit(tools=tools)

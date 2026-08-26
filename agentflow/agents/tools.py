@@ -185,12 +185,13 @@ MOCK_L1_TOOLS: dict[str, Any] = {
 }
 
 
-def build_l1_tools(agent_name: str, *, use_mock: bool = True, cmdb=None) -> list[dict]:
+def build_l1_tools(agent_name: str, *, use_mock: bool = True, cmdb=None, datasource=None) -> list[dict]:
     """为 agent 生成 L1 工具列表（AgentScope FunctionTool 形态）。
 
-    ``use_mock=True`` 时绑定 mock 实现（本地联调 / 无数据源时的回退）。
-    传 ``cmdb``（TenantMappingProvider）时，``locate_code`` 走 CMDB 查询（§9.4）。
-    数据源就绪后切换为 MCP 工具（mcp.py）。
+    - ``use_mock=True``：绑定 mock 实现（本地联调 / 无数据源时的回退）。
+    - 传 ``cmdb``（TenantMappingProvider）：``locate_code`` 走 CMDB 查询（§9.4）。
+    - 传 ``datasource``（RealDataSourceAdapter）：``query_logs``/``query_metrics``/
+      ``check_infra``/``describe_pod`` 绑定真实数据源（testbed 联调），工具签名不变。
     """
     tools = []
     for spec in tools_for_agent(agent_name):
@@ -201,6 +202,10 @@ def build_l1_tools(agent_name: str, *, use_mock: bool = True, cmdb=None) -> list
             from functools import partial
 
             func = partial(_cmdb_locate_code, cmdb)
+        elif datasource is not None and hasattr(datasource, spec.name):
+            from functools import partial
+
+            func = partial(getattr(datasource, spec.name))
         tools.append({
             "name": spec.name,
             "description": spec.description,

@@ -28,6 +28,13 @@ make lint      # ruff 检查
    tenant 为授权依据（M5 接入 Gateway 前本地联调可显式传参）。
 8. **Git 版本冻结**（§4.6/§8.7）：`workspace/manager.py` 明确不提供 git_pull；Run 期间工作区
    HEAD 必须 == base_sha，漂移报 `FrozenVersionMismatch`。每个 Run 用 `aiops/RUN_{run_id}` 分支隔离。
+9. **工具权限**（§9.5）：`build_agent` 默认 DONT_ASK + agent 注册工具的 allow 规则。
+   没有 allow 规则时 DONT_ASK 下工具全部 DENY（联调踩过：agent 只能靠提示词推理）。
+   `build_permission_context` 生成上下文；租户 deny 规则 M5 接入。
+10. **真实数据源**（testbed 联调）：`datasources.py` 的 adapter 与 mock 工具签名一致
+    （SCENARIOS §5.2），数据源切换只换 adapter。ES index `app-logs`（app.* 字段）、
+    Prometheus cAdvisor（`container_*`）、kubectl namespace `order`。联调脚本
+    `scripts/diagnose_scenario1.py`（需 `source ../spike/.env` 供 DEEPSEEK_API_KEY）。
 
 ## 结构速览
 
@@ -36,11 +43,14 @@ core/        Workflow 模型 + DAG 语义 + 版本冻结（M0）
 statestore/  State Model：InMemory / SQLite（M0）
 executor/    并发 DAGExecutor + 幂等 + Retry + Resume（M2）
 agents/      15-agent 编队 + AgentScope 适配 + 工具治理（M1 骨架）
+             ├ datasources.py  真实数据源适配（ES/Prometheus/kubectl，testbed）
+             └ scopes.py       build_permission_context（§9.5 DONT_ASK+allow）
 workspace/   WorkspaceManager + CMDB（M3）
 queue/ lock/ 可插拔队列/锁（memory + M6 stub）
 service.py   RunService：create / approve / resume 编排
 api/         控制面 FastAPI
 workflows/   bug-fix-pipeline.yaml（design §8.1）
+scripts/     diagnose_scenario1.py（真实联调）
 ```
 
 ## 测试
