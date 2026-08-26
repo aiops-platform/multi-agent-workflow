@@ -57,6 +57,18 @@ def _prom_handler(request: httpx.Request) -> httpx.Response:
     })
 
 
+def _trace_handler(request: httpx.Request) -> httpx.Response:
+    assert request.url.path == "/app-logs/_search"
+    return httpx.Response(200, json={
+        "hits": {"hits": [
+            {"_source": {"app": {"@timestamp": "t1", "level": "INFO", "service": "order-service",
+                                 "traceId": "tr-1", "message": "结账请求进入"}}},
+            {"_source": {"app": {"@timestamp": "t2", "level": "ERROR", "service": "warranty-service",
+                                 "traceId": "tr-1", "message": "查询三包期失败: fin 没有传"}}},
+        ]},
+    })
+
+
 async def test_query_logs_builds_es_request() -> None:
     ds = _adapter(_es_handler)
     out = await ds.query_logs(service="order-service", level="ERROR")
@@ -70,6 +82,16 @@ async def test_query_metrics_builds_prom_request() -> None:
     ds = _adapter(_prom_handler)
     out = await ds.query_metrics(service="order-service", metric="cpu")
     assert out["value"] == 0.5
+    await ds.aclose()
+
+
+async def test_get_trace_reconstructs_chain_and_failing_span() -> None:
+    """get_trace：按 traceId 重建调用链，判定故障 span（下游 warranty）。"""
+    ds = _adapter(_trace_handler)
+    out = await ds.get_trace(trace_id="tr-1")
+    services = {s["service"] for s in out["chain"]}
+    assert services == {"order-service", "warranty-service"}
+    assert out["failing_service"] == "warranty-service"  # ERROR 未完成的服务
     await ds.aclose()
 
 

@@ -75,6 +75,7 @@ def build_agent(
     *,
     permission_context: PermissionContext | None = None,
     tenant_id: str = "local",
+    max_iters: int = 10,
 ) -> Agent:
     from .prompts import SYSTEM_PROMPTS
 
@@ -85,7 +86,7 @@ def build_agent(
         model=model,
         toolkit=toolkit,
         state=AgentState(permission_context=ctx),
-        react_config=ReActConfig(max_iters=6),
+        react_config=ReActConfig(max_iters=max_iters),
     )
 
 

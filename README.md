@@ -54,24 +54,29 @@ scripts/
 tests/                 # M0-M3 语义测试（36 tests）
 ```
 
-## testbed 真实联调（场景1 已验证 ✅）
+## testbed 真实联调（场景1 + 场景2 已验证 ✅）
 
 ```bash
 # 1. 部署 testbed（services + ES/Prometheus + configmaps + port-forward）
 cd ../testbed && bash scripts/port-forward-all.sh
 
-# 2. 注入场景1 故障（磁盘 + CPU 打满）
+# 2. 场景1：注入故障（磁盘 + CPU 打满）→ 诊断 → 恢复
 bash fault-inject/scenario1.sh
-
-# 3. 跑真实诊断链（DeepSeek + ES/Prometheus/kubectl 真实工具）
 cd ../backend && source ../spike/.env && ./venv/bin/python scripts/diagnose_scenario1.py
-# → root_cause_type: infra_issue（磁盘打满），命中 SCENARIOS 期望
+# → root_cause_type: infra_issue（磁盘 EmptyDir 写满），命中期望
+cd ../testbed && bash fault-inject/scenario1-recover.sh
 
-# 4. 恢复
-bash fault-inject/scenario1-recover.sh
+# 3. 场景2：注入故障（warranty fin 缺参 + 吞异常）→ 诊断 → 恢复
+bash fault-inject/scenario2.sh
+curl -s --max-time 8 -X POST "http://localhost:18080/checkout?orderId=ORD20260819001"   # 触发（挂起）
+cd ../backend && ./venv/bin/python scripts/diagnose_scenario2.py
+# → root_cause_type: code_bug（warranty-service fin 缺参），置信度 0.92，命中期望
+cd ../testbed && bash fault-inject/scenario2-recover.sh
 ```
 
 数据源与工具签名一致（SCENARIOS §5.2），mock/真实切换只换 adapter，agent 定义不变。
+`get_trace`：ES 按 traceId 重建调用链并判定故障 span（真实 testbed 的 traceId 未跨服务共享，
+无 traceId 时回退最近时间窗）。
 
 ## 设计要点对照
 

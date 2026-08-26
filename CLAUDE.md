@@ -32,9 +32,12 @@ make lint      # ruff 检查
    没有 allow 规则时 DONT_ASK 下工具全部 DENY（联调踩过：agent 只能靠提示词推理）。
    `build_permission_context` 生成上下文；租户 deny 规则 M5 接入。
 10. **真实数据源**（testbed 联调）：`datasources.py` 的 adapter 与 mock 工具签名一致
-    （SCENARIOS §5.2），数据源切换只换 adapter。ES index `app-logs`（app.* 字段）、
-    Prometheus cAdvisor（`container_*`）、kubectl namespace `order`。联调脚本
-    `scripts/diagnose_scenario1.py`（需 `source ../spike/.env` 供 DEEPSEEK_API_KEY）。
+    （SCENARIOS §5.2），数据源切换只换 adapter。ES index `app-logs`（字段是 `app.traceId`
+    驼峰，不是 `trace_id`）、Prometheus cAdvisor（`container_*`）、kubectl namespace `order`。
+    `get_trace`：ES 按 traceId 重建调用链判故障 span（testbed 的 traceId 未跨服务共享，
+    无 traceId 回退时间窗）。联调脚本 `scripts/diagnose_scenario{1,2}.py`
+    （需 `source ../spike/.env` 供 DEEPSEEK_API_KEY）。trace-analyst 需 `max_iters≥12`
+    （2 个工具 + 链合成，默认 6 会迭代耗尽返回 {}）。
 
 ## 结构速览
 

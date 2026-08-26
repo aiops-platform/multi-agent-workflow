@@ -55,7 +55,13 @@ class RealDataSourceAdapter:
         if level:
             filters.append({"term": {"app.level.keyword": level.upper()}})
         if trace_id:
-            filters.append({"term": {"app.trace_id.keyword": trace_id}})
+            # 真实 testbed 日志字段为 app.traceId（驼峰），兼容两种写法
+            filters.append({
+                "bool": {"should": [
+                    {"term": {"app.traceId.keyword": trace_id}},
+                    {"term": {"app.trace_id.keyword": trace_id}},
+                ]}
+            })
         body = {
             "size": min(limit, 200),
             "sort": [{"@timestamp": "desc"}],
@@ -80,6 +86,78 @@ class RealDataSourceAdapter:
             })
         return {"found": bool(logs), "count": len(logs), "logs": logs,
                 "summary": f"ES 返回 {len(logs)} 条日志（service={service}, level={level}）"}
+
+    # ------------------------------------------------------------------
+    # get_trace → ES 按 traceId 关联重建调用链（SCENARIOS §3.6 / §6.6）
+    # 真实 testbed 的 traceId 未必跨服务共享：支持按 traceId 查询；
+    # 无 traceId 时回退为最近时间窗全链路日志。
+    # ------------------------------------------------------------------
+    async def get_trace(
+        self, trace_id: str | None = None, service: str | None = None,
+        minutes: int = 15, limit: int = 100,
+    ) -> dict:
+        filters: list[dict] = []
+        if trace_id:
+            filters.append({
+                "bool": {"should": [
+                    {"term": {"app.traceId.keyword": trace_id}},
+                    {"term": {"app.trace_id.keyword": trace_id}},
+                ]}
+            })
+        if service:
+            filters.append({"term": {"app.service.keyword": service}})
+        if not trace_id:
+            filters.append({"range": {"@timestamp": {"gte": f"now-{minutes}m"}}})
+
+        body = {
+            "size": min(limit, 200),
+            "sort": [{"@timestamp": "asc"}],
+            "query": {"bool": {"filter": filters}} if filters else {"match_all": {}},
+        }
+        resp = await self._client.post(f"{self.es_url}/{ES_INDEX}/_search", json=body)
+        if resp.status_code >= 400:
+            raise DataSourceError(f"ES trace 查询失败 ({resp.status_code}): {resp.text[:200]}")
+        hits = resp.json().get("hits", {}).get("hits", [])
+        logs = []
+        for h in hits:
+            app = h.get("_source", {}).get("app", {})
+            logs.append({
+                "@timestamp": app.get("@timestamp"),
+                "level": app.get("level"),
+                "service": app.get("service"),
+                "trace_id": app.get("traceId") or app.get("trace_id"),
+                "message": (app.get("message") or "")[:200],
+            })
+
+        # 按 service 分组，重建调用链 + 判定故障 span
+        spans: dict[str, list[dict]] = {}
+        for l in logs:
+            spans.setdefault(l["service"], []).append(l)
+
+        chain = []
+        failing = None
+        for svc, slogs in spans.items():
+            has_error = any(l["level"] == "ERROR" for l in slogs)
+            completed = any(
+                ("完成" in l["message"] or "成功" in l["message"] or "成功" in l["message"])
+                for l in slogs
+            )
+            first_error = next((l["message"] for l in slogs if l["level"] == "ERROR"), None)
+            span = {
+                "service": svc, "spans": len(slogs),
+                "has_error": has_error, "completed": completed,
+                "first_error": first_error,
+            }
+            chain.append(span)
+            if has_error and not completed and failing is None:
+                failing = svc
+
+        return {
+            "trace_id": trace_id, "total": len(logs),
+            "chain": chain, "failing_service": failing, "logs": logs[:20],
+            "summary": f"trace 重建 {len(logs)} 条日志 / {len(chain)} 个服务"
+                       + (f"，故障 span 疑似 {failing}" if failing else "，未见明显故障 span"),
+        }
 
     # ------------------------------------------------------------------
     # query_metrics → Prometheus（cAdvisor/kubelet 采集）
