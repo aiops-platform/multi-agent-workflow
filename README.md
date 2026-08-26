@@ -58,20 +58,20 @@ tests/                 # M0-M3 语义测试（36 tests）
 
 ```bash
 # 1. 部署 testbed（services + ES/Prometheus + configmaps + port-forward）
-cd ../testbed && bash scripts/port-forward-all.sh
+cd ../../agentflow-testbed && bash scripts/port-forward-all.sh
 
 # 2. 场景1：注入故障（磁盘 + CPU 打满）→ 诊断 → 恢复
 bash fault-inject/scenario1.sh
 cd ../backend && source ../spike/.env && ./venv/bin/python scripts/diagnose_scenario1.py
 # → root_cause_type: infra_issue（磁盘 EmptyDir 写满），命中期望
-cd ../testbed && bash fault-inject/scenario1-recover.sh
+cd ../../agentflow-testbed && bash fault-inject/scenario1-recover.sh
 
 # 3. 场景2：注入故障（warranty fin 缺参 + 吞异常）→ 诊断 → 恢复
 bash fault-inject/scenario2.sh
 curl -s --max-time 8 -X POST "http://localhost:18080/checkout?orderId=ORD20260819001"   # 触发（挂起）
 cd ../backend && ./venv/bin/python scripts/diagnose_scenario2.py
 # → root_cause_type: code_bug（warranty-service fin 缺参），置信度 0.92，命中期望
-cd ../testbed && bash fault-inject/scenario2-recover.sh
+cd ../../agentflow-testbed && bash fault-inject/scenario2-recover.sh
 ```
 
 数据源与工具签名一致（SCENARIOS §5.2），mock/真实切换只换 adapter，agent 定义不变。

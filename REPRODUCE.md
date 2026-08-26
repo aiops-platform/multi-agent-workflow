@@ -5,7 +5,7 @@
 
 **目录约定**：
 - `BACKEND` = `/Users/bo.gong/Documents/accenture/workspace/multi-agent-workflow/backend`
-- `TESTBED` = `/Users/bo.gong/Documents/accenture/workspace/multi-agent-workflow/testbed`
+- `TESTBED` = `/Users/bo.gong/Documents/accenture/workspace/agentflow-testbed`（即 `../agentflow-testbed`，独立仓库）
 - 数据源端点：ES `:19200`、Prometheus `:19090`、order `:18080`、warranty `:18081`、gateway `:18082`
 
 ---
