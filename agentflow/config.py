@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     # ---- Kafka（M6）----
     kafka_bootstrap: str = "localhost:9092"
 
+    # ---- CORS（控制面 API 前端跨域，逗号分隔的 origin 列表，默认 *）----
+    cors_origins: str = "*"
+
     # ---- 沙箱（M4）----
     open_sandbox_domain: str = "localhost:8080"
     open_sandbox_api_key: str = ""

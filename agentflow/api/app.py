@@ -10,8 +10,10 @@ import asyncio
 
 import yaml
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from ..agents.registry import AGENT_REGISTRY
 from ..approval.notifier import ApprovalNotifier
 from ..approval.sweeper import ApprovalSweeper
 from ..config import Settings, get_settings
@@ -26,6 +28,16 @@ settings: Settings = get_settings()
 app = FastAPI(title="agentflow 控制面", version="0.1.0")
 service: RunService | None = None
 sweeper: ApprovalSweeper | None = None
+
+# CORS：允许前端跨域调用控制面 API。来源可配（AGENTFLOW_CORS_ORIGINS 逗号分隔，默认 *）。
+# allow_origins=* 时不可开启 allow_credentials（浏览器规范限制）；JWT 走 Authorization 头不受影响。
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class RunRequest(BaseModel):
@@ -100,6 +112,21 @@ async def approve(run_id: str, node_id: str, req: ApproveRequest) -> dict:
 async def audit(tenant_id: str | None = None, run_id: str | None = None, limit: int = 100) -> list[dict]:
     """审计日志查询（§9.5：tenant_id/tool_name/decision/run_id/node_id/input 脱敏/ts）。"""
     return await _service().store.get_audit_logs(tenant_id=tenant_id, run_id=run_id, limit=limit)
+
+
+@app.get("/agents")
+async def agents() -> list[dict]:
+    """Agent 编队列表（静态平台元数据，读取 AGENT_REGISTRY；与 /health 同级无鉴权）。
+
+    返回 [{name, description, tools, stage}]，tools 为该 agent 在 Tool Registry 中可见的工具名，
+    stage 为流水线阶段（detect/diagnose/fix/verify/deliver/learn），供前端舰队分组展示。
+    """
+    return [
+        {"name": spec.name, "description": spec.description,
+         "tools": [t.name for t in spec.tools],
+         "stage": spec.stage}
+        for spec in AGENT_REGISTRY.values()
+    ]
 
 
 @app.get("/health")
