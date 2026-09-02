@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """并发 DAG 执行器（design §8.2 join/skip 语义 + §8.6 Worker 生命周期）。
 
 语义要点（对应 S-008b / S-010b 实测）：
@@ -15,27 +14,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from ..core.dag import (
     DAG,
-    Node,
-    PENDING,
-    RUNNING,
     DONE,
-    SKIPPED,
-    WAITING_APPROVAL,
+    PENDING,
     REJECTED,
+    RUNNING,
+    SKIPPED,
     TERMINAL,
-    EDGE_ACTIVE,
-    EDGE_INACTIVE,
+    WAITING_APPROVAL,
+    Node,
 )
 from ..core.expressions import eval_condition
 from ..statestore.base import (
-    APPROVAL_WAITING,
     APPROVAL_APPROVED,
     APPROVAL_REJECTED,
+    APPROVAL_WAITING,
     StateStore,
 )
 from .idempotency import execute_with_idempotency
@@ -76,8 +74,7 @@ def _resolve_param(value: Any, ctx: dict) -> Any:
             # "output" 是标准访问器（取节点输出值），不是节点输出的字段
             if field_path == "output":
                 return node_output
-            if field_path.startswith("output."):
-                field_path = field_path[len("output."):]
+            field_path = field_path.removeprefix("output.")
             if not field_path:
                 return node_output
             cur: Any = node_output
@@ -245,7 +242,7 @@ class DAGExecutor:
             if decision == "ready":
                 params = node.params or {}
                 timeout_s = int(params.get("timeout", 3600))
-                timeout_at = datetime.now(timezone.utc) + timedelta(seconds=timeout_s)
+                timeout_at = datetime.now(UTC) + timedelta(seconds=timeout_s)
                 self.node_states[nid] = {
                     "status": WAITING_APPROVAL,
                     "output": None,
@@ -304,7 +301,14 @@ class DAGExecutor:
         params = resolve_params(node.params, ctx)
         try:
             output = await self._run_with_retry(node, params)
-            self.node_states[nid] = {"status": DONE, "output": output, "params": params}
+            state: dict = {"status": DONE, "output": output, "params": params}
+            # 真实 node_runner（AgentNodeRunner）暴露 last_usage → 合并 token/cost 计量；
+            # mock _default_runner 无 last_usage → 保持无 tokens/cost（聚合 GET 诚实 0）
+            usage = getattr(self.node_runner, "last_usage", None)
+            if usage:
+                state["tokens"] = usage.get("tokens", 0)
+                state["cost"] = usage.get("cost", 0.0)
+            self.node_states[nid] = state
             await self._persist(nid)
             log.info("[%s] done %s", self.run_id, nid)
         except WorkflowNodeFailed as exc:
@@ -389,7 +393,7 @@ class DAGExecutor:
         store: StateStore,
         node_runner: NodeRunner | None = None,
         inputs: dict | None = None,
-    ) -> "DAGExecutor":
+    ) -> DAGExecutor:
         """从 StateStore 的节点级 checkpoint 重建执行器（§8.4 / §4.4 Resume）。
 
         - 终态（done/skipped/rejected）回填输出；
