@@ -309,3 +309,26 @@ edges:
 - `agentflow/statestore/base.py` / `sqlite.py` — 表结构 + get_run 原始记录
 - `agentflow/executor/dag_executor.py` — 节点状态 `{status, output, params}`
 - `workflows/bug-fix-pipeline.yaml` — 本仓库 YAML 示例（kind: approval 模型）
+
+---
+
+## 9. MCP Server 配置端点契约（v1.11.0）
+
+> SIP「MCP Server 配置」页调用的后端：配置**通用的 MCP server**（stdio / streamable HTTP / SSE）并
+> **绑定给 agent**，agent 运行时经 AgentScope `MCPClient` 把 MCP 工具与 function tool **共存**
+> （hybrid toolkit）。存储/运行时实现与「测试连接」/安全注意详见
+> `docs/MCP_SERVER_CONFIG_zh-CN.md`。
+
+| 方法 | 路径 | 请求 | 响应 | 说明 |
+|---|---|---|---|---|
+| POST | `/mcp-servers` | `{name, transport, config, is_stateful?, agents, enable_tools?, disable_tools?, enabled}` | `201 {id}` | 落库 + 热刷新 client。`name` 须 `^[a-zA-Z0-9_-]+$` 且唯一；`transport ∈ stdio\|http`；stdio 强制 `is_stateful=true`（缺 `command`/http 缺 `url`/重复名 → 400 中文）。config 为嵌套 JSON（stdio 存 `command/args/env/cwd`，http 存 `url/headers/timeout`） |
+| GET | `/mcp-servers` | — | `[{id, name, transport, config, is_stateful, agents, enable_tools, disable_tools, enabled, created_at, updated_at}]` | 全部记录（created_at 倒序） |
+| GET | `/mcp-servers/{mid}` | — | 单条（同 GET 列表元素）| 不存在 → 404 |
+| PUT | `/mcp-servers/{mid}` | 同 POST body | `{ok, id}` | 更新 + 热刷新（`enabled=false` 或删行 → 只 evict 不重建）。不存在 → 404 |
+| DELETE | `/mcp-servers/{mid}` | — | `{ok: true}` | 删除 + evict（关 stateful 连接/杀 stdio 子进程）。不存在 → 404 |
+| POST | `/mcp-servers/test` | `{transport, config, is_stateful?, enable_tools?, disable_tools?}` | `{ok, transport, tools:[{name, description, read_only, llm_name}], error?}` | **不落库**。临时建 client 连一次列工具；连不上/超时(10s)/配置坏 → `{ok:false, error}`（不抛 500）。注册在 `/{mid}` 系列之前 |
+| GET | `/mcp-servers/{mid}/tools` | — | 同 `/test` 响应 | 已存 server 实时连接列工具（走 `MCPClientManager.test_connection`）。不存在 → 404 |
+
+- `llm_name` = AgentScope 侧精确工具名 `mcp__{server}__{sanitized_tool}`（含 sanitize：如 `query.repo` → `queryxrepo`），前端可展示；allow 名单按此精确匹配。
+- `read_only` = 是否携带只读标注（true → 运行时自动 ALLOW；false → 需 allow 规则）。
+- 前端「agents 多选」数据源：`GET /agents`（本仓库 `AGENT_REGISTRY`）。

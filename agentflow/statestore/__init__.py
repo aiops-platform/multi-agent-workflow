@@ -2,7 +2,7 @@
 """StateStore 适配层：配置驱动切换（design §5）。"""
 from __future__ import annotations
 
-from ..config import Settings
+from ..config import Settings, postgres_dsn
 from .base import StateStore
 from .memory import InMemoryStateStore
 
@@ -19,7 +19,7 @@ def build_state_store(settings: Settings) -> StateStore:
     if settings.state_store == "postgres":
         from .postgres import PostgresStateStore
 
-        return PostgresStateStore(f"postgresql://{settings.postgres_dsn}")
+        return PostgresStateStore(postgres_dsn(settings))
     raise ValueError(f"未知 state_store 后端: {settings.state_store!r}")
 
 

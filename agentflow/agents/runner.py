@@ -18,7 +18,7 @@ from agentscope.model import ChatModelBase, ChatResponse
 
 from ..core.dag import Node
 from .mcp import build_toolkit
-from .scopes import build_agent, run_agent
+from .scopes import build_agent, build_permission_context, run_agent
 
 log = logging.getLogger("agentflow.runner")
 
@@ -99,9 +99,16 @@ class AgentNodeRunner:
     mock 模型（ScriptedJsonModel）无 usage → ``last_usage`` 仍为 0/0.0（诚实不伪造）。
     """
 
-    def __init__(self, model, *, use_mock_datasource: bool = True) -> None:
+    def __init__(
+        self,
+        model,
+        *,
+        use_mock_datasource: bool = True,
+        mcp_manager=None,
+    ) -> None:
         self.model = UsageTrackingModel(model)
         self.use_mock_datasource = use_mock_datasource
+        self.mcp_manager = mcp_manager
         self.last_usage: dict[str, float | int] | None = None
 
     async def __call__(self, node: Node, params: dict) -> Any:
@@ -110,8 +117,26 @@ class AgentNodeRunner:
         agent = node.agent
         if not agent:
             return {"node": node.id, "ok": True}
-        toolkit = build_toolkit(agent, use_mock=self.use_mock_datasource)
-        a = build_agent(agent, toolkit, self.model, max_iters=_MAX_ITERS.get(agent, _DEFAULT_MAX_ITERS))
+        # MCP（hybrid toolkit）：取出全部 enabled client + 预计算 allow 名单。
+        # server 侧无 agent 绑定（原 agents 字段已移除）→ 每个 agent 都拿到全部 enabled server；
+        # allow 规则（§9.5 DONT_ASK + 精确工具名）必须早于 build_agent / 首个工具调用。
+        clients, allow_extra = [], None
+        if self.mcp_manager is not None:
+            clients = await self.mcp_manager.clients_for_agent(agent)
+            allow_extra = await self.mcp_manager.allow_names_for_agent(agent)
+        toolkit = build_toolkit(
+            agent,
+            use_mock=self.use_mock_datasource,
+            mcp_clients=clients,
+        )
+        ctx = build_permission_context(agent, allow_extra=allow_extra)
+        a = build_agent(
+            agent,
+            toolkit,
+            self.model,
+            permission_context=ctx,
+            max_iters=_MAX_ITERS.get(agent, _DEFAULT_MAX_ITERS),
+        )
         user = params if isinstance(params, dict) and params else {"params": params}
         out = await run_agent(a, user)
         tokens = self.model.input_tokens + self.model.output_tokens

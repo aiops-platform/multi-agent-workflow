@@ -60,3 +60,12 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def postgres_dsn(settings: Settings) -> str:
+    """settings.postgres_dsn → psycopg 连接串（补 postgresql:// 前缀）。
+
+    唯一归一化点：运行期 StateStore 与控制面配置 store（MCP/workflow）都复用，
+    避免各处重复拼前缀漂移。
+    """
+    return f"postgresql://{settings.postgres_dsn}"
