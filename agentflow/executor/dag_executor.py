@@ -51,6 +51,32 @@ class WorkflowNodeFailed(Exception):
         self.cause = cause
 
 
+class NodeInputError(Exception):
+    """节点必填入参（``require``）缺失或解析到非法值。
+
+    输入有问题应直接失败，而不是把坏输入交给 agent 空转（用户踩过：requestId 为 null
+    时 app-log 卡死无任何输出）。on_failure: abort → 整条链置 failed；continue → 负证据。
+    """
+
+    def __init__(self, node_id: str, missing: list[str]) -> None:
+        super().__init__(
+            f"节点 {node_id} 入参缺失/非法，未满足 require {missing}——输入有问题直接判失败"
+        )
+        self.node_id = node_id
+        self.missing = missing
+
+
+def _usable(value: Any) -> bool:
+    """入参是否"可用"：非 None、非空串、非空 list/dict。"""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    if isinstance(value, (list, dict)):
+        return len(value) > 0
+    return True
+
+
 class WorkflowStalledError(Exception):
     """ready 集为空、无 waiting_approval、又未全部终态 —— DAG 死锁或逻辑错误。"""
 
@@ -59,41 +85,72 @@ class ApprovalRaceError(Exception):
     """审批 CAS 冲突（已被并发操作推进到终态）。"""
 
 
+def _path_steps(path: str) -> list[Any]:
+    """把点分路径拆成步（含 ``[idx]`` 下标）：``a.b[0].c[1][2]`` → ['a','b',0,'c',1,2]。"""
+    steps: list[Any] = []
+    i, n = 0, len(path)
+    while i < n:
+        ch = path[i]
+        if ch == ".":
+            i += 1
+            continue
+        if ch == "[":
+            j = path.index("]", i)
+            try:
+                steps.append(int(path[i + 1 : j]))
+            except ValueError:
+                return []
+            i = j + 1
+            continue
+        j = i
+        while j < n and path[j] not in ".[":
+            j += 1
+        steps.append(path[i:j])
+        i = j
+    return steps
+
+
+def _walk(root: Any, path: str) -> Any:
+    """沿点分路径 + 下标下钻；任一步失配（dict 无键 / list 越界）返回 None。"""
+    cur = root
+    for step in _path_steps(path):
+        if isinstance(cur, dict) and isinstance(step, str) and step in cur:
+            cur = cur[step]
+        elif isinstance(cur, (list, tuple)) and isinstance(step, int):
+            if -len(cur) <= step < len(cur):
+                cur = cur[step]
+            else:
+                return None
+        else:
+            return None
+    return cur
+
+
 def _resolve_param(value: Any, ctx: dict) -> Any:
-    """解析 `$.nodes.X.output[.field]` / `$.inputs.X` 引用；普通值原样返回。"""
+    """解析 `$.nodes.X.output[.field]` / `$.inputs.X` 引用；普通值原样返回。
+
+    支持数组下标：``$.inputs.correlation_hint.sample_trace_ids[0]`` /
+    ``$.nodes.X.output.key_logs[0].msg``。
+    """
     if isinstance(value, str) and value.startswith("$."):
         path = value[2:]  # 去掉 "$."
         if path.startswith("nodes."):
             rest = path[len("nodes."):]
-            parts = rest.split(".")
-            node_id = parts[0]
-            field_path = ".".join(parts[1:])
+            node_id = rest.split(".", 1)[0]  # 节点名不带下标/点
+            field = rest.split(".", 1)[1] if "." in rest else ""
             node_output = ctx["nodes"].get(node_id, {}).get("output")
             if node_output is None:
                 return None
             # "output" 是标准访问器（取节点输出值），不是节点输出的字段
-            if field_path == "output":
+            if field == "output":
                 return node_output
-            field_path = field_path.removeprefix("output.")
-            if not field_path:
+            if field.startswith("output"):
+                field = field.removeprefix("output")  # ".field" 或 "[0]" 或 ".key_logs[0].msg"
+            if not field:
                 return node_output
-            cur: Any = node_output
-            for p in field_path.split("."):
-                if p == "":
-                    continue
-                if isinstance(cur, dict) and p in cur:
-                    cur = cur[p]
-                else:
-                    return None
-            return cur
+            return _walk(node_output, field)
         if path.startswith("inputs."):
-            cur = ctx.get("inputs", {})
-            for p in path[len("inputs."):].split("."):
-                if isinstance(cur, dict) and p in cur:
-                    cur = cur[p]
-                else:
-                    return None
-            return cur
+            return _walk(ctx.get("inputs", {}), path[len("inputs."):])
     if isinstance(value, dict):
         return {k: _resolve_param(v, ctx) for k, v in value.items()}
     if isinstance(value, list):
@@ -212,6 +269,44 @@ class DAGExecutor:
             self.run_id, self.tenant_id, nid, self.node_states[nid]
         )
 
+    async def _flush_node_trace(self, nid: str) -> None:
+        """把该节点成功后取到的明细行落 ``node_traces``，并派生审计（§9.5）。
+
+        - 仅真实 ``AgentNodeRunner`` 有明细（``take_trace``）；mock runner 直接返回。
+        - 明细行 = node 汇总 + llm_call + tool_call + denied；DB/审计失败只记日志不翻车。
+        - tool_call → 审计 ALLOW；denied → 审计 DENY（input 经 ``mask_input`` 脱敏）。
+        """
+        if not hasattr(self.node_runner, "take_trace"):
+            return
+        node = self.dag.nodes[nid]
+        try:
+            rows = self.node_runner.take_trace(node)
+            if not rows:
+                return
+            await self.store.replace_node_traces(
+                self.run_id, nid, self.tenant_id, rows=rows
+            )
+            from ..audit.logger import mask_input
+
+            for r in rows:
+                kind = r["kind"]
+                if kind not in ("tool_call", "denied"):
+                    continue
+                decision = "ALLOW" if kind == "tool_call" else "DENY"
+                p = r.get("payload", {})
+                inp = p.get("input")
+                await self.store.append_audit(
+                    self.tenant_id,
+                    tool_name=r.get("name") or "unknown",
+                    decision=decision,
+                    run_id=self.run_id,
+                    node_id=nid,
+                    input_masked=mask_input(inp) if inp is not None else None,
+                    actor=node.agent,
+                )
+        except Exception:  # noqa: BLE001
+            log.exception("[%s] flush node_trace %s 失败（忽略，不影响 run）", self.run_id, nid)
+
     async def _mark_skipped(self, nid: str) -> None:
         self.node_states[nid] = {"status": SKIPPED, "output": None}
         await self._persist(nid)
@@ -260,7 +355,13 @@ class DAGExecutor:
                 log.info("[%s] ⭐ approval %s -> waiting_approval", self.run_id, nid)
 
     async def _run_with_retry(self, node: Node, params: dict) -> Any:
-        """幂等执行 + retry + on_failure 策略（§8.4 / §8.1 on_failure）。"""
+        """幂等执行 + retry + on_failure 策略（§8.4 / §8.1 on_failure）。
+
+        - **入参预检**：``node.require`` 里的键解析后不可用（None/空串/空容器）→ 立即
+          走 on_error（不调 agent、不空转）。输入有问题直接失败（NodeInputError）。
+        - **可选墙钟上限**：``node.timeout``（秒）存在时，单次尝试用 ``asyncio.wait_for``
+          限时，超时按节点失败处理（防止网络/模型侧无限等待而整条链卡死）。
+        """
 
         async def invoke() -> Any:
             # runner 约定为 async；兼容同步 runner（脚本化/mock 场景）
@@ -275,12 +376,27 @@ class DAGExecutor:
                 return {"found": False, "error": str(exc)}
             raise WorkflowNodeFailed(node.id, exc) from exc
 
+        # ── 入参预检：输入有问题 → 立即失败，而非交给 agent 空转 ──
+        missing = [k for k in node.require if not _usable(params.get(k))]
+        if missing:
+            return await on_error(NodeInputError(node.id, missing))
+
+        async def action() -> Any:
+            if node.timeout:
+                try:
+                    return await asyncio.wait_for(invoke(), timeout=node.timeout)
+                except TimeoutError:
+                    raise TimeoutError(
+                        f"节点 {node.id} 执行超时（>{node.timeout}s 未完成，输入合法但执行停滞），判定失败"
+                    ) from None
+            return await invoke()
+
         return await execute_with_idempotency(
             self.store,
             self.run_id,
             node.id,
             attempt=0,
-            action=invoke,
+            action=action,
             max_attempts=node.retry + 1,
             on_error=on_error,
         )
@@ -299,17 +415,27 @@ class DAGExecutor:
         self.node_states[nid]["status"] = RUNNING
         ctx = {"nodes": self.node_states, "inputs": self.inputs}
         params = resolve_params(node.params, ctx)
+        # 节点开始即落 running：GET /runs/{id} 实时读库 → 前端能看到「执行中」（running 样式已就绪）。
+        # 终态 _persist 整 dict 覆盖本行；crash 遗留的 running 行由 resume/重跑覆盖。
+        self.node_states[nid]["params"] = params
+        await self._persist(nid)
         try:
             output = await self._run_with_retry(node, params)
             state: dict = {"status": DONE, "output": output, "params": params}
-            # 真实 node_runner（AgentNodeRunner）暴露 last_usage → 合并 token/cost 计量；
-            # mock _default_runner 无 last_usage → 保持无 tokens/cost（聚合 GET 诚实 0）
-            usage = getattr(self.node_runner, "last_usage", None)
+            # 真实 node_runner（AgentNodeRunner）暴露 take_usage → 合并 token/cost 计量
+            # （按节点 pop，防并行 agent 波串扰）；mock _default_runner 无该方法 → 保持无计量
+            usage = (
+                self.node_runner.take_usage(node)
+                if hasattr(self.node_runner, "take_usage")
+                else None
+            )
             if usage:
                 state["tokens"] = usage.get("tokens", 0)
                 state["cost"] = usage.get("cost", 0.0)
             self.node_states[nid] = state
             await self._persist(nid)
+            # 节点成功后才把明细落 node_traces + 派生审计（失败只记日志，不影响 run）
+            await self._flush_node_trace(nid)
             log.info("[%s] done %s", self.run_id, nid)
         except WorkflowNodeFailed as exc:
             self.node_states[nid] = {"status": "failed", "output": None, "error": str(exc)}

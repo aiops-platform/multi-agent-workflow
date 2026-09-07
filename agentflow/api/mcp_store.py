@@ -5,8 +5,9 @@
 （幂等 connect），测试可脱离 lifespan 直接使用。逻辑列（transport/config/enable·disable_tools/
 is_stateful/enabled）用 JSON/INT 落列，读取时反序列化为 Python 对象。
 
-记录只描述 server 本身；**不存 agent 绑定**（原 ``agents`` 列已移除——agent 侧绑定后续以
-agent 为主表建模，MCP server 不再承载绑定）。运行期 manager 将全部 enabled server 下发给 agent。
+记录只描述 server 本身；**不存 agent 绑定**（原 ``agents`` 列已移除——绑定以 agent 为主表建模：
+``agent_configs.mcp_server_ids``，MCP server 不再承载绑定）。运行期 manager 经注入的
+AgentConfigResolver 按 agent 所选 server 下发（v1.12.1 起未绑定=没有 server）。
 """
 from __future__ import annotations
 

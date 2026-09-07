@@ -2,24 +2,28 @@
 
 > 后端实现 v1.11.0（本仓库 `multi-agent-workflow`）。配套前端页见 SIP `service-intelligence-platform-ui`
 > `changelogs/v1.11.0-mcp-server-config.md`；端点契约见 `AGENTFLOW_UI_INTEGRATION_RESEARCH_zh-CN.md` §9。
-> **v1.11.x 起 server 记录不再存 `agents` 绑定字段**（agent 侧绑定后续以 **agent 为主表**建模，MCP server
-> 不再是绑定主表）：运行时把全部 enabled server 下发给每个 agent。存储后端跟随 `state_store`
-> （sqlite 默认 / postgres 生产）。
+> **v1.11.x 起 server 记录不再存 `agents` 绑定字段**（MCP server 不再是绑定主表）。绑定以 **agent 为主表**
+> 建模（`agent_configs.mcp_server_ids`，见 `AGENT_CONFIG_DB_zh-CN.md`）：
+> - **v1.12.1 起运行时按 agent 所选 server 下发，默认（未绑定）= 无 MCP server**——去掉早期「全部 enabled
+>   下发给每个 agent」的默认；agent 需在「Agent 配置」页显式勾选 server 才有 MCP 工具。
+> - `MCPClientManager` 未注入 `server_ids_for`（独立用法/测试）才回退「全部 enabled client」。
+> 存储后端跟随 `state_store`（sqlite 默认 / postgres 生产）。
 
 ## 1. 一句话
 
 后端在 SIP 页配置一条**通用的 MCP server**（stdio / streamable HTTP / SSE）；agent 运行时把 MCP 工具与
 既有 **function tool（L1/L2）共存**（hybrid toolkit）——同一 agent 在 AgentScope react 循环里既能调内置
-只读/执行工具，也能调下发的 MCP server 工具（当前为**全部 enabled server**，不做 per-server agent 过滤）。
+只读/执行工具，也能调**该 agent 绑定的** MCP server 工具（v1.12.1 按 `agent_configs.mcp_server_ids` 下发：
+未绑定 = 无 MCP 工具）。
 
 ## 2. 存储与运行时分层
 
 | 层 | 文件 | 职责 |
 |---|---|---|
 | CRUD 存储 | `agentflow/api/mcp_store.py` `MCPStore` / `PgMCPStore` | `mcp_servers` 表（sqlite 与 workflow/state 同库异表；postgres 生产同库），aiosqlite / psycopg3 惰性连接；旧库迁移会补 `tools` 列并 DROP 废弃的 `agents` 列 |
-| 运行时 | `agentflow/agents/mcp_manager.py` `MCPClientManager` | 配置 JSON → AgentScope `MCPClient`；加载/热刷新/evict/close_all；失联重连；allow 名单预计算；`test_connection`（**无 per-server agent 绑定**） |
+| 运行时 | `agentflow/agents/mcp_manager.py` `MCPClientManager` | 配置 JSON → AgentScope `MCPClient`；加载/热刷新/evict/close_all；失联重连；allow 名单预计算；`test_connection`（server 记录自身**无 per-agent 绑定**；按注入的 `server_ids_for` 过滤） |
 | 组装 | `agentflow/agents/mcp.py` `build_toolkit` | hybrid：function tool + MCP client 合并；防御性剔除「stateful 但未 connect」client |
-| 接入 | `agentflow/agents/runner.py` `AgentNodeRunner` | 每节点取 `clients_for_agent` + `allow_names_for_agent`（全部 enabled）→ `build_toolkit(..., mcp_clients)` + `build_permission_context(allow_extra=...)` |
+| 接入 | `agentflow/agents/runner.py` `AgentNodeRunner` | 每节点取 `clients_for_agent` + `allow_names_for_agent`（按 agent 绑定子集；未注入 resolver 才回退全部 enabled）→ `build_toolkit(..., mcp_clients)` + `build_permission_context(allow_extra=...)` |
 | API | `agentflow/api/app.py` | `/mcp-servers` CRUD + `/test` + `/{mid}/tools`（§9） |
 
 ## 3. transport 矩阵
@@ -36,10 +40,11 @@
 
 ## 4. 下发 + 共存语义
 
-- **下发（无 per-server 绑定）**：server 记录不含 `agents` 字段（已移除）。运行时
-  `MCPClientManager.clients_for_agent(name)` 返回**全部 enabled** 且已连接的 client——任意 agent 名都可见。
-  复用同一 client/session（并发 run 共享，**不在 run 中途刷新**）。后续 agent 侧绑定落地后，将按 agent 所选
-  server 子集过滤（方法签名保留 `agent_name` 作接入缝）。
+- **下发（agent 主表绑定，v1.12.1 两态）**：server 记录不含 `agents` 字段（已移除），绑定以 agent 为主表
+  （`agent_configs.mcp_server_ids`）。运行时 `MCPClientManager.clients_for_agent(name)` 注入 resolver 后按
+  `server_ids_for(name)` 过滤 enabled 且已连接的 client：空 set（未配置/明确不绑）→ **该 agent 无任何 MCP 工具**；
+  非空子集 → 只返回 `mid ∈ allowed` 的 client。复用同一 client/session（并发 run 共享，**不在 run 中途刷新**）。
+  未注入 `server_ids_for`（独立用法/测试）才回退「全部 enabled client」（方法签名保留 `agent_name` 作接入缝）。
 - **共存（hybrid）**：`build_toolkit` 永远按 `use_mock` 构建 function tools（L1 只读 + L2 执行），有 client 时再
   `Toolkit(tools=[...], mcps=[...])` 叠加 MCP 工具。两类工具的 schema 一起给 LLM，工具名前缀区分 function tool
   （原名）与 MCP 工具（`mcp__{server}__{tool}`）。
@@ -47,8 +52,8 @@
   - 只读 MCP 工具（server 声明 `readOnlyHint`，mock `get_weather`/`query.repo`）→ AgentScope 在
     `MCPTool.check_permissions` **自动 ALLOW**，无需规则。
   - 非只读 MCP 工具（mock `send_alert`）→ 需 **allow 规则精确命中 LLM 侧名**，否则 DENY。
-  - `AgentNodeRunner` 在 `build_agent` **之前**用 `allow_names_for_agent` 预取（当前为全部 enabled client）
-    的 `mcp__...` 名，注入 `build_permission_context(allow_extra=...)`（必须早于首个工具调用）。
+  - `AgentNodeRunner` 在 `build_agent` **之前**用 `allow_names_for_agent` 预取**真正下发 client** 的 `mcp__...` 名
+    （只对绑定子集生成；未绑定 = 空），注入 `build_permission_context(allow_extra=...)`（必须早于首个工具调用）。
 - **向后兼容**：既有调用方（scripts / tests / runner）不传 `mcp_clients` → 结果与旧行为一致（纯 function tools）。
 
 ## 5. 连接生命周期
@@ -71,8 +76,8 @@ CRUD:   POST / PUT / DELETE /mcp-servers[/{mid}] → refresh_server(mid)
 
 - **auth headers 明文落 SQLite**：`config.headers`（如 Bearer）以 JSON 明文存在 `mcp_servers.config`。
   仅本地控制面/内网可访问；后续建议支持 env 引用（`${ENV_VAR}`）以复用网关托管密钥。
-- 工具权限由 allow 规则兜底；非只读 MCP 工具在 DONT_ASK 下默认 DENY。当前下发是「全部 enabled
-  server → 每个 agent」，非只读工具全量进 allow 名单；agent 侧绑定落地后应按所选 server 子集收紧。
+- 工具权限由 allow 规则兜底；非只读 MCP 工具在 DONT_ASK 下默认 DENY。下发按 agent 绑定子集（v1.12.1 两态：
+  未绑定 = 无 server），非只读工具的 allow 名单只对真正下发的 client 生成——未绑定 server 的 agent 无 MCP 工具。
 - name 校验 `^[a-zA-Z0-9_-]+$`（同时是 LLM 工具名前缀，硬性约束）。
 
 ## 7. Mock server 与真实 server 接入示例
@@ -117,14 +122,15 @@ mcp v1 FastMCP + Bearer 鉴权，url `http://127.0.0.1:8000/mcp`。测试连接 
 // → ok:true + 6 个 git 工具
 ```
 
-落库（server 侧无 agent 绑定 → 全部 enabled 下发到每个 agent）后跑任一 workflow，日志应见
-`mcp__git-server__...` 工具被真实调用（需真 LLM key）。
+落库后需先在「Agent 配置」页把该 agent 绑定到此 server（v1.12.1：未绑定 = 无 MCP 工具），再跑任一 workflow，
+日志应见 `mcp__git-server__...` 工具被真实调用（需真 LLM key）。
 
 ## 8. 测试
 
 - `tests/test_mcp_store.py` — CRUD 往返 / enabled 过滤 / update·delete 哨兵 / 重名。
 - `tests/test_mcp_api.py` — ASGITransport + monkeypatch store/manager：CRUD/404/校验 400/`/test` 不崩/name charset。
 - `tests/test_mcp_manager.py` — 真实 stdio mock 子进程：`test_connection` 列 3 工具（含 sanitize 名与只读标注）、
-  `clients_for_agent` 无绑定→全部 enabled、`allow_names_for_agent` 精确名、stateless HTTP live。
+  `clients_for_agent`/`allow_names_for_agent`：注入 resolver → 按绑定子集过滤（空 set → 无 client），未注入 →
+  回退全部 enabled；stateless HTTP live。
 - `tests/test_mcp_integration.py` — `AgentNodeRunner(mcp_manager=...)` + 确定性模型 → LLM 首个工具调用命中 MCP
   工具并真实执行（验证 hybrid toolkit + `MCPTool.call` 会话链路）。

@@ -18,7 +18,8 @@ from agentscope.model import ChatModelBase, ChatResponse
 
 from ..core.dag import Node
 from .mcp import build_toolkit
-from .scopes import build_agent, build_permission_context, run_agent
+from .scopes import build_agent, build_permission_context, build_reasoning_model, run_agent
+from .transcript import K_LLM_CALL, K_NODE, K_TOOL_CALL, TraceRecorder, scan_denied_blocks
 
 log = logging.getLogger("agentflow.runner")
 
@@ -105,21 +106,55 @@ class AgentNodeRunner:
         *,
         use_mock_datasource: bool = True,
         mcp_manager=None,
+        agent_config=None,
     ) -> None:
         self.model = UsageTrackingModel(model)
         self.use_mock_datasource = use_mock_datasource
         self.mcp_manager = mcp_manager
+        # AgentSpec DB 配置解析器（agent_config.AgentConfigResolver）：提供 system_prompt 覆盖 + enabled
+        self.agent_config = agent_config
+        # 兼容属性：最近一次节点用量（顺序/单节点场景精确；并行 wave 下以 take_usage 为准）
         self.last_usage: dict[str, float | int] | None = None
+        # 按 id(node) 分槽（并行波安全）：executor 跑完取走（pop）→ retry/resume 只留末次成功
+        self._trace_by_node: dict[int, list[dict]] = {}
+        self._usage_by_node: dict[int, dict] = {}
+        # Agent 级启用推理的节点 → thinking-enabled DeepSeek 模型（懒构建缓存，见 _reasoning）
+        self._reasoning_model: UsageTrackingModel | None = None
+
+    def _reasoning(self) -> UsageTrackingModel:
+        """懒构建并缓存推理模型（thinking_enable=True）。无 API Key → ScriptedJsonModel 回退（封闭）。"""
+        if self._reasoning_model is None:
+            self._reasoning_model = UsageTrackingModel(build_reasoning_model())
+        return self._reasoning_model
+
+    def take_trace(self, node: Node) -> list[dict] | None:
+        """pop 取走该节点的明细行（无 → None）。executor 在节点成功后调用。"""
+        return self._trace_by_node.pop(id(node), None)
+
+    def take_usage(self, node: Node) -> dict | None:
+        """pop 取走该节点的 {tokens,cost}。防并行 agent 波串扰 + 幂等节点无 key 返回 None。"""
+        return self._usage_by_node.pop(id(node), None)
 
     async def __call__(self, node: Node, params: dict) -> Any:
-        self.model.reset()
+        key = id(node)
+        self._trace_by_node.pop(key, None)
+        self._usage_by_node.pop(key, None)
         self.last_usage = None
         agent = node.agent
         if not agent:
             return {"node": node.id, "ok": True}
-        # MCP（hybrid toolkit）：取出全部 enabled client + 预计算 allow 名单。
-        # server 侧无 agent 绑定（原 agents 字段已移除）→ 每个 agent 都拿到全部 enabled server；
-        # allow 规则（§9.5 DONT_ASK + 精确工具名）必须早于 build_agent / 首个工具调用。
+        # AgentSpec DB 配置（覆盖 system_prompt / enabled / reasoning / MCP server 绑定）。
+        # 未接 resolver（agent_config=None）或名字不在配置 → 走内置静态默认，行为不变。
+        cfg = self.agent_config.resolve(agent) if self.agent_config is not None else None
+        if cfg is not None and not cfg.enabled:
+            return {"node": node.id, "ok": True, "disabled": True, "note": f"agent {agent!r} 已在配置中停用"}
+        # Agent 级启用推理（cfg.reasoning_enabled）→ thinking-enabled 模型，CoT 落 llm_call 明细；
+        # 否则用全局正常模型。选完再 reset（不 reset 未用的那只）。
+        model = self._reasoning() if (cfg is not None and cfg.reasoning_enabled) else self.model
+        model.reset()
+        # MCP（hybrid toolkit）：取出该 agent 可用的 client——DB 配置选定 server（两态：无/子集，
+        # v1.12.1 起未绑定=没有 server；resolver 注入时空集→无 client，不注入的独立用法才回退全量）
+        # + 预计算 allow 名单。allow 规则（§9.5 DONT_ASK + 精确工具名）必须早于 build_agent / 首个工具调用。
         clients, allow_extra = [], None
         if self.mcp_manager is not None:
             clients = await self.mcp_manager.clients_for_agent(agent)
@@ -130,21 +165,46 @@ class AgentNodeRunner:
             mcp_clients=clients,
         )
         ctx = build_permission_context(agent, allow_extra=allow_extra)
+        # 每节点独立 recorder：采集 llm_call / tool_call 明细；DENY 工具跑后补扫
+        recorder = TraceRecorder(node.id, agent)
         a = build_agent(
             agent,
             toolkit,
-            self.model,
+            model,
             permission_context=ctx,
             max_iters=_MAX_ITERS.get(agent, _DEFAULT_MAX_ITERS),
+            # DB 配置解析后的有效 system_prompt（含静态回退）；cfg=None → 传 None 走 scopes 静态默认
+            system_prompt=cfg.system_prompt if cfg is not None else None,
+            middlewares=[recorder],
         )
         user = params if isinstance(params, dict) and params else {"params": params}
         out = await run_agent(a, user)
-        tokens = self.model.input_tokens + self.model.output_tokens
+        tokens = model.input_tokens + model.output_tokens
         cost = (
-            self.model.input_tokens * _PRICE_INPUT_PER_M
-            + self.model.output_tokens * _PRICE_OUTPUT_PER_M
+            model.input_tokens * _PRICE_INPUT_PER_M
+            + model.output_tokens * _PRICE_OUTPUT_PER_M
         ) / 1_000_000
-        self.last_usage = {"tokens": tokens, "cost": round(cost, 6)}
+        usage = {"tokens": tokens, "cost": round(cost, 6)}
+        self.last_usage = usage
+        # 明细行 = [node 汇总] + llm/tool + 跑后补扫的 denied；executor 取走落 node_traces
+        node_row = {
+            "agent": agent,
+            "enabled": cfg.enabled if cfg is not None else True,
+            "input": user,
+            "output": out,
+            "tokens": tokens,
+            "cost": round(cost, 6),
+            "llm_steps": sum(1 for r in recorder.rows if r["kind"] == K_LLM_CALL),
+            "tool_steps": sum(1 for r in recorder.rows if r["kind"] == K_TOOL_CALL),
+        }
+        # 跑后补扫 DENY 工具调用；agent 无 .state.context（轻量桩/测试替换）时退回空
+        denied_ctx = getattr(getattr(a, "state", None), "context", None)
+        self._trace_by_node[key] = (
+            [{"kind": K_NODE, "name": None, "payload": node_row}]
+            + recorder.rows
+            + scan_denied_blocks(denied_ctx)
+        )
+        self._usage_by_node[key] = usage
         log.info(
             "agent[%s] -> %s (tokens=%s, cost=$%.6f)",
             agent,

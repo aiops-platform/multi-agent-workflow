@@ -133,3 +133,28 @@ class StateStore(ABC):
     async def get_audit_logs(
         self, *, tenant_id: str | None = None, run_id: str | None = None, limit: int = 100
     ) -> list[dict]: ...
+
+    # ---- node_traces：节点级事件流水明细（LLM/工具/MCP/汇总，全量不脱敏）----
+    @abstractmethod
+    async def replace_node_traces(
+        self,
+        run_id: str,
+        node_id: str,
+        tenant_id: str,
+        *,
+        rows: list[dict],
+    ) -> None:
+        """整节点替换事件流水（先删后插）。rows 每项含 kind/name/payload；
+        seq 由实现按枚举重算、ts 实现自填。仅节点最终成功后调一次 →
+        retry/resume 只留最后一次成功 attempt 的完整流水。"""
+
+    @abstractmethod
+    async def get_node_traces(
+        self,
+        run_id: str,
+        node_id: str | None = None,
+        *,
+        kind: str | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """按 (node_id, id) 升序读流水；kind 可过滤（'node'/'llm_call'/'tool_call'/'denied'）。"""

@@ -2,8 +2,9 @@
 """MCPClientManager 测试：真实拉起 stdio mock server 子进程验证连接/下发/allow 名单。
 
 - test_connection：stdio 连上列 3 工具（只读/含`.` sanitize/非只读标注齐全）；http 连不上 → ok:false。
-- load/clients_for_agent：server 侧无 agent 绑定（agents 字段已移除）→ 任意 agent 拿全部 enabled
-  client；stateful connect（真实子进程）。
+- load/clients_for_agent：默认（未注入 server_ids_for）→ 任意 agent 拿全部 enabled client
+  （仅独立用法/回退兼容；接入 AgentConfigResolver 后按 agent 所选 server 过滤，v1.12.1 两态
+  无/子集，空集→无 server）。stateful connect（真实子进程）。
 - allow_names_for_agent：返回 AgentScope 精确名 ``mcp__mock-mcp__...``（无 sanitize 漂移）。
 
 子进程在 finally/close_all 杀掉，避免泄漏。
@@ -125,7 +126,7 @@ async def test_test_connection_bad_config_ok_false() -> None:
 
 
 async def test_load_clients_for_agent_returns_all_enabled() -> None:
-    """server 侧无 agent 绑定（agents 字段已移除）：每个 agent 都拿到全部 enabled client。"""
+    """未注入 server_ids_for（独立用法回退）：每个 agent 都拿到全部 enabled client。"""
     store = MCPStore(":memory:")
     mgr = MCPClientManager(store)
     await store.save(_stdio_row(name="mock-mcp"))
@@ -147,7 +148,7 @@ async def test_allow_names_for_agent_returns_exact_llm_names() -> None:
     await store.save(_stdio_row())
     await mgr.load()
     try:
-        # 无绑定 → 任意 agent 名都拿到全部 enabled client 的工具名
+        # 未注入 server_ids_for（回退全量）→ 任意 agent 名都拿到全部 enabled client 的工具名
         for agent in ("triage", "nobody"):
             names = await mgr.allow_names_for_agent(agent)
             assert set(names) == {
@@ -176,6 +177,53 @@ async def test_refresh_server_rebuilds_and_evicts() -> None:
     await store.delete(mid)
     await mgr.refresh_server(mid)
     assert await mgr.clients_for_agent("triage") == []
+
+
+async def test_clients_for_agent_filters_to_bound_server_ids() -> None:
+    """agent→server 绑定（server_ids_for 注入）：只下发绑定子集的 enabled client（server 粒度）。"""
+    store = MCPStore(":memory:")
+    mid_a = await store.save(_stdio_row(name="mock-mcp"))
+    await store.save(_http_row("http://127.0.0.1:9/mcp", name="http-only"))
+    mgr = MCPClientManager(store, server_ids_for=lambda agent: {mid_a})
+    await mgr.load()
+    try:
+        clients = await mgr.clients_for_agent("triage")
+        assert {c.name for c in clients} == {"mock-mcp"}
+        # allow 名单只对真正下发给该 agent 的 server 生成（read-only 自动 ALLOW 被「只见所选 server」约束）
+        names = await mgr.allow_names_for_agent("triage")
+        assert "mcp__mock-mcp__get_weather" in names
+        assert not any(n.startswith("mcp__http-only") for n in names)
+        # 未绑定的另一 agent 名（server_ids_for 同返回 {mid_a}）同样只见子集
+        assert not any(n.startswith("mcp__http-only") for n in await mgr.allow_names_for_agent("root-cause"))
+    finally:
+        await mgr.close_all()
+
+
+async def test_server_ids_for_empty_set_binds_none() -> None:
+    """server_ids_for 返回 set()（明确不绑任何 server）→ 该 agent 无 MCP client。"""
+    store = MCPStore(":memory:")
+    await store.save(_stdio_row())
+    mgr = MCPClientManager(store, server_ids_for=lambda agent: set())
+    await mgr.load()
+    try:
+        assert await mgr.clients_for_agent("triage") == []
+        assert await mgr.allow_names_for_agent("triage") == []
+    finally:
+        await mgr.close_all()
+
+
+async def test_server_ids_for_none_binds_none() -> None:
+    """注入的 server_ids_for 返回 None/空 → 无 server（v1.12.1：不配置就没有 server，不再回退全量）。"""
+    store = MCPStore(":memory:")
+    await store.save(_stdio_row(name="mock-mcp"))
+    await store.save(_http_row("http://127.0.0.1:9/mcp", name="http-only"))
+    mgr = MCPClientManager(store, server_ids_for=lambda agent: None)
+    await mgr.load()
+    try:
+        assert await mgr.clients_for_agent("triage") == []
+        assert await mgr.allow_names_for_agent("triage") == []
+    finally:
+        await mgr.close_all()
 
 
 @pytest.mark.skipif(sys.platform.startswith("win"), reason="子进程/信号仅类 Unix 验证")

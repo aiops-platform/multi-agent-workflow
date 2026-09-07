@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 import sqlite3
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +19,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from ..agents.agent_config import AgentConfigResolver
 from ..agents.mcp_manager import MCPClientManager
-from ..agents.registry import AGENT_REGISTRY
+from ..agents.registry import DIAGNOSE_AGENTS, FIX_AGENTS
+from ..agents.tools import tools_for_agent
 from ..approval.notifier import ApprovalNotifier
 from ..approval.sweeper import ApprovalSweeper
 from ..config import Settings, get_settings
@@ -28,20 +31,38 @@ from ..core.workflow import Workflow
 from ..queue import build_queue
 from ..service import RunService
 from ..statestore import build_state_store, connect_state_store
+from .agent_store import AgentConfigStore, build_agent_config_store, seed_builtin_agent_configs
 from .mcp_store import MCPStore, build_mcp_store
 from .workflow_store import WorkflowStore, build_workflow_store
 
 settings: Settings = get_settings()
 
-app = FastAPI(title="agentflow 控制面", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """取代弃用的 @app.on_event：启动跑 init()（StateStore/Queue + 审批 Sweeper），关闭回收 MCP 连接。
+
+    注：init()/mcp_manager 在本文件后文才定义/赋值，但 lifespan 由 ASGI server 在模块
+    完全加载后才调用，届时模块全局已就绪，无前向引用问题。
+    """
+    await init()
+    yield
+    await mcp_manager.close_all()
+
+
+app = FastAPI(title="agentflow 控制面", version="0.1.0", lifespan=lifespan)
 service: RunService | None = None
 sweeper: ApprovalSweeper | None = None
-# 控制面配置存储（workflows/mcp_servers）：state_store=postgres 时落 PG，否则沿用本地 sqlite
-# （构造不做 DB/I/O，惰性 connect；测试可 monkeypatch 模块全局）。
+# 控制面配置存储（workflows/mcp_servers/agent_configs）：state_store=postgres 时落 PG，
+# 否则沿用本地 sqlite（构造不做 DB/I/O，惰性 connect；测试可 monkeypatch 模块全局）。
 workflow_store = build_workflow_store(settings)
 mcp_store = build_mcp_store(settings)
+agent_config_store = build_agent_config_store(settings)
 # 运行时 MCP client 管理器（持有同一个 store 引用，读取 enabled=1 配置）
 mcp_manager = MCPClientManager(mcp_store)
+# AgentSpec 配置解析器（DB 覆盖 + 内置静态回退）：init()/CRUD 后经 _reload_agent_config_resolver 重建，
+# 并重接 mcp_manager.server_ids_for（agent→MCP server 绑定，server 粒度）。
+_agent_config_resolver: AgentConfigResolver | None = None
 
 # CORS：允许前端跨域调用控制面 API。来源可配（AGENTFLOW_CORS_ORIGINS 逗号分隔，默认 *）。
 # allow_origins=* 时不可开启 allow_credentials（浏览器规范限制）；JWT 走 Authorization 头不受影响。
@@ -110,6 +131,29 @@ def _service() -> RunService:
     return service
 
 
+async def _reload_agent_config_resolver() -> AgentConfigResolver:
+    """从 agent_config_store 重建 AgentSpec 解析器，并重接 mcp_manager 的 server_ids_for。
+
+    init（seed 后）与每次 /agent-configs CRUD 后调用，保证运行时 + GET /agents 读到最新
+    DB 覆盖/自定义 agent。构造不做 DB I/O 之外的重活（内存行索引）。
+    """
+    global _agent_config_resolver
+    _agent_config_resolver = AgentConfigResolver(await agent_config_store.list())
+    mcp_manager.server_ids_for = _agent_config_resolver.server_ids_for
+    # 运行中 node_runner 持 init() 时传入的 resolver 对象快照：CRUD 只重建模块全局 + 重接
+    # mcp_manager，若不把新实例重指向 runner，启动后新建/补写 system_prompt 的 agent 在后续 run
+    # 里仍按旧快照解析（NULL→默认提示），表现为输出退化（如只有默认提示没有 JSON 契约 → {}）。
+    runner = getattr(service, "node_runner", None)
+    if runner is not None and getattr(runner, "agent_config", None) is not None:
+        runner.agent_config = _agent_config_resolver
+    return _agent_config_resolver
+
+
+def _effective_agent_resolver() -> AgentConfigResolver:
+    """读当前全局解析器；未 init（测试无 lifespan）时退化为空配置 → 纯静态内置视图。"""
+    return _agent_config_resolver if _agent_config_resolver is not None else AgentConfigResolver([])
+
+
 async def _migrate_sqlite_config_to_pg() -> None:
     """本地 SQLite → PostgreSQL 一次性迁移（仅 state_store=postgres、源库存在时执行）。
 
@@ -144,9 +188,22 @@ async def _migrate_sqlite_config_to_pg() -> None:
         finally:
             await src.close()
 
+    async def _copy_agent_configs() -> None:
+        if await agent_config_store.list():
+            return
+        src = AgentConfigStore(settings.state_db_path)
+        await src.connect()
+        try:
+            # 整行交给 PgAgentConfigStore.save（name 为 PK，直接带 name/覆盖字段搬）
+            for row in await src.list():
+                await agent_config_store.save(row)
+        finally:
+            await src.close()
+
     await _copy_workflows()
     await _copy_mcp()
-    print("[agentflow] 已把本地 SQLite 的 workflows/mcp_servers 配置迁移到 PostgreSQL")
+    await _copy_agent_configs()
+    print("[agentflow] 已把本地 SQLite 的 workflows/mcp_servers/agent_configs 配置迁移到 PostgreSQL")
 
 
 async def init() -> RunService:
@@ -154,9 +211,13 @@ async def init() -> RunService:
     global service, sweeper
     await workflow_store.connect()
     await mcp_store.connect()
+    await agent_config_store.connect()
     if settings.state_store == "postgres":
-        # 控制面配置表（workflows/mcp_servers）跟随 state_store 落 PG → 历史 sqlite 一次性搬运
+        # 控制面配置表（workflows/mcp_servers/agent_configs）跟随 state_store 落 PG → 历史 sqlite 一次性搬运
         await _migrate_sqlite_config_to_pg()
+    # AgentSpec 配置：空表 seed 15 条内置 / 既有内置行缺失默认回填（幂等，默认物化）；随后重建解析器并重接 mcp_manager 绑定
+    await seed_builtin_agent_configs(agent_config_store)
+    resolver = await _reload_agent_config_resolver()
     await mcp_manager.load()
     store = build_state_store(settings)
     await connect_state_store(store)
@@ -171,23 +232,13 @@ async def init() -> RunService:
         kwargs["node_runner"] = AgentNodeRunner(
             build_model(settings),
             mcp_manager=mcp_manager,
+            agent_config=resolver,
         )
         print("[agentflow] node_runner=agent（DeepSeek）：Bug Solve 页将真实调用 agent")
     service = RunService(store, **kwargs)
     sweeper = ApprovalSweeper(store, queue, ApprovalNotifier(), interval=60)
     asyncio.create_task(sweeper.run_forever())
     return service
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    await init()
-
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    # 关闭全部 stateful MCP 连接（杀 stdio 子进程），避免进程泄漏
-    await mcp_manager.close_all()
 
 
 @app.post("/run")
@@ -281,8 +332,9 @@ async def delete_workflow(wid: str) -> dict:
 
 # ── MCP Server 配置 CRUD（SIP「MCP Server 配置」页：配置通用 MCP server）──
 # 运行期：MCPStore（同库异表 CRUD）+ MCPClientManager（解析为 AgentScope MCPClient + 热刷新）。
-# server 记录不存 agent 绑定（原 agents 字段已移除；agent 侧绑定后续以 agent 为主表建模），
-# 运行期 manager 把全部 enabled server 下发给 agent。
+# server 记录不存 agent 绑定（原 agents 字段已移除）；绑定以 agent 为主表建模，运行时经注入的
+# AgentConfigResolver.server_ids_for 按 agent 所选 server 过滤——v1.12.1 起「没配置=没有 server」，
+# agent 需显式绑定才有 MCP 工具（未注入 resolver 的独立用法才回退到全部 enabled）。
 # 注意：静态子路径 /mcp-servers/test 先于 /{mid} 系列注册（同 /workflows/preview 教训）。
 
 _MCP_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -553,6 +605,28 @@ async def get_run(run_id: str) -> dict:
     }
 
 
+@app.get("/runs/{run_id}/traces")
+async def get_run_traces(
+    run_id: str,
+    node_id: str | None = None,
+    kind: str | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    """节点级执行明细（node_traces 流水，按 (node_id, seq) 升序）。
+
+    kind 分类（对齐 transcript.py / statestore.base 注释）：
+    - ``node`` 汇总（agent/input/output/tokens/cost/llm_steps/tool_steps）
+    - ``llm_call`` 每次喂模型的完整 messages 原文 + tools + usage
+    - ``tool_call`` 已放行工具的执行输入/结果（含 MCP server/read_only）
+    - ``denied``   被权限 DENY 的工具（含 reason）
+    ``node_id`` 省略 = 整 run 全量；``kind`` 可过滤。mock runner 无明细 → 空列表。
+    """
+    store = _service().store
+    if await store.get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail="run 不存在")
+    return await store.get_node_traces(run_id, node_id=node_id, kind=kind, limit=limit)
+
+
 @app.post("/runs/{run_id}/approve")
 async def approve(run_id: str, node_id: str | None = None, req: ApproveRequest | None = None) -> dict:
     """通过某审批节点。body ``{node_id}``（UI 契约）或 query ``?node_id=``（旧兼容）。"""
@@ -597,18 +671,211 @@ async def audit(tenant_id: str | None = None, run_id: str | None = None, limit: 
     return await _service().store.get_audit_logs(tenant_id=tenant_id, run_id=run_id, limit=limit)
 
 
+# ── AgentSpec 配置 CRUD（SIP「Agent 配置」页：DB 驱动 agent 配置 + agent→MCP server 绑定）──
+# 语义（对齐 docs plan §一）：description/system_prompt/schema 存 NULL=未覆盖→回退内置静态默认；
+# mcp_server_ids 两态（v1.12.1 起）：NULL/[]（写入归一 NULL）=无 MCP server / [mid,…] = 精确子集。
+# origin：builtin（seed，禁删，可编辑清空覆盖回退）| custom（POST 新建，可删）。
+# 每次写操作后重建 _agent_config_resolver 并重接 mcp_manager.server_ids_for（运行时热生效）。
+_AGENT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+_AGENT_ROLES = {"diagnose", "fix"}
+_AGENT_STAGES_SET = {"detect", "diagnose", "fix", "verify", "deliver", "learn", "other"}
+_BUILTIN_AGENT_NAMES = set(DIAGNOSE_AGENTS) | set(FIX_AGENTS)
+
+
+class AgentConfigPayload(BaseModel):
+    """AgentSpec 配置负载（POST 新建 custom / PUT 完整对象覆盖更新）。
+
+    可覆盖字段：description/system_prompt/schema/mcp_server_ids/enabled/role/stage。
+    ``""``/None 文本类 → 归 NULL（回退内置）；schema 不传/None → 回退内置（仅元数据/详情）。
+    origin 不可经 API 修改（POST 一律 custom；PUT 保持行内 origin）。
+    """
+
+    name: str | None = None  # 仅 POST 必填；PUT 以路径 name 为准（本字段忽略）
+    role: str | None = None
+    stage: str | None = None
+    description: str | None = None
+    system_prompt: str | None = None
+    output_schema: dict | None = None  # 输出契约（仅元数据/详情）；不传/None → 回退内置
+    mcp_server_ids: list[str] | None = None
+    enabled: bool | None = None
+    reasoning_enabled: bool | None = None  # Agent 级启用推理；None=不指定（update 保持原值 / create 默认关）
+
+
+def _acfg_str(value: str | None) -> str | None:
+    """'' / None / 纯空白 → None（未覆盖），否则去首尾空白。"""
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _validate_agent_role_stage(role: str | None, stage: str | None) -> None:
+    if role is not None and role not in _AGENT_ROLES:
+        raise HTTPException(status_code=400, detail="role 仅支持 diagnose 或 fix")
+    if stage is not None and stage not in _AGENT_STAGES_SET:
+        raise HTTPException(status_code=400, detail=f"stage 仅支持 {sorted(_AGENT_STAGES_SET)}")
+
+
+async def _bound_servers(mcp_server_ids: list[str] | None) -> list[dict]:
+    """绑定 server 的 [{id, name, transport}]；无（NULL/空数组，两态语义）→ []。"""
+    if not mcp_server_ids:
+        return []
+    out: list[dict] = []
+    for mid in mcp_server_ids:
+        row = await mcp_store.get(mid)
+        out.append(
+            {"id": row["id"], "name": row["name"], "transport": row["transport"]}
+            if row is not None
+            else {"id": mid, "name": mid, "transport": "?"}  # 残留引用（server 已删）
+        )
+    return out
+
+
+async def _with_bound_servers(rows: list[dict]) -> list[dict]:
+    resolver = AgentConfigResolver(rows)
+    out: list[dict] = []
+    for row in rows:
+        eff = resolver.resolve(row["name"])
+        out.append({
+            **row,
+            "effective_description": eff.description if eff else (row.get("description") or ""),
+            "bound_servers": await _bound_servers(row.get("mcp_server_ids")),
+        })
+    return out
+
+
+@app.post("/agent-configs", status_code=201)
+async def create_agent_config(payload: AgentConfigPayload) -> dict:
+    """新建自定义 agent（origin=custom）。name 唯一（撞内置名 → 400）；custom 必填非空 system_prompt。"""
+    name = _acfg_str(payload.name)
+    if not name or not _AGENT_NAME_RE.fullmatch(name):
+        raise HTTPException(status_code=400, detail="name 仅支持字母/数字/下划线/中划线（同时是 workflow node.agent 引用）")
+    if name in _BUILTIN_AGENT_NAMES:
+        raise HTTPException(status_code=400, detail=f"agent 名 {name!r} 是内置 agent，请直接编辑其配置")
+    _validate_agent_role_stage(payload.role, payload.stage)
+    if payload.role not in _AGENT_ROLES:
+        raise HTTPException(status_code=400, detail="role 仅支持 diagnose 或 fix")
+    system_prompt = _acfg_str(payload.system_prompt)
+    if not system_prompt:
+        raise HTTPException(status_code=400, detail="自定义 agent 必须提供非空 system_prompt")
+    data = {
+        "name": name,
+        "origin": "custom",
+        "role": payload.role,
+        "stage": _acfg_str(payload.stage) or "other",
+        "description": _acfg_str(payload.description),
+        "system_prompt": system_prompt,
+        "schema": payload.output_schema,
+        "mcp_server_ids": payload.mcp_server_ids,
+        "enabled": True if payload.enabled is None else payload.enabled,
+        "reasoning_enabled": False if payload.reasoning_enabled is None else payload.reasoning_enabled,
+    }
+    try:
+        await agent_config_store.save(data)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail=f"agent 名 {name!r} 已存在") from None
+    await _reload_agent_config_resolver()
+    return {"name": name, "origin": "custom"}
+
+
+@app.get("/agent-configs")
+async def list_agent_configs() -> list[dict]:
+    """全部 AgentSpec 配置行（含合并有效描述 + 绑定 server 名）。"""
+    rows = await agent_config_store.list()
+    return await _with_bound_servers(rows)
+
+
+@app.get("/agent-configs/{name}")
+async def get_agent_config(name: str) -> dict:
+    """单条：有效值已合并内置回退（供编辑弹窗回填）+ 绑定 server + stored（是否已覆盖）。"""
+    row = await agent_config_store.get(name)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"agent 配置不存在: {name!r}")
+    eff = AgentConfigResolver([row]).resolve(name)
+    return {
+        "name": row["name"],
+        "origin": row["origin"],
+        "role": row["role"],
+        "stage": row["stage"],
+        "enabled": row["enabled"],
+        "reasoning_enabled": row["reasoning_enabled"],
+        "mcp_server_ids": row["mcp_server_ids"],
+        "bound_servers": await _bound_servers(row.get("mcp_server_ids")),
+        "description": eff.description if eff else (row.get("description") or ""),
+        "system_prompt": eff.system_prompt if eff else None,
+        "schema": eff.schema if eff else {},
+        "stored": {
+            "description": row["description"],
+            "system_prompt": row["system_prompt"],
+            "schema": row["schema"],
+        },
+    }
+
+
+@app.put("/agent-configs/{name}")
+async def update_agent_config(name: str, payload: AgentConfigPayload) -> dict:
+    """完整对象覆盖式更新（builtin/custom 均可）。文本清空/不传 → 归 NULL 回退内置；
+    custom 不允许最终 system_prompt 为空。origin 保持不变。"""
+    existing = await agent_config_store.get(name)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"agent 配置不存在: {name!r}")
+    _validate_agent_role_stage(payload.role, payload.stage)
+    role = payload.role if payload.role in _AGENT_ROLES else existing["role"]
+    stage = _acfg_str(payload.stage) or existing["stage"]
+    system_prompt = _acfg_str(payload.system_prompt)
+    if existing["origin"] == "custom" and not system_prompt:
+        raise HTTPException(status_code=400, detail="自定义 agent 必须提供非空 system_prompt")
+    data = {
+        "name": name,
+        "origin": existing["origin"],
+        "role": role,
+        "stage": stage,
+        "description": _acfg_str(payload.description),
+        "system_prompt": system_prompt,
+        "schema": payload.output_schema,
+        "mcp_server_ids": payload.mcp_server_ids,
+        "enabled": existing["enabled"] if payload.enabled is None else payload.enabled,
+        "reasoning_enabled": (
+            existing["reasoning_enabled"]
+            if payload.reasoning_enabled is None
+            else payload.reasoning_enabled
+        ),
+    }
+    if not await agent_config_store.update(name, data):
+        raise HTTPException(status_code=404, detail=f"agent 配置不存在: {name!r}")
+    await _reload_agent_config_resolver()
+    return {"ok": True, "name": name}
+
+
+@app.delete("/agent-configs/{name}")
+async def delete_agent_config(name: str) -> dict:
+    """删除自定义 agent；内置 agent 禁删（只能编辑/清空覆盖回退）。"""
+    row = await agent_config_store.get(name)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"agent 配置不存在: {name!r}")
+    if row["origin"] == "builtin":
+        raise HTTPException(status_code=400, detail="内置 agent 不可删除，请用编辑清空覆盖回退默认")
+    if not await agent_config_store.delete(name):
+        raise HTTPException(status_code=404, detail=f"agent 配置不存在: {name!r}")
+    await _reload_agent_config_resolver()
+    return {"ok": True}
+
+
 @app.get("/agents")
 async def agents() -> list[dict]:
-    """Agent 编队列表（静态平台元数据，读取 AGENT_REGISTRY；与 /health 同级无鉴权）。
+    """Agent 编队列表（DB AgentSpec 配置 + 内置静态默认的合并视图；与 /health 同级无鉴权）。
 
-    返回 [{name, description, tools, stage}]，tools 为该 agent 在 Tool Registry 中可见的工具名，
-    stage 为流水线阶段（detect/diagnose/fix/verify/deliver/learn），供前端舰队分组展示。
+    来源 ``_effective_agent_resolver().all()``：内置 15（DB 覆盖或静态默认）∪ 自定义 agent。
+    返回 [{name, description, tools, stage}]，tools 为该 agent 在 Tool Registry 中可见的函数
+    工具名（L1 数据源，与 MCP 绑定无关），stage 为流水线阶段（detect/diagnose/fix/verify/
+    deliver/learn），供前端舰队分组展示。store 为空（未 init）时 == 纯内置 15，形状/顺序与
+    既有静态注册表一致。
     """
     return [
         {"name": spec.name, "description": spec.description,
-         "tools": [t.name for t in spec.tools],
+         "tools": [t.name for t in tools_for_agent(spec.name)],
          "stage": spec.stage}
-        for spec in AGENT_REGISTRY.values()
+        for spec in _effective_agent_resolver().all()
     ]
 
 

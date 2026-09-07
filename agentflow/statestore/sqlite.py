@@ -70,6 +70,18 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     actor         TEXT,
     ts            TEXT
 );
+CREATE TABLE IF NOT EXISTS node_traces (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id    TEXT NOT NULL,
+    node_id   TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    seq       INTEGER NOT NULL,
+    kind      TEXT NOT NULL,
+    name      TEXT,
+    payload   TEXT NOT NULL,
+    ts        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_node_traces_run ON node_traces(run_id, node_id);
 """
 
 
@@ -275,3 +287,38 @@ class SqliteStateStore(StateStore):
         cur = await self._c.execute(sql, params)
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+    # ---- node_traces ----
+    async def replace_node_traces(self, run_id, node_id, tenant_id, *, rows) -> None:
+        await self._c.execute(
+            "DELETE FROM node_traces WHERE run_id=? AND node_id=?", (run_id, node_id)
+        )
+        if rows:
+            ts = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+            await self._c.executemany(
+                "INSERT INTO node_traces(run_id, node_id, tenant_id, seq, kind, name, payload, ts)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                [
+                    (run_id, node_id, tenant_id, i, r.get("kind", ""), r.get("name"),
+                     _j(r.get("payload", {})), ts)
+                    for i, r in enumerate(rows)
+                ],
+            )
+        await self._c.commit()
+
+    async def get_node_traces(self, run_id, node_id=None, *, kind=None, limit=500) -> list[dict]:
+        sql = "SELECT * FROM node_traces WHERE run_id=?"
+        params: list = [run_id]
+        if node_id:
+            sql += " AND node_id=?"; params.append(node_id)
+        if kind:
+            sql += " AND kind=?"; params.append(kind)
+        sql += " ORDER BY node_id, id LIMIT ?"; params.append(limit)
+        cur = await self._c.execute(sql, params)
+        rows = await cur.fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["payload"] = json.loads(d["payload"])
+            out.append(d)
+        return out

@@ -68,14 +68,28 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     ts           TIMESTAMPTZ DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS node_traces (
+    id        BIGSERIAL PRIMARY KEY,
+    run_id    TEXT NOT NULL,
+    node_id   TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    seq       INTEGER NOT NULL,
+    kind      TEXT NOT NULL,
+    name      TEXT,
+    payload   JSONB NOT NULL,
+    ts        TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_traces_run ON node_traces(run_id, node_id);
+
 -- 控制面配置：MCP Server 配置（SIP「MCP Server 配置」页 CRUD + 运行时 MCPClientManager 读取）
+-- 记录只描述 server 本身，不存 agent 绑定（原 agents 列已移除；绑定以 agent 为主表建模）。
 CREATE TABLE IF NOT EXISTS mcp_servers (
     id            TEXT PRIMARY KEY,
     name          TEXT NOT NULL UNIQUE,
     transport     TEXT NOT NULL,
     config        TEXT NOT NULL,
     is_stateful   INTEGER NOT NULL DEFAULT 1,
-    agents        TEXT NOT NULL,
     enable_tools  TEXT,
     disable_tools TEXT,
     tools         TEXT,
@@ -90,4 +104,23 @@ CREATE TABLE IF NOT EXISTS workflows (
     name       TEXT NOT NULL,
     yaml       TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+-- 控制面配置：AgentSpec 配置（SIP「Agent 配置」页 CRUD + 运行时 AgentNodeRunner 读取）
+-- 可空列 description/system_prompt/schema_json 存 NULL=未覆盖→回退内置静态默认；
+-- seed/init 会把内置行的 description/system_prompt/schema_json 物化为静态默认（DB 为可见快照）。
+-- mcp_server_ids（JSON list[str] | NULL）两态（v1.12.1）：NULL/[]=无 MCP server；[mid,…]=精确子集。
+CREATE TABLE IF NOT EXISTS agent_configs (
+    name            TEXT PRIMARY KEY,
+    origin          TEXT NOT NULL DEFAULT 'builtin',
+    role            TEXT NOT NULL,
+    stage           TEXT NOT NULL DEFAULT 'other',
+    description     TEXT,
+    system_prompt   TEXT,
+    schema_json     TEXT,
+    mcp_server_ids  TEXT,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    reasoning_enabled INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
 );

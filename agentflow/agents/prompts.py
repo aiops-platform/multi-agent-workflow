@@ -10,11 +10,18 @@ from __future__ import annotations
 from .schemas import (
     BugReportSchema,
     CodeLocationSchema,
+    CommitSchema,
+    FixDiffSchema,
+    FixPlanSchema,
     InfraEvidenceSchema,
     KnowledgeEvidenceSchema,
     LogEvidenceSchema,
     MetricsEvidenceSchema,
+    PostmortemSchema,
+    RemediationPlanSchema,
+    ReviewSchema,
     RootCauseSchema,
+    TestResultSchema,
     TraceEvidenceSchema,
 )
 
@@ -152,8 +159,11 @@ SYSTEM_PROMPTS: dict[str, str] = {
     ),
 }
 
-# 输出 Schema 引用（供 registry 使用）
+# 输出 Schema 引用（供 registry 使用）。诊断侧为 S-011 实测字段；解决侧
+# 早期只在 prompt 内联 JSON 模板，现补全进 registry（每个 fix agent 的 schema
+# 与其 SYSTEM_PROMPTS 里的内联 JSON 模板字段对齐，见 schemas.py）。
 AGENT_SCHEMAS: dict[str, dict] = {
+    # 诊断侧（只读）
     "triage": BugReportSchema,
     "log-analyst": LogEvidenceSchema,
     "trace-analyst": TraceEvidenceSchema,
@@ -162,4 +172,167 @@ AGENT_SCHEMAS: dict[str, dict] = {
     "code-locator": CodeLocationSchema,
     "knowledge-lookup": KnowledgeEvidenceSchema,
     "root-cause": RootCauseSchema,
+    # 解决侧（含 L2）
+    "fix-planner": FixPlanSchema,
+    "fix-implementer": FixDiffSchema,
+    "infra-remediator": RemediationPlanSchema,
+    "tester": TestResultSchema,
+    "reviewer": ReviewSchema,
+    "committer": CommitSchema,
+    "postmortem": PostmortemSchema,
 }
+
+# ======================================================================
+# 自定义演示 agent 静态默认（origin='custom' 的 DB agent_configs 行物化优先；
+# 此处在“无 DB 行”或“DB 字段被清空”时作代码回退 + 单测锚点）
+# ======================================================================
+# remediation-planning-analyst：基于已审批根因生成可一次过审的修复计划。
+# decisions[] 是「方向选择」契约（形态 A）：互斥路径显式并列 + recommended 默认采纳；
+# 审批人不认可推荐时低成本改选 → 结构化驳回（带 decision_id + chosen_option）回本 agent 重写。
+REMEDIATION_PLANNING_PROMPT = (
+    "你是 AI 运维平台的「修复规划」Agent（remediation-planning-analyst）。\n"
+    "任务：基于已通过人工审批的根因结论，产出一份「一次可过审、可执行、可回滚」的修复计划。\n"
+    "产出目标读者 = 下一道人工审批（审核修复计划）的工程师 + 后续执行者（fix-implementer / tester / reviewer）。\n"
+    "审批人要在不开代码的前提下决定「采纳哪个方向、值不值得放行」，所以计划必须自带方向依据与判据，"
+    "把需要人拍板的点显式列成 decisions 而不是藏进 summary。\n"
+    "\n"
+    "输入（入参契约）：\n"
+    "- root_cause：已审批通过的根因 JSON（含 root_cause_type / confidence / summary，可能含 hypotheses / ruled_out / related_files）。\n"
+    "- 若你绑定了只读代码查询 MCP 工具（如 git-search）：出稿前必须用它核实证据——目标文件/行当前内容、调用方、分支与制品状态；"
+    "没有工具时，凡无法核实的一律不许写成确定结论。\n"
+    "\n"
+    "规则：\n"
+    "1. 区分「止血 mitigation（先恢复可用性，按需前置）」与「根治 root_fix（消除根因，必须覆盖）」两类动作。\n"
+    "2. 每个步骤都要自证：target(改动目标) → action(动作) → expected(预期) → verification(如何验证) → rollback(如何回退) → risk(风险)。\n"
+    "   没有回滚路径的步骤不允许出现。requires_approval 只标「部署/不可逆/高风险」动作，测试等自证步骤一律 false。\n"
+    "3. 只引用证据里的事实，绝不编造 root_cause / 代码侦查里不存在的文件、行号、配置、API；仅凭根因无法定位到具体行时，\n"
+    "   把「定位待改代码」列为首个实现步骤，不硬凑路径。\n"
+    "4. 出稿前先核实：凡能从绑定工具/代码/仓库状态查实的（调用方、分支/制品、字段可空性、是否已有校验），必须先查实再写，\n"
+    "   禁止把「自己本该查清的事」丢给审批人——这类项不得出现在 assumptions / open_questions。\n"
+    "5. 当存在互斥修复路径、各有合理 trade-off、无法靠证据唯一确定时，禁止静默选边：必须在 decisions[] 里并列给出 options\n"
+    "   （含 pros/cons/effort/risk/rollback）并标 recommended + accept_criteria。recommended 必须是你最有把握审批人会接受的选项，\n"
+    "   且 summary/steps 要与 recommended 口径一致——不要一边推荐 A 一边计划按 B 写。审批人默认「采纳推荐方向」，不需要你为某一边辩护。\n"
+    "6. 明确影响面（impact：affected_services / blast_radius / needs_deploy / change_window）与可测试的 success_criteria，供 tester/reviewer 验收。\n"
+    "7. open_questions ≤3，只留「真·产品/业务/外部」未知且必须由人拍板的（如上游调用方真实行为、字段业务语义、生产制品来源）；\n"
+    "   可查实的不得留，不需要人拍板的写进 assumptions。\n"
+    "8. 交付前自检，任一不过则先改写再输出：\n"
+    "   - 每步有 verification + rollback + risk；requires_approval 只标该标的步骤；\n"
+    "   - decisions 的 recommended 确实在 options 内，且与 summary/steps 口径一致；\n"
+    "   - root_cause_ref 与上游已审批根因一致；open_questions 无自己能查实的项且 ≤3 条；\n"
+    "   - summary 一句话讲清「改什么 / 为什么 / 风险 / 怎么退」。\n"
+    "\n"
+    "最终只输出一个严格 JSON 对象，不要任何多余文字或 markdown 代码块，结构必须与输出 Schema 完全一致，例如：\n"
+    '{"summary": "计划一句话摘要",\n'
+    ' "root_cause_ref": {"type": "code_bug", "confidence": 0.9, "summary": "根因摘要"},\n'
+    ' "approach": "mitigation_first",\n'
+    ' "steps": [{"id": "S1", "phase": "mitigation", "scope": "code", "target": "文件:行", "action": "动作",\n'
+    '            "expected": "预期", "verification": "验证方式", "rollback": "回滚方案", "risk": "low",\n'
+    '            "depends_on": [], "requires_approval": true}],\n'
+    ' "impact": {"affected_services": ["svc-a"], "blast_radius": "service", "needs_deploy": true, "change_window": true},\n'
+    ' "success_criteria": ["可验证的验收标准"],\n'
+    ' "risks": [{"risk": "风险", "mitigation": "缓解"}],\n'
+    ' "assumptions": ["前提假设"],\n'
+    ' "open_questions": ["≤3 条，仅真·产品/外部未知"],\n'
+    ' "decisions": [{"id": "D1", "question": "要人拍板的问题",\n'
+    '                 "context": "为何需人定",\n'
+    '                 "options": [{"id": "A", "title": "选项A", "pros": [], "cons": [], "rollback": "…"},\n'
+    '                             {"id": "B", "title": "选项B", "pros": [], "cons": [], "rollback": "…"}],\n'
+    '                 "recommended": "A", "accept_criteria": "选 A 后计划据此展开，满足…即可放行"}]}'
+)
+
+REMEDIATION_PLANNING_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string", "description": "计划一句话摘要（中文）"},
+        "root_cause_ref": {
+            "type": "object",
+            "description": "引用本次已审批的根因，保证可追溯",
+            "properties": {
+                "type": {"type": "string", "enum": ["code_bug", "infra_issue", "config_issue", "dependency_issue"]},
+                "confidence": {"type": "number"},
+                "summary": {"type": "string"},
+            },
+            "required": ["type", "summary"],
+        },
+        "approach": {"type": "string", "enum": ["mitigation_first", "root_fix_only", "combined"], "description": "止血优先 / 仅根治 / 双管齐下"},
+        "steps": {
+            "type": "array",
+            "description": "有序执行步骤；每一步都必须可验证、可回滚",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "phase": {"type": "string", "enum": ["mitigation", "root_fix", "verification", "cleanup"]},
+                    "scope": {"type": "string", "enum": ["code", "config", "infra"]},
+                    "target": {"type": "string", "description": "改动目标：文件/服务/配置/资源"},
+                    "action": {"type": "string", "description": "具体动作"},
+                    "expected": {"type": "string", "description": "预期效果"},
+                    "verification": {"type": "string", "description": "如何验证该步骤生效"},
+                    "rollback": {"type": "string", "description": "回滚/撤销方案（必填）"},
+                    "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+                    "depends_on": {"type": "array", "items": {"type": "string"}},
+                    "requires_approval": {"type": "boolean"},
+                },
+                "required": ["phase", "scope", "target", "action", "expected", "verification", "rollback", "risk"],
+            },
+        },
+        "impact": {
+            "type": "object",
+            "properties": {
+                "affected_services": {"type": "array", "items": {"type": "string"}},
+                "blast_radius": {"type": "string", "enum": ["single_instance", "service", "cross_service"]},
+                "needs_deploy": {"type": "boolean"},
+                "change_window": {"type": "boolean"},
+            },
+            "required": ["affected_services", "needs_deploy"],
+        },
+        "success_criteria": {"type": "array", "items": {"type": "string"}},
+        "risks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"risk": {"type": "string"}, "mitigation": {"type": "string"}},
+                "required": ["risk", "mitigation"],
+            },
+        },
+        "assumptions": {"type": "array", "items": {"type": "string"}},
+        "open_questions": {"type": "array", "items": {"type": "string"}},
+        "decisions": {
+            "type": "array",
+            "description": "互斥修复路径/需人拍板的决策点（可选；无真实分歧可省略/空数组）。审批默认采纳 recommended，或低成本改选方向后驳回重写。",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "决策标识（如 D1），供审批/驳回引用"},
+                    "question": {"type": "string", "description": "需人工拍板的问题——推荐方向带不动的真·产品/业务取舍"},
+                    "context": {"type": "string", "description": "为何需人定：证据缺口/双向风险，一两句"},
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "选项 id（如 A/B）"},
+                                "title": {"type": "string", "description": "选项标题"},
+                                "description": {"type": "string", "description": "做法一句话"},
+                                "pros": {"type": "array", "items": {"type": "string"}},
+                                "cons": {"type": "array", "items": {"type": "string"}},
+                                "effort": {"type": "string", "description": "low/medium/high 或人天"},
+                                "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+                                "rollback": {"type": "string", "description": "若最终走向该选项，如何回退"},
+                            },
+                            "required": ["id", "title"],
+                        },
+                    },
+                    "recommended": {"type": "string", "description": "推荐选项 id；必须是 options 中某项，审批默认采纳"},
+                    "accept_criteria": {"type": "string", "description": "采纳该项后计划据此展开；满足什么即视为可放行执行"},
+                },
+                "required": ["id", "question", "options", "recommended"],
+            },
+        },
+    },
+    "required": ["summary", "root_cause_ref", "approach", "steps", "impact", "success_criteria"],
+}
+
+# 注册为静态默认（供 DB 字段清空/NULL 时回退；DB 行物化优先，运行时以 DB 为准）
+SYSTEM_PROMPTS["remediation-planning-analyst"] = REMEDIATION_PLANNING_PROMPT
+AGENT_SCHEMAS["remediation-planning-analyst"] = REMEDIATION_PLANNING_SCHEMA

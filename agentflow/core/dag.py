@@ -58,6 +58,12 @@ class Node:
     params: dict[str, Any] = field(default_factory=dict)
     on_failure: str = "abort"  # abort | continue（诊断侧负证据策略）
     on_reject: str = "abort"  # approval 被拒时的行为
+    # 入参预检：执行 agent 前，这些 params 键必须解析到"可用值"
+    # （非 None / 非空串 / 非空 list-dict）。缺失或非法 → 立即按失败处理，不空转。
+    require: list[str] = field(default_factory=list)
+    # agent 节点可选墙钟上限（秒，可小数）；None = 不设限。
+    # 注意：审批节点把 YAML 顶层 timeout 折叠进 params（等待审批超时），语义不同。
+    timeout: float | None = None
 
     @property
     def is_approval(self) -> bool:
@@ -107,12 +113,16 @@ class DAG:
             params = spec.pop("params", {}) or {}
             on_failure = spec.pop("on_failure", "abort")
             on_reject = spec.pop("on_reject", "abort")
+            require = spec.pop("require", []) or []
+            if isinstance(require, str):
+                require = [require]
+            timeout_raw = spec.pop("timeout", None)
             if kind == "approval":
                 # 审批节点的展示元数据折叠进 params（§8.1：approvers/timeout/name 为同级 key）
                 params = {
                     **params,
                     "approvers": spec.pop("approvers", []) or [],
-                    "timeout": int(spec.pop("timeout", 3600)),
+                    "timeout": int(timeout_raw) if timeout_raw is not None else 3600,
                     "name": spec.pop("name", nid),
                 }
             nodes[nid] = Node(
@@ -126,6 +136,8 @@ class DAG:
                 params=params,
                 on_failure=on_failure,
                 on_reject=on_reject,
+                require=require,
+                timeout=(float(timeout_raw) if timeout_raw is not None else None),
             )
 
         # 2) 边：优先 edges 列表；否则内联 upstreams

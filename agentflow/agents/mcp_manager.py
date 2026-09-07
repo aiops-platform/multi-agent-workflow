@@ -3,10 +3,11 @@
 
 职责（对齐 SIP「MCP Server 配置」页 + AgentNodeRunner 运行时）：
 - CRUD 后热刷新：``refresh_server(mid)`` 重建/连接（或 enabled=0 时 evict）。
-- 运行时取 client：``clients_for_agent(agent_name)`` 返回全部 enabled 且已连接的 client
-  （**server 侧无 agent 绑定**——原 ``agents`` 字段已移除；运行时把全部 enabled server
-  下发给 agent，待 agent 主表落地后再按 agent 所选 server 过滤。stateful 失联做一次重连，
-  失败跳过不阻塞执行）。
+- 运行时取 client：``clients_for_agent(agent_name)`` 返回该 agent 可用的 enabled 且已连接
+  client。绑定以 **agent 主表**建模（``agent_configs.mcp_server_ids``），经注入的
+  ``server_ids_for``（AgentConfigResolver）按 **server 粒度**过滤：v1.12.1 起「没配置绑定 =
+  没有 server」（两态：无/精确子集），不再有「未配置=全量 enabled」的默认。
+  stateful 失联做一次重连，失败跳过不阻塞执行。
 - 预计算 allow 名单：``allow_names_for_agent(agent_name)`` 经 ``MCPTool.name`` 取 AgentScope
   侧的精确工具名（``mcp__{server}__{sanitized}``，避免 sanitize 规则漂移），供
   ``build_permission_context`` 在 build_agent 前注入（§9.5 DONT_ASK + 精确 allow）。
@@ -58,11 +59,14 @@ class MCPClientManager:
     refresh 重建后 id 变化 → 自然失效重算）。
     """
 
-    def __init__(self, store: Any) -> None:
+    def __init__(self, store: Any, *, server_ids_for=None) -> None:
         self._store = store
         self._clients: dict[str, MCPClient] = {}
         self._rows: dict[str, dict[str, Any]] = {}
         self._allow_cache: dict[int, list[str]] = {}
+        # agent 主表绑定解析器（AgentConfigResolver.server_ids_for，server 粒度）。不注入（None）→
+        # 返回全部 enabled（仅测试/独立用法兼容）；注入后以回调返回的子集过滤——空 set = 无 server。
+        self.server_ids_for = server_ids_for
 
     # ------------------------------------------------------------------
     # client 构造
@@ -190,16 +194,23 @@ class MCPClientManager:
     # 运行时查询（AgentNodeRunner 用）
     # ------------------------------------------------------------------
     async def clients_for_agent(self, agent_name: str) -> list[MCPClient]:
-        """返回全部 enabled 且（stateful）已连接的 client。
+        """返回该 agent 可用的 enabled 且（stateful）已连接的 client（server 粒度）。
 
-        参数 ``agent_name`` 暂不参与过滤：server 侧绑定（原 ``agents`` 字段）已移除，
-        运行时把全部 enabled server 下发给每个 agent；后续以 agent 为主表挂载 MCP server
-        id 时，再回到这里按 agent 过滤。stateful 失联 → 尝试一次重连；重连仍失败则跳过
-        （log 告警，不让一个坏 server 拖垮整次 run）。
+        ``server_ids_for`` 为 None（未注入 resolver，仅测试/独立用法）→ 返回全部 enabled；
+        否则按 ``server_ids_for(agent_name)`` 过滤：返回空 set（未配置/明确不绑，v1.12.1 起
+        “没配置就没有 server”）→ 无任何 client；非空 set → 只返回 ``mid in set`` 的 client。
+        只读 MCP 工具在 AgentScope 自动 ALLOW，故“只见所选 server 的 enabled 工具”靠
+        这里只下发绑定 client 天然约束（非只读工具另经 allow_names_for_agent 精确 allow）。
+        stateful 失联 → 尝试一次重连；重连仍失败则跳过（log 告警，不让一个坏 server 拖垮整次 run）。
         """
+        allowed: set[str] | None = None
+        if self.server_ids_for is not None:
+            allowed = self.server_ids_for(agent_name) or set()  # 无/空 → 不绑任何 server（两态：无/子集）
         result: list[MCPClient] = []
         for mid, row in list(self._rows.items()):
             if not row.get("enabled"):
+                continue
+            if allowed is not None and mid not in allowed:
                 continue
             client = self._clients.get(mid)
             if client is None:
@@ -217,10 +228,9 @@ class MCPClientManager:
     async def allow_names_for_agent(self, agent_name: str) -> list[str]:
         """当前该 agent 可见 MCP 工具的 AgentScope 精确名（``mcp__{server}__{tool}``）。
 
-        server 侧绑定已移除 → 等于全部 enabled client 的工具（agent 参数同
-        ``clients_for_agent`` 暂不参与过滤）。只对真正下发的工具生成 allow
-        （``client.list_tools()`` 已应用 enable/disable 过滤）。结果按 client 缓存；
-        client 被 refresh 重建（id 变化）后自动重算。
+        复用 ``clients_for_agent``（含 server_ids_for 过滤）→ 只对真正下发给该 agent 的
+        client 生成 allow（``client.list_tools()`` 已应用 enable/disable 过滤）。结果按
+        client 缓存；client 被 refresh 重建（id 变化）后自动重算。
         """
         names: list[str] = []
         for client in await self.clients_for_agent(agent_name):

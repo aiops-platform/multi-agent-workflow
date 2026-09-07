@@ -47,6 +47,7 @@ make install
 
 ```bash
 cp .env.example .env
+cp .env.dev .env
 # 编辑 .env，填入 DeepSeek Key：
 #   DEEPSEEK_API_KEY=sk-xxx
 ```

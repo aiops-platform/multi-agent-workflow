@@ -1,0 +1,67 @@
+name: git-search-approval
+# 演示：App 日志分析（app-log-analyst，绑 app-log-search-mcp-server，按 requestId 查链路日志）
+#      → 代码侦查（git-search-analyst，绑 git-search-mcp-server）
+#      → 根因综合（root-cause-analyst，custom、零工具，纯依据上游证据推理）
+#      → 人工审批（审批根因结论）。
+#
+# 入参对齐平台 ticket 契约（repo + bug_report）；app-log-analyst 的链路 ID（requestId）取自
+# ticket 的 correlation_hint.sample_trace_ids[0]（取第一个关联 trace），供按链路查日志；
+# 若 ticket 无该字段 → require 预检直接判失败（不空转）。git-search-analyst 输出
+# {repo_path, found, summary, evidence[], suspicious_files[], suspects[]}；app-log-analyst 输出
+# {query_type, request_id, found, error_count, failing_service, first_error, error_types,
+# key_logs[], summary}；root-cause-analyst 输出根因 JSON {root_cause_type, confidence, summary,...}。
+inputs:
+  repo:       { type: string, required: true }   # 目标仓库：项目名或绝对路径
+  bug_report: { type: object, required: true }   # APM/SLO 事件或任意问题描述对象
+  request_id: { type: string, required: false }  # 链路 ID（app-log-analyst 按它查整条调用链）
+
+nodes:
+  # ── 第 1 个节点：app-log-analyst 按链路 ID 查应用日志并分析 ──
+  app-log:
+    agent: app-log-analyst
+    require: [requestId]          # requestId 解析不到可用链路 ID → 直接判失败，不空转
+    params:
+      requestId:  "$.inputs.correlation_hint.sample_trace_ids[0]"   # 链路 ID → query_chain_log_by_request_id
+      #                                                             #（ticket 的关联 trace 列表取第一个；无则走 require 判失败）
+      bug_report: "$.inputs.description"        # 问题上下文（现象/错误信息，供聚焦）
+    on_failure: abort
+
+  # ── 第 2 个节点：git-search-analyst 代码侦查 ──
+  git-search:
+    agent: git-search-analyst
+    params:
+      repo_path:  "$.inputs.subcategory"        # 仓库定位（沿用你既有写法）
+      bug_report: "$.inputs.description"        # 完整问题上下文
+    on_failure: abort
+
+  # ── 第 3 个节点：root-cause-analyst 纯推理根因综合（零工具）──
+  root-cause:
+    agent: root-cause-analyst
+    params:
+      log_analysis: "$.nodes.app-log.output"      # app-log-analyst 完整日志分析
+      code_analysis: "$.nodes.git-search.output"  # git-search 完整代码侦查
+      bug:  "$.inputs.description"                # 原始问题描述
+    on_failure: abort
+
+  # ── 第 4 个节点：人工审批根因结论 ──
+  approve-root:
+    agent: approval
+    kind: approval
+    name: "审批根因分析结论"
+    params: { output: "$.nodes.root-cause.output" }   # 展示并透传 root-cause 输出
+    approvers: ["lead-engineer"]
+    timeout: 3600
+    on_reject: abort
+
+  # ── 第 5 个节点：remediation-planning-analyst 依据已审批的根因生成修复计划 ──
+  remediation-plan:
+    agent: remediation-planning-analyst
+    params:
+      root_cause: "$.nodes.root-cause.output"   # 根因结论（传递上游；approve-root 通过后才可达）
+    on_failure: abort
+
+edges:
+  - { from: app-log, to: git-search }
+  - { from: git-search, to: root-cause }
+  - { from: root-cause, to: approve-root }
+  - { from: approve-root, to: remediation-plan, when: "$.nodes.approve-root.output.approved == true" }

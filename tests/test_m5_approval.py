@@ -112,6 +112,32 @@ async def test_sweeper_cas_no_double_timeout() -> None:
     assert ap["status"] == APPROVAL_TIMED_OUT
 
 
+async def test_sweeper_accepts_datetime_timeout_at_pg_adapter(monkeypatch) -> None:
+    """回归：PG 适配器把 TIMESTAMPTZ 列读回 datetime（非 str），sweeper 不得再抛
+    ``TypeError: fromisoformat: argument must be str``（曾导致超时审批永远无法处理）。"""
+    store = InMemoryStateStore()
+    queue = InMemoryQueue()
+    sweeper = ApprovalSweeper(store, queue, interval=1)
+    await store.create_run("run_pg", "team-alpha", "snap", {})
+    await store.put_node("run_pg", "team-alpha", "approve-changes", {"status": "waiting_approval"})
+    await _expired_approval(store, run_id="run_pg")  # 真实 ISO str 落库，aid=ap_run_pg_approve-changes
+
+    real_get_pending = store.get_pending_approvals
+
+    async def _pg_pending():
+        rows = await real_get_pending()
+        for r in rows:
+            r["timeout_at"] = datetime.fromisoformat(r["timeout_at"])  # 模拟 PG 读回 datetime
+        return rows
+
+    monkeypatch.setattr(store, "get_pending_approvals", _pg_pending)
+
+    timed_out = await sweeper.run_once()
+    assert len(timed_out) == 1
+    ap = await store.get_approval("run_pg", "approve-changes")
+    assert ap["status"] == APPROVAL_TIMED_OUT
+
+
 # ======================================================================
 # 通知
 # ======================================================================

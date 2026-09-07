@@ -87,7 +87,7 @@ async def test_allow_names_include_mcp_tools_for_any_agent() -> None:
         names = await mgr.allow_names_for_agent("triage")
         assert "mcp__mock-mcp__get_weather" in names
         assert "mcp__mock-mcp__queryxrepo" in names
-        # server 侧无绑定 → 别的 agent 名同样可见全部 enabled 工具
+        # 未注入 server_ids_for（独立用法回退全量）→ 别的 agent 名同样可见该 server 工具
         assert "mcp__mock-mcp__get_weather" in await mgr.allow_names_for_agent("root-cause")
     finally:
         await mgr.close_all()
