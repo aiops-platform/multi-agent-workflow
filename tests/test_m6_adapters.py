@@ -142,6 +142,106 @@ async def test_postgres_state_store_construct() -> None:
     assert store._dsn.startswith("postgresql://")
 
 
+# ---- psycopg3 连接无 executemany：replace_node_traces 必须走 cursor（曾用 conn.executemany 静默丢 trace）----
+class _FakeTraceCursor:
+    def __init__(self, log):
+        self._log = log
+
+    async def execute(self, sql, params=None):
+        self._log.append(("cursor_execute", sql))
+
+
+class _FakeTraceCursorCtx:
+    def __init__(self, cur):
+        self._cur = cur
+
+    async def __aenter__(self):
+        return self._cur
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeTraceConn:
+    """极简 psycopg3 AsyncConnection 面：只有 execute/cursor/commit，**没有 executemany**。"""
+
+    def __init__(self):
+        self.log: list[tuple[str, str]] = []
+        self.committed = False
+
+    async def execute(self, sql, params=None):
+        self.log.append(("conn_execute", sql))
+
+    def cursor(self):
+        return _FakeTraceCursorCtx(_FakeTraceCursor(self.log))
+
+    async def commit(self):
+        self.committed = True
+
+
+async def test_postgres_replace_node_traces_writes_via_cursor() -> None:
+    """回归（live PG 全 run 无 trace 的根因）：connection.execute() 有、executemany() 没有，
+    → 实现改走 ``self._conn.cursor()`` 逐行 execute。此测试用无 executemany 的假连接驱动，
+    旧实现（conn.executemany）会在此 AttributeError。"""
+    from agentflow.statestore.postgres import PostgresStateStore
+
+    store = PostgresStateStore("postgresql://unused")  # 不 connect()，直接注入假连接
+    conn = _FakeTraceConn()
+    store._conn = conn
+    await store.replace_node_traces(
+        "run_r", "n1", "local",
+        rows=[
+            {"kind": "llm_call", "name": "m", "payload": {"reasoning": "思考链"}},
+            {"kind": "tool_call", "name": "get_trace", "payload": {"input": {"trace_id": "abc"}}},
+        ],
+    )
+    sqls = " ".join(s for _, s in conn.log)
+    assert "DELETE FROM node_traces" in sqls
+    assert sqls.count("INSERT INTO node_traces") == 2  # 逐行插（seq 0,1）
+    assert conn.committed
+
+
 class _SettingsStub:
     state_store = "postgres"
     postgres_dsn = "localhost:5432/agentflow?user=agentflow&password=agentflow"
+
+
+# ======================================================================
+# 控制面配置存储 PG 后端（mcp_servers/workflows 跟随 state_store）：
+# builder 选择正确性 + PG store 构造（psycopg 惰性 import，不连真实 DB，同 §14 构造专项）
+# ======================================================================
+class _ControlSettingsStub:
+    """含 state_db_path 的最小 settings，供 sqlite 分支 builder 测试。"""
+
+    state_store = "sqlite"
+    state_db_path = ":memory:"
+
+
+async def test_mcp_store_builder_selects_sqlite() -> None:
+    from agentflow.api.mcp_store import MCPStore, build_mcp_store
+
+    store = build_mcp_store(_ControlSettingsStub())
+    assert isinstance(store, MCPStore)
+
+
+async def test_mcp_store_builder_selects_postgres() -> None:
+    from agentflow.api.mcp_store import PgMCPStore, build_mcp_store
+
+    store = build_mcp_store(_SettingsStub())
+    assert isinstance(store, PgMCPStore)
+    assert store._dsn.startswith("postgresql://")  # postgres_dsn 归一化补前缀
+
+
+async def test_workflow_store_builder_selects_sqlite() -> None:
+    from agentflow.api.workflow_store import WorkflowStore, build_workflow_store
+
+    store = build_workflow_store(_ControlSettingsStub())
+    assert isinstance(store, WorkflowStore)
+
+
+async def test_workflow_store_builder_selects_postgres() -> None:
+    from agentflow.api.workflow_store import PgWorkflowStore, build_workflow_store
+
+    store = build_workflow_store(_SettingsStub())
+    assert isinstance(store, PgWorkflowStore)
+    assert store._dsn.startswith("postgresql://")

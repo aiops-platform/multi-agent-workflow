@@ -30,3 +30,6 @@ docker/sandbox/wheels/
 .idea/
 .vscode/
 .DS_Store
+*.env.dev
+
+

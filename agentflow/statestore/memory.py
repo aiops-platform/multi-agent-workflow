@@ -17,6 +17,8 @@ class InMemoryStateStore(StateStore):
         self._attempts: dict[str, dict] = {}
         self._attempt_seq: int = 0
         self._audit: list[dict] = []
+        self._traces: list[dict] = []
+        self._trace_seq: int = 0
 
     # ---- workflow_snapshots ----
     async def save_snapshot(self, tenant_id: str, snapshot: dict) -> str:
@@ -135,3 +137,35 @@ class InMemoryStateStore(StateStore):
             and (run_id is None or a["run_id"] == run_id)
         ]
         return out[-limit:]
+
+    # ---- node_traces：节点级事件流水明细（先删后插 → retry/resume 只留末次成功 attempt 全量流水）----
+    async def replace_node_traces(self, run_id, node_id, tenant_id, *, rows) -> None:
+        self._traces = [
+            t for t in self._traces
+            if not (t["run_id"] == run_id and t["node_id"] == node_id)
+        ]
+        ts = datetime.now(timezone.utc).isoformat()
+        for i, r in enumerate(rows):
+            self._traces.append({
+                "id": self._trace_seq,
+                "seq": i,  # 与 sqlite/PG 一致：整节点替换后按 0 起重算
+                "run_id": run_id,
+                "node_id": node_id,
+                "tenant_id": tenant_id,
+                "kind": r.get("kind", ""),
+                "name": r.get("name"),
+                "payload": r.get("payload", {}),
+                "ts": ts,
+            })
+            self._trace_seq += 1
+
+    async def get_node_traces(self, run_id, node_id=None, *, kind=None, limit=500) -> list[dict]:
+        out = [
+            t for t in self._traces
+            if t["run_id"] == run_id
+            and (node_id is None or t["node_id"] == node_id)
+            and (kind is None or t["kind"] == kind)
+        ]
+        # 与 sqlite/PG 的 ORDER BY node_id, id 一致
+        out.sort(key=lambda t: (t["node_id"], t["id"]))
+        return list(out[:limit])

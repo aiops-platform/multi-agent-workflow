@@ -1,0 +1,52 @@
+# docker-compose.yml — 本地基础设施：PostgreSQL(StateStore) + Redis(Lock)
+#
+# 对齐 agentflow/config.py 与 .env 的 DSN：
+#   PostgreSQL  localhost:5432  db=agentflow user=agentflow password=agentflow
+#   Redis       localhost:6379  （无密码）
+#
+# 用法：
+#   docker compose up -d          # 启动
+#   docker compose ps             # 查看状态
+#   docker compose logs -f postgres
+#   docker compose down           # 停止并删除容器（保留数据卷）
+#   docker compose down -v        # 连同数据卷一起删（清空数据）
+#
+# 首次启动会自动执行 docker/init/*.sql 建表（仅空数据卷时执行一次），
+# 之后应用以 PostgresStateStore 连接时也会 CREATE TABLE IF NOT EXISTS，幂等。
+services:
+  postgres:
+    image: docker.io/library/postgres:17
+    container_name: agentflow-postgres
+    environment:
+      POSTGRES_DB: agentflow
+      POSTGRES_USER: agentflow
+      POSTGRES_PASSWORD: agentflow
+      TZ: Asia/Shanghai
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init:/docker-entrypoint-initdb.d:ro   # 首次启动自动建表
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentflow -d agentflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: docker.1ms.run/redis:8.4-alpine
+    container_name: agentflow-redis
+    command: ["redis-server", "--appendonly", "yes"]   # 开启 AOF 持久化
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
+  redisdata:

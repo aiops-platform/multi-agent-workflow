@@ -48,10 +48,16 @@ class ApprovalSweeper:
             timeout_at = ap.get("timeout_at")
             if not timeout_at:
                 continue
-            try:
-                deadline = datetime.fromisoformat(timeout_at)
-            except ValueError:
-                continue
+            # PG 适配器把 TIMESTAMPTZ 列读回 datetime（非 str）；sqlite/memory 存的是 ISO str → 两者都兼容
+            if isinstance(timeout_at, datetime):
+                deadline = timeout_at
+            else:
+                try:
+                    deadline = datetime.fromisoformat(timeout_at)
+                except (TypeError, ValueError):
+                    continue  # 无法解析的 deadline → 本轮跳过
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)  # naive → 视为 UTC，与 now 对齐
             if deadline > now:
                 continue
             # CAS：仅当仍为 WAITING（终态不可逆）

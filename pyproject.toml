@@ -13,6 +13,9 @@ license = { text = "Proprietary" }
 dependencies = [
     # 智能体运行时（design §5 锁定 2.0.3；升级前需重跑 S-001/S-011）
     "agentscope==2.0.3",
+    # AgentScope 2.0.3 的 MCP 能力按 mcp SDK v1 API 编写（MCPTool 读 tool.inputSchema），
+    # mcp 2.x 改 snake_case(input_schema) 会使包装崩溃；显式 pin <2（git-mcp-server 同款）。
+    "mcp>=1.13,<2.0",
     "pyyaml>=6.0",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",

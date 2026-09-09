@@ -68,6 +68,31 @@ def build_model(settings: Settings | None = None) -> ChatModelBase:
     )
 
 
+def build_reasoning_model(settings: Settings | None = None) -> ChatModelBase:
+    """构建 DeepSeek **推理**模型（thinking 模式，design §16.3 同源）。
+
+    与 ``build_model``（OpenAIChatModel）的关键差异：用 ``DeepSeekChatModel`` 且
+    ``Parameters(thinking_enable=True)``——它才会发送 DeepSeek 的 ``extra_body.thinking.type=
+    "enabled"``，返回的 ``reasoning_content`` 经 AgentScope 解析成 ``ThinkingBlock``（思维链）。
+    供 Agent 级启用推理的节点用；无 API Key 时回退 ScriptedJsonModel（封闭，供无 Key / CI）。
+    """
+    settings = settings or get_settings()
+    if not settings.deepseek_api_key:
+        return ScriptedJsonModel({"note": "no_api_key"})
+
+    from agentscope.credential import DeepSeekCredential
+    from agentscope.model import DeepSeekChatModel
+
+    return DeepSeekChatModel(
+        credential=DeepSeekCredential(
+            api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url
+        ),
+        model=settings.deepseek_model,
+        parameters=DeepSeekChatModel.Parameters(thinking_enable=True),
+        stream=True,
+    )
+
+
 def build_agent(
     name: str,
     toolkit,
@@ -76,15 +101,19 @@ def build_agent(
     permission_context: PermissionContext | None = None,
     tenant_id: str = "local",
     max_iters: int = 10,
+    system_prompt: str | None = None,
+    middlewares: list | None = None,
 ) -> Agent:
     from .prompts import SYSTEM_PROMPTS
 
     ctx = permission_context or build_permission_context(name, tenant_id=tenant_id)
     return Agent(
         name=name,
-        system_prompt=SYSTEM_PROMPTS.get(name, "你是 AI 运维平台智能体。"),
+        # system_prompt 显式传入（DB 配置覆盖/自定义 agent）优先，否则用内置静态默认
+        system_prompt=system_prompt or SYSTEM_PROMPTS.get(name, "你是 AI 运维平台智能体。"),
         model=model,
         toolkit=toolkit,
+        middlewares=middlewares or [],
         state=AgentState(permission_context=ctx),
         react_config=ReActConfig(max_iters=max_iters),
     )

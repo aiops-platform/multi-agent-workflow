@@ -64,6 +64,34 @@ async def test_param_resolution_output_accessor() -> None:
     assert p["diff"] == "--- a\n+++ b"  # 字段可解析
 
 
+async def test_param_resolution_array_index() -> None:
+    """数组下标解析：inputs.list[0] 与 nodes 输出的 key_logs[0].msg。"""
+    from agentflow.executor.dag_executor import resolve_params
+
+    ctx = {
+        "nodes": {"app-log": {"status": "done", "output": {
+            "key_logs": [{"level": "ERROR", "msg": "boom", "trace_id": "T1"}],
+        }}},
+        "inputs": {"correlation_hint": {"sample_trace_ids": ["47239b8d", "a5873ffd"]}},
+    }
+    p = resolve_params(
+        {
+            "requestId": "$.inputs.correlation_hint.sample_trace_ids[0]",
+            "second": "$.inputs.correlation_hint.sample_trace_ids[1]",
+            "msg": "$.nodes.app-log.output.key_logs[0].msg",
+            "trace_id": "$.nodes.app-log.output.key_logs[0].trace_id",
+        },
+        ctx,
+    )
+    assert p["requestId"] == "47239b8d"
+    assert p["second"] == "a5873ffd"
+    assert p["msg"] == "boom"
+    assert p["trace_id"] == "T1"
+    # 越界下标 → None（require 会据此判失败，而非空转）
+    p2 = resolve_params({"x": "$.inputs.correlation_hint.sample_trace_ids[9]"}, ctx)
+    assert p2["x"] is None
+
+
 async def test_parallel_with_approval_waiting() -> None:
     ex, _, store, calls = build_executor(PARALLEL_YAML)
     outcome = await ex.run()
@@ -167,3 +195,181 @@ edges:
     ex = DAGExecutor("run_f", "t", wf.dag, InMemoryStateStore(), node_runner=failing_runner)
     with pytest.raises(WorkflowNodeFailed):
         await ex.run()
+
+
+# ──────────────────────────────────────────────────────────────────
+# 入参预检（require）+ 可选墙钟上限（timeout）：输入有问题直接失败，不空转
+# ──────────────────────────────────────────────────────────────────
+
+REQUIRE_ABORT_YAML = """
+name: require-abort
+version: "1.0.0"
+inputs: {}
+nodes:
+  a:
+    agent: log-analyst
+    require: [requestId]
+    params: { requestId: "$.inputs.requestId", bug: "$.inputs.description" }
+  b:
+    agent: root-cause
+edges:
+  - { from: a, to: b }
+"""
+
+
+async def test_node_require_missing_aborts_fast() -> None:
+    """必填入参 requestId 解析为 null → 立即失败，不调 agent（不空转）→ 整条链 abort。"""
+    from agentflow.core.workflow import Workflow
+
+    wf = Workflow.load_yaml(REQUIRE_ABORT_YAML)
+    called: list[str] = []
+
+    async def runner(node, params):
+        called.append(node.id)
+        return {"found": True}
+
+    ex = DAGExecutor(
+        "run_rq", "t", wf.dag, InMemoryStateStore(), node_runner=runner, inputs={}
+    )
+    with pytest.raises(WorkflowNodeFailed) as ei:
+        await ex.run()
+    assert "requestId" in str(ei.value)  # 错误信息指明缺失入参
+    assert called == []  # agent 未启动 → 无空转
+    assert ex.get_status("a") == "failed"
+
+
+async def test_node_require_satisfied_runs() -> None:
+    """入参可用 → 正常执行直至 done。"""
+    from agentflow.core.workflow import Workflow
+
+    wf = Workflow.load_yaml(REQUIRE_ABORT_YAML)
+    called: list[str] = []
+
+    async def runner(node, params):
+        called.append(node.id)
+        return {"node": node.id}
+
+    ex = DAGExecutor(
+        "run_ok", "t", wf.dag, InMemoryStateStore(), node_runner=runner,
+        inputs={"requestId": "abc123", "description": "卡死"},
+    )
+    outcome = await ex.run()
+    assert outcome == "done"
+    assert called == ["a", "b"]
+
+
+async def test_node_require_missing_on_continue_returns_negative_evidence() -> None:
+    """on_failure=continue 的节点入参缺失 → 负证据（found:false）而非 abort。"""
+    from agentflow.core.workflow import Workflow
+
+    yaml_text = """
+name: require-continue
+version: "1.0.0"
+inputs: {}
+nodes:
+  diag:
+    agent: log-analyst
+    require: [requestId]
+    on_failure: continue
+    params: { requestId: "$.inputs.requestId" }
+  fin:
+    agent: root-cause
+    params: { ev: "$.nodes.diag.output" }
+edges:
+  - { from: diag, to: fin }
+"""
+    wf = Workflow.load_yaml(yaml_text)
+
+    async def runner(node, params):
+        return {"node": node.id, "params": params}
+
+    ex = DAGExecutor(
+        "run_cn", "t", wf.dag, InMemoryStateStore(), node_runner=runner, inputs={}
+    )
+    outcome = await ex.run()
+    assert outcome == "done"
+    assert ex.get_status("diag") == DONE
+    assert ex.get_status("fin") == DONE
+    # diag 产出负证据，fin 收到它
+    fin_output = ex.get_output("fin")
+    assert fin_output["params"]["ev"]["found"] is False
+    assert "requestId" in fin_output["params"]["ev"]["error"]
+
+
+async def test_node_wallclock_timeout_marks_failed() -> None:
+    """node.timeout 墙钟上限：慢 runner 超时 → 节点失败 → 整条链 abort。"""
+    from agentflow.core.workflow import Workflow
+
+    yaml_text = """
+name: timeout-fail
+version: "1.0.0"
+inputs: {}
+nodes:
+  a:
+    agent: triage
+    timeout: 0.05
+  b:
+    agent: root-cause
+edges:
+  - { from: a, to: b }
+"""
+    wf = Workflow.load_yaml(yaml_text)
+
+    async def slow_runner(node, params):
+        await asyncio.sleep(1.0)
+        return {"ok": True}
+
+    ex = DAGExecutor("run_tm", "t", wf.dag, InMemoryStateStore(), node_runner=slow_runner)
+    with pytest.raises(WorkflowNodeFailed) as ei:
+        await ex.run()
+    assert "超时" in str(ei.value)
+    assert ex.get_status("a") == "failed"
+
+
+# ──────────────────────────────────────────────────────────────────
+# 节点开始即落 running：执行中 GET /runs/{id}（实时读库）能看见它在跑
+# ──────────────────────────────────────────────────────────────────
+async def test_executing_node_persisted_as_running() -> None:
+    """gate runner 进入后阻塞 → store 里该节点 status=='running' 且带解析后 params。
+
+    回归：曾只在内存置 RUNNING，DB 无行 → 前端看不到「执行中」。终态 _persist 覆盖本行。
+    """
+    from agentflow.core.workflow import Workflow
+
+    yaml_text = """
+name: single-running
+version: "1.0.0"
+inputs:
+  bug: { type: string }
+nodes:
+  a:
+    agent: triage
+    params: { bug: "$.inputs.bug" }
+"""
+    wf = Workflow.load_yaml(yaml_text)
+    store = InMemoryStateStore()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_runner(node, params):
+        entered.set()
+        await release.wait()  # 卡在执行中，模拟长 LLM 节点
+        return {"node": node.id, "ok": True}
+
+    ex = DAGExecutor(
+        "run_rn", "t", wf.dag, store, node_runner=gated_runner, inputs={"bug": "卡死"}
+    )
+    task = asyncio.create_task(ex.run())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)  # runner 已进 → running 已落库
+        nodes = await store.get_nodes("run_rn")
+        assert nodes["a"]["status"] == "running"
+        assert nodes["a"]["params"] == {"bug": "卡死"}  # running 行带解析后入参
+    finally:
+        release.set()
+    outcome = await asyncio.wait_for(task, timeout=2)
+    assert outcome == "done"
+    assert ex.get_status("a") == DONE
+    # 终态覆盖 running 行，无脏数据
+    nodes = await store.get_nodes("run_rn")
+    assert nodes["a"]["status"] == "done"

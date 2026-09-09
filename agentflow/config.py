@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     # ---- Kafka（M6）----
     kafka_bootstrap: str = "localhost:9092"
 
+    # ---- CORS（控制面 API 前端跨域，逗号分隔的 origin 列表，默认 *）----
+    cors_origins: str = "*"
+
     # ---- 沙箱（M4）----
     open_sandbox_domain: str = "localhost:8080"
     open_sandbox_api_key: str = ""
@@ -57,3 +60,12 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def postgres_dsn(settings: Settings) -> str:
+    """settings.postgres_dsn → psycopg 连接串（补 postgresql:// 前缀）。
+
+    唯一归一化点：运行期 StateStore 与控制面配置 store（MCP/workflow）都复用，
+    避免各处重复拼前缀漂移。
+    """
+    return f"postgresql://{settings.postgres_dsn}"
