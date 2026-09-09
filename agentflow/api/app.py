@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """控制面 FastAPI（design §6：POST /run / GET /runs/{id} / approve|reject / pause|resume）。
 
 - **认证**（§9.1）：``get_tenant_context`` 依赖从 Bearer JWT 派生 tenant_id；
@@ -34,21 +33,27 @@ from ..config import Settings, get_settings
 from ..core.dag import WAITING_APPROVAL, WorkflowDAGError
 from ..core.workflow import Workflow
 from ..executor.dag_executor import ApprovalRaceError
+from ..lock import build_lock
 from ..queue import build_queue
 from ..service import ApproverNotAllowed, RunService, TenantQuotaExceeded
-from ..statestore import build_state_store, connect_state_store
-from ..tenants import TenantRegistry
+from ..statestore.router import TenantStoresRouter
+from ..tenants import TenantRegistry, async_bootstrap_tenants
 from ..worker import Worker
-from .agent_store import AgentConfigStore, build_agent_config_store, seed_builtin_agent_configs
+from .agent_store import (
+    AgentConfigStore,
+    build_agent_config_store,
+)
 from .auth import TenantContext, get_tenant_context
+from .management_store import build_management_store
 from .mcp_store import MCPStore, build_mcp_store
 from .workflow_store import WorkflowStore, build_workflow_store
 
 settings: Settings = get_settings()
-# 租户注册表（§9.3）：配置了 AGENTFLOW_TENANTS_FILE 则文件驱动，否则内置默认（不限制）
-tenant_registry = (
-    TenantRegistry.load(settings.tenants_file) if settings.tenants_file else TenantRegistry.builtin()
-)
+# 租户注册表：import 时为 builtin 默认（dev）；init() 从管理库重建（v5.3 §5.2）
+tenant_registry = TenantRegistry.builtin()
+# 管理库 + 租户库路由 + 配额锁：init() 装配；测试可 monkeypatch 模块全局替换
+management_store = build_management_store(settings)
+stores_router: TenantStoresRouter | None = None
 
 
 @asynccontextmanager
@@ -146,21 +151,29 @@ def _service() -> RunService:
 
 
 async def _run_for_tenant(run_id: str, ctx: TenantContext) -> dict:
-    """读 run 并强制租户隔离（§9.2）：跨租户一律 404（不泄漏存在性）。"""
-    run = await _service().store.get_run(run_id)
+    """读 run 并强制租户隔离（§9.2）：跨租户一律 404（不泄漏存在性）。
+
+    Router 模式下 run 在该租户自己的库里——查不到即 404（隔离由构造保证）。"""
+    store = await _service().store_for(ctx.tenant_id)
+    run = await store.get_run(run_id)
     if run is None or run["tenant_id"] != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="run 不存在")
     return run
 
 
-async def _reload_agent_config_resolver() -> AgentConfigResolver:
-    """从 agent_config_store 重建 AgentSpec 解析器，并重接 mcp_manager 的 server_ids_for。
+async def _reload_agent_config_resolver(tenant_id: str | None = None) -> AgentConfigResolver:
+    """重建 AgentSpec 解析器（Router 模式读该租户库的覆盖行），并重接 mcp_manager。
 
     init（seed 后）与每次 /agent-configs CRUD 后调用，保证运行时 + GET /agents 读到最新
     DB 覆盖/自定义 agent。构造不做 DB I/O 之外的重活（内存行索引）。
     """
     global _agent_config_resolver
-    _agent_config_resolver = AgentConfigResolver(await agent_config_store.list())
+    if stores_router is not None:
+        bundle = await stores_router.get(tenant_id or "local")
+        rows = await bundle.agent_config.list()
+    else:  # 单租户回退（测试/未 init）
+        rows = await agent_config_store.list()
+    _agent_config_resolver = AgentConfigResolver(rows)
     mcp_manager.server_ids_for = _agent_config_resolver.server_ids_for
     # 运行中 node_runner 持 init() 时传入的 resolver 对象快照：CRUD 只重建模块全局 + 重接
     # mcp_manager，若不把新实例重指向 runner，启动后新建/补写 system_prompt 的 agent 在后续 run
@@ -229,21 +242,22 @@ async def _migrate_sqlite_config_to_pg() -> None:
 
 
 async def init() -> RunService:
-    """应用启动时调用：初始化 StateStore + Queue，并启动审批超时 Sweeper（§8.9）。"""
-    global service, sweeper, worker, _worker_task
+    """应用启动时调用：管理库/租户路由 + StateStore + Queue + 审批超时 Sweeper（§8.9）。"""
+    global service, sweeper, worker, _worker_task, stores_router, tenant_registry
     app.state.settings = settings  # auth 依赖读取（get_tenant_context）
-    await workflow_store.connect()
-    await mcp_store.connect()
-    await agent_config_store.connect()
-    if settings.state_store == "postgres":
-        # 控制面配置表（workflows/mcp_servers/agent_configs）跟随 state_store 落 PG → 历史 sqlite 一次性搬运
-        await _migrate_sqlite_config_to_pg()
-    # AgentSpec 配置：空表 seed 15 条内置 / 既有内置行缺失默认回填（幂等，默认物化）；随后重建解析器并重接 mcp_manager 绑定
-    await seed_builtin_agent_configs(agent_config_store)
-    resolver = await _reload_agent_config_resolver()
+    # ── 管理库（v5.3 §5.2）：bootstrap 种子 → 租户注册表 ──
+    await management_store.connect()
+    await async_bootstrap_tenants(management_store, settings)
+    tenant_registry = await TenantRegistry.from_management(management_store)
+    # ── 租户库路由（P4）：tenant_id → TenantStores（state+workflow+mcp+agent_config）──
+    stores_router = TenantStoresRouter(settings, management_store)
+    # mcp_manager：预加载全局默认租户的 MCP 连接（per-tenant 缓存在批 C 接入 runner）
     await mcp_manager.load()
-    store = build_state_store(settings)
-    await connect_state_store(store)
+    if not settings.jwt_secret:
+        print(
+            "[agentflow][WARN] 未配置 AGENTFLOW_JWT_SECRET：认证关闭，tenant_id 由客户端提交"
+            "（§9.1 禁止作为生产授权依据，仅限本地联调）"
+        )
     queue = build_queue(settings)
     kwargs: dict = {}
     if settings.deepseek_api_key:
@@ -252,30 +266,33 @@ async def init() -> RunService:
         from ..agents.runner import AgentNodeRunner
         from ..agents.scopes import build_model
 
+        resolver = await _reload_agent_config_resolver()
         kwargs["node_runner"] = AgentNodeRunner(
             build_model(settings),
             mcp_manager=mcp_manager,
             agent_config=resolver,
         )
         print("[agentflow] node_runner=agent（DeepSeek）：Bug Solve 页将真实调用 agent")
-    if not settings.jwt_secret:
-        print(
-            "[agentflow][WARN] 未配置 AGENTFLOW_JWT_SECRET：认证关闭，tenant_id 由客户端提交"
-            "（§9.1 禁止作为生产授权依据，仅限本地联调）"
-        )
     queue_mode = settings.run_mode == "queue"
     service = RunService(
-        store,
+        stores_router,
         queue=queue if queue_mode else None,
         tenant_registry=tenant_registry,
+        lock=build_lock(settings),
         **kwargs,
     )
-    sweeper = ApprovalSweeper(store, queue, ApprovalNotifier(), interval=60)
+    sweeper = ApprovalSweeper(
+        stores_router,
+        queue,
+        ApprovalNotifier(),
+        interval=60,
+        tenants_provider=_active_tenant_ids,
+    )
     asyncio.create_task(sweeper.run_forever())
     if queue_mode:
         if settings.queue == "memory":
             # 单进程形态：Worker 以后台任务运行（与独立进程行为一致）
-            worker = Worker(store, queue, node_runner=service.node_runner)
+            worker = Worker(stores_router, queue, node_runner=service.node_runner)
             _worker_task = asyncio.create_task(worker.run_forever())
             print("[agentflow] run_mode=queue + memory：进程内 Worker 已启动")
         else:
@@ -283,6 +300,33 @@ async def init() -> RunService:
                 f"[agentflow] run_mode=queue（{settings.queue}）：请单独运行 `python -m agentflow.worker`"
             )
     return service
+
+
+async def _active_tenant_ids() -> list[str]:
+    """sweeper 的租户清单提供者（管理库 active 租户）。"""
+    rows = await management_store.list_tenants(status="active")
+    return [r["tenant_id"] for r in rows]
+
+
+async def _control_stores(ctx: TenantContext | None):
+    """控制面配置存储解析（v5.3 §5.1：配置表随租户库走）。
+
+    - init 后（Router 就绪）按 ctx 租户取其租户库 bundle；
+    - 未 init/测试回退模块全局单例（单租户形态，test_*_api 依赖此路径）。
+    """
+    if stores_router is not None and ctx is not None:
+        return await stores_router.get(ctx.tenant_id)
+
+    class _GlobalStores:  # 单租户回退形状（与 TenantStores 同字段）
+        tenant_id = "local"
+
+        def __init__(self) -> None:
+            self.state = None
+            self.workflow = workflow_store
+            self.mcp = mcp_store
+            self.agent_config = agent_config_store
+
+    return _GlobalStores()
 
 
 @app.post("/run")
@@ -296,7 +340,9 @@ async def create_run(req: RunRequest, ctx: TenantContext = Depends(get_tenant_co
       dev 模式回退 body ``tenant_id`` / ``X-Tenant-ID`` 头
     """
     if req.workflow_id:
-        wf_row = await workflow_store.get(req.workflow_id)  # get() 内部惰性 connect
+        # workflow 定义存该租户自己的库（v5.3 §5.1：配置表随租户库走）
+        cs = await _control_stores(ctx)
+        wf_row = await cs.workflow.get(req.workflow_id)
         if wf_row is None:
             raise HTTPException(status_code=404, detail="workflow 不存在")
         try:
@@ -333,24 +379,27 @@ async def preview_workflow(req: WorkflowPreviewRequest) -> dict:
 
 
 @app.post("/workflows")
-async def create_workflow(req: WorkflowCreate) -> dict:
+async def create_workflow(req: WorkflowCreate, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
     """保存一条 workflow（校验 YAML 合法性），返回 id + graph。"""
     try:
         wf = Workflow.load_yaml(req.yaml)
     except (ValueError, yaml.YAMLError, WorkflowDAGError) as exc:
         raise HTTPException(status_code=400, detail=f"Workflow 解析失败: {exc}") from exc
-    wid = await workflow_store.save(req.name, req.yaml)
+    cs = await _control_stores(ctx)
+    wid = await cs.workflow.save(req.name, req.yaml)
     return {"id": wid, "name": req.name, "graph": _workflow_graph(wf)}
 
 
 @app.get("/workflows")
-async def list_workflows() -> list[dict]:
-    return await workflow_store.list()
+async def list_workflows(ctx: TenantContext = Depends(get_tenant_context)) -> list[dict]:
+    cs = await _control_stores(ctx)
+    return await cs.workflow.list()
 
 
 @app.get("/workflows/{wid}")
-async def get_workflow(wid: str) -> dict:
-    wf_row = await workflow_store.get(wid)
+async def get_workflow(wid: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
+    cs = await _control_stores(ctx)
+    wf_row = await cs.workflow.get(wid)
     if wf_row is None:
         raise HTTPException(status_code=404, detail="workflow 不存在")
     try:
@@ -362,20 +411,24 @@ async def get_workflow(wid: str) -> dict:
 
 
 @app.put("/workflows/{wid}")
-async def update_workflow(wid: str, req: WorkflowCreate) -> dict:
+async def update_workflow(
+    wid: str, req: WorkflowCreate, ctx: TenantContext = Depends(get_tenant_context)
+) -> dict:
     """更新一条 workflow（校验 YAML 合法性）。"""
     try:
         wf = Workflow.load_yaml(req.yaml)
     except (ValueError, yaml.YAMLError, WorkflowDAGError) as exc:
         raise HTTPException(status_code=400, detail=f"Workflow 解析失败: {exc}") from exc
-    if not await workflow_store.update(wid, req.name, req.yaml):
+    cs = await _control_stores(ctx)
+    if not await cs.workflow.update(wid, req.name, req.yaml):
         raise HTTPException(status_code=404, detail="workflow 不存在")
     return {"id": wid, "name": req.name, "graph": _workflow_graph(wf)}
 
 
 @app.delete("/workflows/{wid}")
-async def delete_workflow(wid: str) -> dict:
-    if not await workflow_store.delete(wid):
+async def delete_workflow(wid: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
+    cs = await _control_stores(ctx)
+    if not await cs.workflow.delete(wid):
         raise HTTPException(status_code=404, detail="workflow 不存在")
     return {"ok": True}
 
@@ -484,16 +537,17 @@ async def _mcp_snapshot(data: dict) -> list[dict[str, Any]] | None:
 
 
 @app.post("/mcp-servers", status_code=201)
-async def create_mcp_server(req: MCPServerCreate) -> dict:
-    """保存一条 MCP server 配置并热刷新 client，返回 id。
+async def create_mcp_server(req: MCPServerCreate, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
+    """保存一条 MCP server 配置（存该租户库）并热刷新 client，返回 id。
 
     ``tools`` 未显式携带时 best-effort 连一次 tools/list 落快照；目标不可达则存 null，
     不阻断保存（快照随时可经 GET /{mid}/tools 重新拉取）。
     """
+    cs = await _control_stores(ctx)
     data = _mcp_create_row(req)
     data["tools"] = await _mcp_snapshot(data)
     try:
-        mid = await mcp_store.save(data)
+        mid = await cs.mcp.save(data)
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="name 已存在（MCP server 名需唯一）") from None
     await mcp_manager.refresh_server(mid)  # 重建 + best-effort connect（失败仅 log）
@@ -501,8 +555,9 @@ async def create_mcp_server(req: MCPServerCreate) -> dict:
 
 
 @app.get("/mcp-servers")
-async def list_mcp_servers() -> list[dict]:
-    return await mcp_store.list()
+async def list_mcp_servers(ctx: TenantContext = Depends(get_tenant_context)) -> list[dict]:
+    cs = await _control_stores(ctx)
+    return await cs.mcp.list()
 
 
 @app.post("/mcp-servers/test")
@@ -528,27 +583,31 @@ async def test_mcp_server(req: MCPTestRequest) -> dict:
 
 
 @app.get("/mcp-servers/{mid}")
-async def get_mcp_server(mid: str) -> dict:
-    row = await mcp_store.get(mid)
+async def get_mcp_server(mid: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
+    cs = await _control_stores(ctx)
+    row = await cs.mcp.get(mid)
     if row is None:
         raise HTTPException(status_code=404, detail="MCP server 不存在")
     return row
 
 
 @app.put("/mcp-servers/{mid}")
-async def update_mcp_server(mid: str, req: MCPServerUpdate) -> dict:
+async def update_mcp_server(
+    mid: str, req: MCPServerUpdate, ctx: TenantContext = Depends(get_tenant_context)
+) -> dict:
     """更新并热刷新 client（enabled=0 → refresh 时只 evict 不重建）。
 
     ``tools`` 缺省(=None)时保留已存快照（不 fetch、不覆盖）；显式携带则整体替换。
     """
-    existing = await mcp_store.get(mid)
+    cs = await _control_stores(ctx)
+    existing = await cs.mcp.get(mid)
     if existing is None:
         raise HTTPException(status_code=404, detail="MCP server 不存在")
     data = _mcp_create_row(req)
     if data["tools"] is None:
         data["tools"] = existing.get("tools")  # 未带 → 保留旧快照
     try:
-        hit = await mcp_store.update(mid, data)
+        hit = await cs.mcp.update(mid, data)
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="name 已存在（MCP server 名需唯一）") from None
     if not hit:  # 并发删除兜底
@@ -558,26 +617,28 @@ async def update_mcp_server(mid: str, req: MCPServerUpdate) -> dict:
 
 
 @app.delete("/mcp-servers/{mid}")
-async def delete_mcp_server(mid: str) -> dict:
+async def delete_mcp_server(mid: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
     """删除并 evict 对应 client（关闭 stateful 连接 / 杀 stdio 子进程）。"""
-    if not await mcp_store.delete(mid):
+    cs = await _control_stores(ctx)
+    if not await cs.mcp.delete(mid):
         raise HTTPException(status_code=404, detail="MCP server 不存在")
     await mcp_manager.refresh_server(mid)  # store 中已无该行 → 仅 evict
     return {"ok": True}
 
 
 @app.get("/mcp-servers/{mid}/tools")
-async def mcp_server_tools(mid: str) -> dict:
+async def mcp_server_tools(mid: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
     """「重新拉取」：已存 server 实时连接并列工具（复用 test_connection 形状）。
 
     成功后把最新快照回写 tools 列（供列表/详情离线展示）；失败保留已存快照不动。
     """
-    row = await mcp_store.get(mid)
+    cs = await _control_stores(ctx)
+    row = await cs.mcp.get(mid)
     if row is None:
         raise HTTPException(status_code=404, detail="MCP server 不存在")
     res = await mcp_manager.test_connection(row)
     if res.get("ok") and res.get("tools") is not None:
-        await mcp_store.update_tools(mid, res["tools"])
+        await cs.mcp.update_tools(mid, res["tools"])
     return res
 
 
@@ -592,19 +653,20 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
     """
     service = _service()
     run = await _run_for_tenant(run_id, ctx)
+    store = await service.store_for(ctx.tenant_id)
 
-    # 图：从 snapshot 重建（Resume/展示不受 workflow 变更影响）
+    # 图：从原 snapshot 重建（Resume/展示不受 workflow 变更影响）
     graph = {}
     wf = None
     try:
-        snap = await service.store.get_snapshot(run["workflow_snapshot_id"])
+        snap = await store.get_snapshot(run["workflow_snapshot_id"])
         if snap:
             wf = Workflow.load_yaml(snap["workflow_yaml"])
             graph = _workflow_graph(wf)
     except (ValueError, yaml.YAMLError, WorkflowDAGError):
         graph = {}
 
-    nodes_raw = await service.store.get_nodes(run_id)
+    nodes_raw = await store.get_nodes(run_id)
     nodes: dict[str, dict] = {}
     total_tokens = 0
     total_cost = 0.0
@@ -671,8 +733,9 @@ async def get_run_traces(
     - ``denied``   被权限 DENY 的工具（含 reason）
     ``node_id`` 省略 = 整 run 全量；``kind`` 可过滤。mock runner 无明细 → 空列表。
     """
-    store = _service().store
+    service = _service()
     await _run_for_tenant(run_id, ctx)  # 租户隔离（§9.2）
+    store = await service.store_for(ctx.tenant_id)
     return await store.get_node_traces(run_id, node_id=node_id, kind=kind, limit=limit)
 
 
@@ -699,6 +762,7 @@ async def approve(
             approved=(req.approved if req else True),
             by=by,
             comment=(req.comment if req else ""),
+            tenant_id=ctx.tenant_id,
         )
     except (ValueError, AssertionError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -717,7 +781,8 @@ async def reject(
     by = ctx.subject if (ctx.is_jwt and ctx.subject) else req.by
     try:
         return await _service().approve(
-            run_id, req.node_id, approved=False, by=by, comment=req.comment
+            run_id, req.node_id, approved=False, by=by, comment=req.comment,
+            tenant_id=ctx.tenant_id,
         )
     except (ValueError, AssertionError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -732,7 +797,7 @@ async def pause_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context
     """暂停 run（§8.6）：当前节点跑完即暂停，checkpoint 保留；``/resume`` 恢复。"""
     await _run_for_tenant(run_id, ctx)
     try:
-        await _service().pause_run(run_id)
+        await _service().pause_run(run_id, tenant_id=ctx.tenant_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"ok": True, "run_id": run_id, "status": "pausing"}
@@ -743,7 +808,7 @@ async def resume_run(run_id: str, ctx: TenantContext = Depends(get_tenant_contex
     """断点续跑（§4.4）：从 checkpoint + 原 snapshot 继续（queue 模式发布 resume 命令）。"""
     await _run_for_tenant(run_id, ctx)
     try:
-        await _service().resume_run(run_id, ctx.tenant_id)
+        await _service().resume_run(run_id, tenant_id=ctx.tenant_id)
     except TenantQuotaExceeded as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     except ValueError as exc:
@@ -756,7 +821,7 @@ async def stop_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context)
     """停止进行中的 run（置 cancelled + 取消后台任务；queue 模式发布 stop 命令）。"""
     await _run_for_tenant(run_id, ctx)
     try:
-        await _service().stop_run(run_id)
+        await _service().stop_run(run_id, tenant_id=ctx.tenant_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"ok": True, "run_id": run_id}
@@ -775,7 +840,9 @@ async def audit(
     dev 模式（无 JWT）允许显式 tenant_id 便于联调。
     """
     effective_tenant = ctx.tenant_id if ctx.is_jwt else (tenant_id or ctx.tenant_id)
-    return await _service().store.get_audit_logs(
+    service = _service()
+    store = await service.store_for(ctx.tenant_id)
+    return await store.get_audit_logs(
         tenant_id=effective_tenant, run_id=run_id, limit=limit
     )
 
@@ -825,13 +892,14 @@ def _validate_agent_role_stage(role: str | None, stage: str | None) -> None:
         raise HTTPException(status_code=400, detail=f"stage 仅支持 {sorted(_AGENT_STAGES_SET)}")
 
 
-async def _bound_servers(mcp_server_ids: list[str] | None) -> list[dict]:
+async def _bound_servers(mcp_server_ids: list[str] | None, cs=None) -> list[dict]:
     """绑定 server 的 [{id, name, transport}]；无（NULL/空数组，两态语义）→ []。"""
     if not mcp_server_ids:
         return []
+    mcp = cs.mcp if cs is not None else mcp_store
     out: list[dict] = []
     for mid in mcp_server_ids:
-        row = await mcp_store.get(mid)
+        row = await mcp.get(mid)
         out.append(
             {"id": row["id"], "name": row["name"], "transport": row["transport"]}
             if row is not None
@@ -840,7 +908,7 @@ async def _bound_servers(mcp_server_ids: list[str] | None) -> list[dict]:
     return out
 
 
-async def _with_bound_servers(rows: list[dict]) -> list[dict]:
+async def _with_bound_servers(rows: list[dict], cs=None) -> list[dict]:
     resolver = AgentConfigResolver(rows)
     out: list[dict] = []
     for row in rows:
@@ -848,13 +916,15 @@ async def _with_bound_servers(rows: list[dict]) -> list[dict]:
         out.append({
             **row,
             "effective_description": eff.description if eff else (row.get("description") or ""),
-            "bound_servers": await _bound_servers(row.get("mcp_server_ids")),
+            "bound_servers": await _bound_servers(row.get("mcp_server_ids"), cs),
         })
     return out
 
 
 @app.post("/agent-configs", status_code=201)
-async def create_agent_config(payload: AgentConfigPayload) -> dict:
+async def create_agent_config(
+    payload: AgentConfigPayload, ctx: TenantContext = Depends(get_tenant_context)
+) -> dict:
     """新建自定义 agent（origin=custom）。name 唯一（撞内置名 → 400）；custom 必填非空 system_prompt。"""
     name = _acfg_str(payload.name)
     if not name or not _AGENT_NAME_RE.fullmatch(name):
@@ -879,27 +949,43 @@ async def create_agent_config(payload: AgentConfigPayload) -> dict:
         "enabled": True if payload.enabled is None else payload.enabled,
         "reasoning_enabled": False if payload.reasoning_enabled is None else payload.reasoning_enabled,
     }
+    cs = await _control_stores(ctx)
     try:
-        await agent_config_store.save(data)
+        await cs.agent_config.save(data)
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail=f"agent 名 {name!r} 已存在") from None
-    await _reload_agent_config_resolver()
+    await _reload_agent_config_resolver(ctx.tenant_id)
     return {"name": name, "origin": "custom"}
 
 
 @app.get("/agent-configs")
-async def list_agent_configs() -> list[dict]:
-    """全部 AgentSpec 配置行（含合并有效描述 + 绑定 server 名）。"""
-    rows = await agent_config_store.list()
-    return await _with_bound_servers(rows)
+async def list_agent_configs(ctx: TenantContext = Depends(get_tenant_context)) -> list[dict]:
+    """该租户的 AgentSpec 配置行（覆盖行；内置 15 靠静态回退，不占行）。
+
+    含合并有效描述 + 绑定 server 名。"""
+    cs = await _control_stores(ctx)
+    rows = await cs.agent_config.list()
+    return await _with_bound_servers(rows, cs)
 
 
 @app.get("/agent-configs/{name}")
-async def get_agent_config(name: str) -> dict:
-    """单条：有效值已合并内置回退（供编辑弹窗回填）+ 绑定 server + stored（是否已覆盖）。"""
-    row = await agent_config_store.get(name)
+async def get_agent_config(
+    name: str, ctx: TenantContext = Depends(get_tenant_context)
+) -> dict:
+    """单条：有效值已合并内置回退（供编辑弹窗回填）+ 绑定 server + stored（是否已覆盖）。
+
+    内置 agent 无覆盖行时按静态注册表合成视图（v5.3：不再 seed 内置行）。"""
+    cs = await _control_stores(ctx)
+    row = await cs.agent_config.get(name)
     if row is None:
-        raise HTTPException(status_code=404, detail=f"agent 配置不存在: {name!r}")
+        if name not in _BUILTIN_AGENT_NAMES:
+            raise HTTPException(status_code=404, detail=f"agent 配置不存在: {name!r}")
+        # 内置无覆盖 → 合成行（stored 全 None = 未覆盖）
+        row = {
+            "name": name, "origin": "builtin", "role": None, "stage": None,
+            "enabled": True, "reasoning_enabled": None, "mcp_server_ids": None,
+            "description": None, "system_prompt": None, "schema": None,
+        }
     eff = AgentConfigResolver([row]).resolve(name)
     return {
         "name": row["name"],
@@ -909,7 +995,7 @@ async def get_agent_config(name: str) -> dict:
         "enabled": row["enabled"],
         "reasoning_enabled": row["reasoning_enabled"],
         "mcp_server_ids": row["mcp_server_ids"],
-        "bound_servers": await _bound_servers(row.get("mcp_server_ids")),
+        "bound_servers": await _bound_servers(row.get("mcp_server_ids"), cs),
         "description": eff.description if eff else (row.get("description") or ""),
         "system_prompt": eff.system_prompt if eff else None,
         "schema": eff.schema if eff else {},
@@ -922,10 +1008,13 @@ async def get_agent_config(name: str) -> dict:
 
 
 @app.put("/agent-configs/{name}")
-async def update_agent_config(name: str, payload: AgentConfigPayload) -> dict:
+async def update_agent_config(
+    name: str, payload: AgentConfigPayload, ctx: TenantContext = Depends(get_tenant_context)
+) -> dict:
     """完整对象覆盖式更新（builtin/custom 均可）。文本清空/不传 → 归 NULL 回退内置；
     custom 不允许最终 system_prompt 为空。origin 保持不变。"""
-    existing = await agent_config_store.get(name)
+    cs = await _control_stores(ctx)
+    existing = await cs.agent_config.get(name)
     if existing is None:
         raise HTTPException(status_code=404, detail=f"agent 配置不存在: {name!r}")
     _validate_agent_role_stage(payload.role, payload.stage)
@@ -950,23 +1039,26 @@ async def update_agent_config(name: str, payload: AgentConfigPayload) -> dict:
             else payload.reasoning_enabled
         ),
     }
-    if not await agent_config_store.update(name, data):
+    if not await cs.agent_config.update(name, data):
         raise HTTPException(status_code=404, detail=f"agent 配置不存在: {name!r}")
-    await _reload_agent_config_resolver()
+    await _reload_agent_config_resolver(ctx.tenant_id)
     return {"ok": True, "name": name}
 
 
 @app.delete("/agent-configs/{name}")
-async def delete_agent_config(name: str) -> dict:
-    """删除自定义 agent；内置 agent 禁删（只能编辑/清空覆盖回退）。"""
-    row = await agent_config_store.get(name)
+async def delete_agent_config(
+    name: str, ctx: TenantContext = Depends(get_tenant_context)
+) -> dict:
+    """删除自定义 agent；内置 agent 禁删（只能编辑/清空覆盖回退默认）。"""
+    cs = await _control_stores(ctx)
+    row = await cs.agent_config.get(name)
     if row is None:
         raise HTTPException(status_code=404, detail=f"agent 配置不存在: {name!r}")
     if row["origin"] == "builtin":
         raise HTTPException(status_code=400, detail="内置 agent 不可删除，请用编辑清空覆盖回退默认")
-    if not await agent_config_store.delete(name):
+    if not await cs.agent_config.delete(name):
         raise HTTPException(status_code=404, detail=f"agent 配置不存在: {name!r}")
-    await _reload_agent_config_resolver()
+    await _reload_agent_config_resolver(ctx.tenant_id)
     return {"ok": True}
 
 

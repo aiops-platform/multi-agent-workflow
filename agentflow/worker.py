@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 from .config import get_settings
 from .core.dag import TERMINAL
@@ -30,6 +31,7 @@ from .queue import build_queue
 from .queue.base import TOPIC_COMMAND, TOPIC_TRIGGER, Queue
 from .statestore import build_state_store, connect_state_store
 from .statestore.base import StateStore
+from .statestore.router import store_resolver
 
 log = logging.getLogger("agentflow.worker")
 
@@ -37,16 +39,21 @@ log = logging.getLogger("agentflow.worker")
 class Worker:
     def __init__(
         self,
-        store: StateStore,
+        store: StateStore | Any,
         queue: Queue,
         node_runner: NodeRunner | None = None,
     ) -> None:
-        self.store = store
+        # store 可为普通 StateStore（单库）或 TenantStoresRouter——统一经 resolver
+        # 按租户解析（design-v5.3 §5.3：每次操作落到该租户自己的库）
+        self._stores = store_resolver(store)
         self.queue = queue
         self.node_runner = node_runner
         # 本 Worker 正在执行的 run；审批挂起/暂停/终态即移出 → 零占用（§8.6）
         self._tasks: dict[str, asyncio.Task] = {}
         self._executors: dict[str, DAGExecutor] = {}  # run_id → executor（pause 反查用）
+
+    async def _store(self, tenant_id: str | None) -> StateStore:
+        return await self._stores.resolve(tenant_id or "local")
 
     # ------------------------------------------------------------------
     # 常驻消费（trigger 与 command 并行消费）
@@ -72,28 +79,34 @@ class Worker:
         if not run_id:
             log.warning("trigger 缺 run_id: %s", msg)
             return
+        tenant_id = msg.get("tenant_id")
+        store = await self._store(tenant_id)
         if run_id in self._tasks:
             log.warning("[%s] 已在本 Worker 执行，忽略重复 trigger", run_id)
             return
-        run = await self.store.get_run(run_id)
+        run = await store.get_run(run_id)
         if run is None:
             log.warning("[%s] trigger 对应 run 不存在", run_id)
             return
         if run.get("status") in TERMINAL or run.get("status") == "cancelled":
             log.info("[%s] run 已终态（%s），忽略 trigger", run_id, run.get("status"))
             return
-        ex = await self._build_executor(run_id, run["tenant_id"])
-        await self.store.update_run(run_id, status="running")  # queued → running（接单）
+        tenant = run["tenant_id"]
+        ex = await self._build_executor(run_id, tenant, store)
+        await store.update_run(run_id, status="running")  # queued → running（接单）
         log.info("[%s] Worker 接单（trigger）", run_id)
         self._executors[run_id] = ex
-        self._tasks[run_id] = asyncio.create_task(self._execute(run_id, ex))
+        self._tasks[run_id] = asyncio.create_task(self._execute(run_id, ex, tenant))
 
-    async def _build_executor(self, run_id: str, tenant_id: str) -> DAGExecutor:
+    async def _build_executor(
+        self, run_id: str, tenant_id: str, store: StateStore
+    ) -> DAGExecutor:
         # trigger 与 resume 统一走 checkpoint 重建：新 run 无 checkpoint → 全 pending，
         # 已有 checkpoint → 续跑（原 snapshot，§8.5）
-        return await resume_executor(run_id, tenant_id, self.store, node_runner=self.node_runner)
+        return await resume_executor(run_id, tenant_id, store, node_runner=self.node_runner)
 
-    async def _execute(self, run_id: str, ex: DAGExecutor) -> None:
+    async def _execute(self, run_id: str, ex: DAGExecutor, tenant_id: str) -> None:
+        store = await self._store(tenant_id)
         try:
             outcome = await ex.run()
         except WorkflowNodeFailed as exc:
@@ -104,7 +117,7 @@ class Worker:
         finally:
             self._tasks.pop(run_id, None)
             self._executors.pop(run_id, None)
-        await self.store.update_run(run_id, status=outcome)
+        await store.update_run(run_id, status=outcome)
         log.info("[%s] Worker 执行结束 -> %s", run_id, outcome)
 
     async def wait_run(self, run_id: str) -> None:
@@ -123,29 +136,32 @@ class Worker:
             log.warning("command 缺 run_id/type: %s", msg)
             return
         if cmd == "resume":
-            await self._cmd_resume(run_id)
+            await self._cmd_resume(msg)
         elif cmd == "pause":
             await self._cmd_pause(run_id)
         elif cmd == "stop":
-            await self._cmd_stop(run_id)
+            await self._cmd_stop(msg)
         else:
             log.warning("[%s] 未知命令: %r", run_id, cmd)
 
-    async def _cmd_resume(self, run_id: str) -> None:
+    async def _cmd_resume(self, msg: dict) -> None:
+        run_id = msg.get("run_id")
         if run_id in self._tasks:
             log.info("[%s] 正在本 Worker 执行，忽略 resume", run_id)
             return
-        run = await self.store.get_run(run_id)
+        store = await self._store(msg.get("tenant_id"))
+        run = await store.get_run(run_id)
         if run is None:
             log.warning("[%s] resume 对应 run 不存在", run_id)
             return
         if run.get("status") in TERMINAL or run.get("status") == "cancelled":
             log.info("[%s] run 已终态，忽略 resume", run_id)
             return
-        ex = await self._build_executor(run_id, run["tenant_id"])
+        tenant = run["tenant_id"]
+        ex = await self._build_executor(run_id, tenant, store)
         log.info("[%s] Worker 接单（resume）", run_id)
         self._executors[run_id] = ex
-        self._tasks[run_id] = asyncio.create_task(self._execute(run_id, ex))
+        self._tasks[run_id] = asyncio.create_task(self._execute(run_id, ex, tenant))
 
     async def _cmd_pause(self, run_id: str) -> None:
         ex = self._executors.get(run_id)
@@ -156,7 +172,8 @@ class Worker:
         ex.request_pause()
         log.info("[%s] pause：已请求，当前节点跑完即暂停", run_id)
 
-    async def _cmd_stop(self, run_id: str) -> None:
+    async def _cmd_stop(self, msg: dict) -> None:
+        run_id = msg.get("run_id")
         task = self._tasks.get(run_id)
         if task is not None and not task.done():
             task.cancel()
@@ -165,7 +182,8 @@ class Worker:
             except asyncio.CancelledError:
                 pass
             self._tasks.pop(run_id, None)
-        await _mark_cancelled(self.store, run_id)
+        store = await self._store(msg.get("tenant_id"))
+        await _mark_cancelled(store, run_id)
         log.info("[%s] stop：非终态节点已置 cancelled", run_id)
 
 
@@ -198,7 +216,7 @@ async def main() -> None:
 
         node_runner = AgentNodeRunner(build_model(settings))
         log.info("node_runner=agent（DeepSeek）")
-    worker = Worker(store, queue, node_runner=node_runner)
+    worker = Worker(store_resolver(store), queue, node_runner=node_runner)
     log.info("Worker 启动（queue=%s），消费 %s / %s", settings.queue, TOPIC_TRIGGER, TOPIC_COMMAND)
     await worker.run_forever()
 

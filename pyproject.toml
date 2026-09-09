@@ -24,6 +24,8 @@ dependencies = [
     "uvicorn>=0.30",
     # JWT 租户派生（§9.1；生产由 API Gateway 签发，控制面只做校验）
     "pyjwt>=2.8",
+    # db_ref/凭证加密（v5.3 §5.3 管理库凭证保护）
+    "cryptography>=42",
     # DeepSeek（OpenAI 兼容）经 AgentScope OpenAI 模型接入
     "openai>=1.60",
     # 生产适配器（M6 前为占位）

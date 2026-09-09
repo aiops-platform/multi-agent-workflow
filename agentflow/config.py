@@ -59,8 +59,11 @@ class Settings(BaseSettings):
     # （本地联调，启动时告警）。
     jwt_secret: str = ""
     jwt_algorithm: str = "HS256"
-    # 租户配置文件（§9.3 配额/审批人）；空 = 全部用内置默认（不限制）
+    # 租户配置文件（§9.3 配额/审批人）；空 = 全部用内置默认（不限制）。
+    # v5.3 起降级为 bootstrap 种子：首启导入管理库，运行时以管理库为准。
     tenants_file: str = ""
+    # db_ref/凭证加密密钥（Fernet, 32B urlsafe base64，§5.3）；缺省从 jwt_secret 派生（告警）
+    secret_key: str = ""
 
     # ---- 沙箱（M4）----
     open_sandbox_domain: str = "localhost:8080"

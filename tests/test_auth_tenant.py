@@ -63,8 +63,8 @@ async def svc(tmp_path, monkeypatch):
     await store.close()
 
 
-async def _save_workflow(client, yaml_text: str) -> str:
-    resp = await client.post("/workflows", json={"name": "t", "yaml": yaml_text})
+async def _save_workflow(client, yaml_text: str, headers: dict | None = None) -> str:
+    resp = await client.post("/workflows", json={"name": "t", "yaml": yaml_text}, headers=headers)
     assert resp.status_code == 200, resp.text
     return resp.json()["id"]
 
@@ -85,8 +85,9 @@ async def _wait_run_status(store, run_id: str, target: set[str], timeout: float 
 # ======================================================================
 async def test_jwt_mode_requires_bearer(svc, monkeypatch) -> None:
     monkeypatch.setattr(get_settings(), "jwt_secret", SECRET, raising=False)
+    auth = {"Authorization": f"Bearer {_token('team-x')}"}
     async with _client() as client:
-        wid = await _save_workflow(client, APPROVAL_YAML)
+        wid = await _save_workflow(client, APPROVAL_YAML, headers=auth)
         resp = await client.post("/run", json={"workflow_id": wid, "inputs": {}})
         assert resp.status_code == 401
         resp = await client.post(
@@ -100,7 +101,9 @@ async def test_jwt_derived_tenant_ignores_client_tenant(svc, monkeypatch) -> Non
     """§9.1 核心断言：tenant 由 claim 派生，body 提交的 tenant_id 被忽略。"""
     monkeypatch.setattr(get_settings(), "jwt_secret", SECRET, raising=False)
     async with _client() as client:
-        wid = await _save_workflow(client, APPROVAL_YAML)
+        wid = await _save_workflow(
+            client, APPROVAL_YAML, headers={"Authorization": f"Bearer {_token('team-x')}"}
+        )
         resp = await client.post(
             "/run",
             json={"workflow_id": wid, "inputs": {}, "tenant_id": "evil-tenant"},
@@ -132,7 +135,9 @@ async def test_jwt_expired_and_invalid_and_missing_claim(svc, monkeypatch) -> No
     async with _client() as client:
         for tok, why in [(expired, "过期"), (wrong_key, "错签名"), (no_claim, "缺 claim")]:
             resp = await client.post(
-                "/run", json={"inputs": {}}, headers={"Authorization": f"Bearer {tok}"}
+                "/run",
+                json={"inputs": {}},
+                headers={"Authorization": f"Bearer {tok}"},
             )
             assert resp.status_code == 401, f"{why} 应 401: {resp.text}"
 
