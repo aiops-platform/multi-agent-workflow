@@ -40,13 +40,33 @@ make lint      # ruff 检查
    checkpoint 重建（`load_snapshot_workflow` 的 `await` 不可删——曾缺失导致 resume
    全挂，此前测试未覆盖该路径）。queue 模式 approve 只做 CAS+发命令，零进程内
    executor 依赖。pause=波间暂停（`request_pause` → run() 返回 "paused"）。
-7. **多租户**（§9）：所有表带 `tenant_id`。`AGENTFLOW_JWT_SECRET` 非空 = JWT 模式：
-   `api/auth.py:get_tenant_context` 从 Bearer token claim（tenant_id/org_id）派生租户，
-   **客户端提交的 tenant 一律忽略**；为空 = dev 回退（X-Tenant-ID 头/body，启动告警）。
-   run 数据跨租户一律 404（`_run_for_tenant`）；/audit 的 tenant JWT 模式强制派生。
-   配额/审批人白名单见 `tenants.py`（AGENTFLOW_TENANTS_FILE，§9.3：超限 429、
-   非白名单审批 403）。workflows/mcp-servers/agent-configs 三张配置表仍为全局
-   （无 tenant_id 列）——多租户配置分片是已知待办。
+7. **多租户（v5.3 五原则，design-v5.3.md）**：
+   - **存储路由**：一切库访问经 `statestore/router.py`——普通 StateStore 包装固定解析
+     （既有单库用法/测试零改动），`TenantStoresRouter` 按 tenant_id 路由到租户库
+     bundle（state+workflow+mcp+agent_config 同库异表，LRU 淘汰关闭）。**新读路径
+     必须经 `service.store_for(tenant)` / router，禁止绕过**（P4：隔离由构造保证）。
+   - **管理库**（`api/management_store.py`）：tenants/schema_versions；db_ref Fernet
+     加密（AGENTFLOW_SECRET_KEY，缺省从 jwt_secret 派生并告警）；**任何 API 不回显
+     DSN**。tenants.yaml 仅 bootstrap 种子（async_bootstrap_tenants），运行时以
+     管理库为准（TenantRegistry.from_management，CRUD 后重建）。
+   - **审批 default-deny（§4.2）**：租户配置过 approvers 后，未命中节点 id 且无 "*"
+     → 一律 403（堵"自建 workflow 换审批节点 id 绕过"）；service._check_approver
+     先看 `cfg.approvers` 是否非空（空=不限制 dev 语义）。
+   - **接单 CAS**：Worker trigger（queued→running）/resume（paused|waiting→running）
+     经 `cas_update_run_status` 原子转换，重复消息恰一个接单；新状态机含 queued/paused。
+   - **topic-per-tenant**：发布一律 `topic_trigger(tenant)/topic_command(tenant)`；
+     Worker 绑定租户只消费自己的 topic，None=全局兜底（单租户回退）。
+   - **数据面姿态**：`AGENTFLOW_SHARED_DATASOURCES=0`（默认加固）→ toolkit 不注入
+     内置 L1 数据源工具（诊断数据工具一律租户 MCP 绑定）+ inputs.repos 直传 400
+     （testbed 联调脚本需显式 =1）。runner 经 `exec_context.current_tenant`（executor
+     置位）做 per-tenant MCP（mcp_manager 缓存键 (tenant, server_id)，租户间物理不可见）
+     与 per-tenant agent 配置（agent_config_provider 代际缓存，CRUD 后失效）。
+   - **生命周期**：`python -m agentflow.tenantctl provision|deploy|upgrade|migrate|
+     deprovision`（幂等 saga）；standard 租户专属分支被拒（§9.2 规则 4）；部署记录
+     pin SHA 不 pin 分支名。
+   - JWT：`AGENTFLOW_JWT_SECRET` 非空=JWT 模式（claim 派生，客户端提交忽略）；
+     空=dev 回退（告警）。跨租户 run 访问 404（`_run_for_tenant`，Router 模式下
+     查不到即 404——隔离由构造保证）。RS256 暂缓（v5.3 §12）。
 8. **Git 版本冻结**（§4.6/§8.7）：`workspace/manager.py` 明确不提供 git_pull；Run 期间工作区
    HEAD 必须 == base_sha，漂移报 `FrozenVersionMismatch`。每个 Run 用 `aiops/RUN_{run_id}` 分支隔离。
 9. **工具权限**（§9.5）：`build_agent` 默认 DONT_ASK + agent 注册工具的 allow 规则。
@@ -77,7 +97,8 @@ make lint      # ruff 检查
     prompt 已强化区分「业务根因 vs 下游调用症状」。**场景复现需干净日志窗口**：
     连续跑两场景会互相污染，切换前 `curl -X DELETE :19200/app-logs` 清窗。
 
-## 结构速览
+## 结构速览（v5.3 新增：api/management_store.py、statestore/router.py、tenantctl.py、
+exec_context.py、docs/DEPLOYMENT_zh-CN.md）
 
 ```
 core/        Workflow 模型 + DAG 语义 + 版本冻结（M0）
@@ -113,6 +134,8 @@ docker/sandbox/  沙箱镜像（stdlib-only 离线可建）
 M0 ✅ → M1 ✅（DB 驱动配置 + MCP 配置化；数据源默认 mock）→ M2 ✅（幂等已接线）→
 M3 ✅ → M4 ✅（组件级；API 认证/egress 未落地）→ M5 ✅（CAS 时间谓词）→
 M6 🟡（适配器可用，真实 broker/DB 专项待生产）→ M7 🟡（诊断真实，解决侧部分 mock）。
-生产化：Worker/双队列（run_mode）✅、JWT 多租户（§9.1/9.3 配额+审批人）✅；
-待办：配置表 tenant 分片、Langfuse/OTel 接入、沙箱 API 认证/egress、
+多租户 v5.3 批 A/B/C ✅（管理库+Router+配置表入租户库 / 接单 CAS+topic 租户化+
+tenantctl+namespace 派生 / 共享数据源下线+repo 封堵+per-tenant MCP/配置路由，268 tests）。
+待办：MCP 凭证加密+回显脱敏、Mock CMDB 租户维度、Orchestrator 租户 namespace 接线、
+Kafka topic 自动建、JWT RS256（暂缓）、Langfuse/OTel、沙箱 API 认证、
 真实 Kafka/PG 故障恢复专项（§14）。

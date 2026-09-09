@@ -32,15 +32,9 @@
 
 ---
 
-## 2. 真实 node_runner 接入 executor（API 目前走 mock）
+## 2. 真实 node_runner 接入 executor —— ✅ 已完成（383b6b7 + v5.3 批C）
 
-**现状**：`make api` 的 `RunService(store)` 未传 node_runner → executor 全走 `_default_runner`（mock）；真实 LLM 只在 `scripts/*` 里手写 for 循环，**不经 DAG 引擎**（无幂等 / 重试 / checkpoint / 审批）。
-
-**目标**：把真实 agent runner（`build_toolkit → build_agent → run_agent`）提取成公共 runner，注入 `RunService`，让 API / executor 驱动真实 LLM 节点。
-
-**涉及**：`agentflow/service.py`、`scripts/diagnose_scenario{1,2}.py`、`scripts/run_fix_loop.py`（提取公共逻辑）。
-
----
+`agents/runner.py:AgentNodeRunner` 经 `RunService(node_runner=...)` 注入 executor/API；有 `DEEPSEEK_API_KEY` 即真实 LLM（无 Key 回退 mock）。v5.3 批 C 进一步：按 `current_tenant` 路由 per-tenant MCP / agent 配置；`AGENTFLOW_SHARED_DATASOURCES=0`（默认加固）时不注入内置共享数据源工具。剩余：L2 沙箱工具接入真实 run。
 
 ## 3. `/agents` 端点增强
 

@@ -1,7 +1,7 @@
 # agentflow — AI 运维 Bug Fix 智能体平台后端
 
 基于 `design-v5.2.md` 的 AIOps Bug Fix 智能体平台：DAG 编排引擎 + 15-agent 编队 +
-审批工作流 + Worker/双队列执行 + JWT 多租户（244 tests）。
+审批工作流 + per-tenant 多租户架构（独立库/队列/namespace/代码分支，design-v5.3，268 tests）。
 
 ## 里程碑状态
 
@@ -28,7 +28,7 @@ make install                     # 或 ./venv/bin/pip install -e ".[dev]"
 # 2. 配置（模型 + 基础设施后端）
 cp .env.example .env            # 填 DEEPSEEK_API_KEY（design §16.3 模型 deepseek-v4-flash）
 
-# 3. 跑测试（244 tests：DAG 语义 + 幂等 + Resume + Worker/队列 + JWT 多租户）
+# 3. 跑测试（268 tests：DAG 语义 + 幂等 + Resume + Worker/队列 + 多租户路由/隔离）
 make test
 
 # 4. 跑脚本化 demo（create_run → 审批 → done）
@@ -38,32 +38,50 @@ make demo
 make api                        # http://localhost:8000/docs
 ```
 
-## 执行模式与多租户
+## 执行模式与多租户（design-v5.3）
 
 ```bash
-# ── 执行模式（design §6/§8.6）──
+# ── 执行模式（§6/§8.6）──
 AGENTFLOW_RUN_MODE=inline   # 默认：API 进程内直接执行 DAG（本地 MVP）
-AGENTFLOW_RUN_MODE=queue    # API 只发布 run.trigger / run.command，Worker 消费：
-                            #   queue=memory → API 启动时自动拉起进程内 Worker
-                            #   queue=kafka  → 单独运行：python -m agentflow.worker
+AGENTFLOW_RUN_MODE=queue    # API 只发布 run.trigger.{tenant} / run.command.{tenant}，Worker 消费：
+                            #   queue=memory → API 启动时自动拉起进程内 WorkerPool（按管理库租户热接入）
+                            #   queue=kafka  → 每租户 Worker Deployment（镜像 {tenant}-{sha}）
+                            #                  独立进程：python -m agentflow.worker
 
-# ── 多租户认证（design §9.1）──
+# ── 多租户认证（§9.1）──
 AGENTFLOW_JWT_SECRET=...    # 非空 = 强制 Bearer JWT，tenant 由 claim（tenant_id/org_id）
                             #   派生，客户端提交的 tenant 一律忽略
                             # 为空 = dev 模式：回退 X-Tenant-ID 头 / 请求体传参（仅联调）
+AGENTFLOW_SECRET_KEY=...    # 租户库 db_ref / 凭证 Fernet 加密（缺省从 jwt_secret 派生并告警）
 
-# ── 租户配置（design §9.3：配额 + 审批人白名单）──
-AGENTFLOW_TENANTS_FILE=tenants.yaml
+# ── 存储与租户（v5.3 §5：per-tenant DB + 管理库）──
+AGENTFLOW_STATE_STORE=sqlite   # sqlite=每租户一个 data/tenants/{tenant}.db；postgres=按 isolation_level 分级
+AGENTFLOW_TENANTS_FILE=tenants.yaml   # 仅 bootstrap 种子：首启导入管理库，运行时以管理库为准
+
+# ── 数据面姿态（§7/P1）──
+AGENTFLOW_SHARED_DATASOURCES=0  # 0=加固（默认）：不注入内置 ES/Prometheus/kubectl 工具（数据工具
+                                #   一律租户 MCP 绑定），并封堵 inputs.repos 直传（400）
+                                # 1=dev/testbed 联调：注入共享数据源工具 + 允许 inputs.repos
 ```
 
 ```yaml
-# tenants.yaml 示例
-default: { max_concurrent_runs: 10 }
+# tenants.yaml（bootstrap 种子）示例：首启导入管理库，之后用 tenantctl / 管理库维护
 tenants:
   team-alpha:
+    isolation_level: standard        # strong=独立库+专属分支允许；standard=共享库+跟 main
     max_concurrent_runs: 5
+    workers: 2                       # 租户级 Worker 消费并发数
     approvers:
-      approve-changes: ["alice@company.com"]   # 白名单外审批 → 403；超限 → 429
+      approve-changes: ["alice@company.com"]   # default-deny：未命中节点（无 "*"）→ 403；超限 → 429
+```
+
+租户生命周期（幂等 saga，详见 `docs/DEPLOYMENT_zh-CN.md`）：
+
+```bash
+python -m agentflow.tenantctl provision team-a --isolation strong --branch tenant/team-a --quota 5 --workers 2 --k8s
+python -m agentflow.tenantctl deploy   team-a --sha <sha>      # pin SHA（§9.2 规则 2，审计不可变）
+python -m agentflow.tenantctl migrate                        # 迁移扇出（按 (tenant, pinned_sha) 记录）
+python -m agentflow.tenantctl deprovision team-a --confirm-delete
 ```
 
 ## 目录结构
@@ -74,31 +92,36 @@ agentflow/
 ├── core/              # M0：Workflow 模型 + DAG 语义（join/skip）+ 版本冻结
 ├── statestore/        # M0/M6：State Model（InMemory / SQLite / PostgreSQL，表结构对齐 §8.8）
 ├── queue/ lock/       # M0/M6：可插拔队列/锁（memory + kafka/redis 生产适配器）
-├── executor/          # M2：并发 DAG Executor + 幂等 + Retry + Resume + 波间暂停
-├── worker.py          # §6/§8.6：Worker 池（消费 run.trigger / run.command；python -m agentflow.worker）
+├── executor/          # M2：并发 DAG Executor + 幂等 + Retry + Resume + 波间暂停 + 租户上下文
+├── worker.py          # §6/§8.6：Worker/WorkerPool（消费 run.trigger.{tenant}；python -m agentflow.worker）
+├── tenantctl.py       # v5.3 §10：租户生命周期 CLI（provision/deploy/upgrade/migrate/deprovision）
 ├── agents/            # M1：15-agent 编队 + AgentScope 适配 + 工具治理 + 权限上下文
 │   ├── agent_config.py    # DB 驱动 agent 配置解析（DB 覆盖 + 内置回退合并）
-│   ├── mcp_manager.py     # MCP server 连接管理（stdio/http + 热刷新 + 按 agent 绑定）
-│   ├── runner.py          # AgentNodeRunner：真实 LLM 接入 DAGExecutor
+│   ├── mcp_manager.py     # MCP server 连接管理（stdio/http + 热刷新 + per-tenant 缓存与绑定）
+│   ├── runner.py          # AgentNodeRunner：真实 LLM 接入 DAGExecutor（按 current_tenant 租户路由）
 │   ├── transcript.py      # 节点级 LLM 对话/工具调用明细采集 → node_traces
 │   └── datasources.py     # 真实数据源适配（ES/Prometheus/kubectl，testbed 联调）
 ├── workspace/         # M3：WorkspaceManager（base_sha 冻结/分支隔离/无 git_pull）+ CMDB
 ├── sandbox/           # M4：exec 服务(纯 stdlib) + SandboxClient + SandboxOrchestrator + ActionExecutor + ToolPolicy
 ├── approval/          # M5：审批超时 Sweeper（§8.9）+ 通知
 ├── audit/             # M5：审计日志（§9.5 字段 + 输入脱敏）
-├── tenants.py         # §9.3：租户配置（max_concurrent_runs 配额 + approvers 审批人白名单）
+├── tenants.py         # v5.3 §5.2：租户配置（default-deny 审批白名单；管理库驱动，yaml 仅 bootstrap）
 ├── api/               # 控制面 FastAPI（27 端点 + JWT 租户派生 + sweeper 后台任务）
-│   └── auth.py            # §9.1：JWT → 派生 tenant_id（get_tenant_context 依赖）
+│   ├── auth.py            # §9.1：JWT → 派生 tenant_id（get_tenant_context 依赖）
+│   └── management_store.py # v5.3 §5.2：管理库（tenants/schema_versions，db_ref 加密）
+├── statestore/router.py # v5.3 §5.3：TenantStoresRouter（tenant_id → 租户库 bundle，LRU）
+docs/
+└── DEPLOYMENT_zh-CN.md  # v5.3：部署矩阵/Kafka ACL/每租户 Worker/分支治理
 └── service.py         # RunService：create / approve / resume / pause / stop（inline|queue 双模式）
 workflows/
 ├── bug-fix-pipeline.yaml   # design §8.1 完整示例
 └── bug-fix-scenario2.yaml  # 场景2 完整修复工作流（诊断→修复→审批→PR，§3.5）
 scripts/
-├── diagnose_scenario1.py   # 场景1 真实联调：DeepSeek + 真实数据源诊断链
+├── diagnose_scenario1.py   # 场景1 真实联调：DeepSeek + 真实数据源诊断链（需 AGENTFLOW_SHARED_DATASOURCES=1）
 ├── diagnose_scenario2.py   # 场景2 真实联调
 └── run_fix_loop.py         # 场景2 修复闭环 E2E（真实工作区 git 修复 + 审批 + PR）
 docker/sandbox/             # 沙箱镜像（stdlib-only，离线可建；WITH_JDK=1 加 Java）
-tests/                 # 244 tests（DAG/幂等/Resume/审批/Worker/队列/JWT 多租户）
+tests/                 # 268 tests（DAG/幂等/Resume/审批/Worker/队列/多租户路由与数据面）
 ```
 
 ## M4 沙箱（独立执行 Pod）
@@ -176,8 +199,11 @@ GET  /health                       存活检查
 - **Worker/双队列**（§6/§8.6）：`run_mode=queue` 时 API 只发布 run.trigger/run.command，
   `worker.Worker` 消费执行；审批完成 API 仅 CAS + 发 resume 命令（零进程内 executor
   依赖，多副本安全）；pause 为波间暂停（当前节点跑完即停）。
-- **多租户**（§9）：JWT 派生 tenant（客户端提交忽略）→ run 数据跨租户 404 →
-  配额 429 / 审批人白名单 403；所有表带 `tenant_id` 分区键。
+- **多租户**（v5.3 五原则 P1-P5）：数据面=租户自有 MCP（共享数据源默认下线）→
+  队列=topic-per-tenant（broker ACL 边界）+ 每租户 Worker → K8s namespace 隔离 →
+  per-tenant DB（TenantStoresRouter 路由，跨租户查询物理不可能）+ 管理库 →
+  branch-per-tenant（管理库记 pinned_sha）。认证：JWT 派生 tenant（客户端提交忽略）
+  → 跨租户 404 → 配额 429 / 审批人 default-deny 403。
 - **工具治理**（§7/§10.4）：Tool Registry 定义 agent 可见性 / 超时 / 限流 / 结果上限。
 
 ## 环境与密钥

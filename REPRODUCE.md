@@ -15,6 +15,10 @@
 
 ---
 
+> **v5.3 数据面姿态**：`AGENTFLOW_SHARED_DATASOURCES` 默认 **0（加固）**——不注入内置
+> ES/Prometheus/kubectl 工具且封堵 `inputs.repos` 直传。**testbed 联调前必须设
+> `AGENTFLOW_SHARED_DATASOURCES=1`**（或写入 .env），否则诊断 agent 无数据工具可用。
+
 ## 0. 一次性准备（首次）
 
 ```bash
