@@ -52,6 +52,46 @@ kubectl -n agentflow-team-a set image deployment/agentflow-worker \
 kubectl -n agentflow-team-a rollout status deployment/agentflow-worker
 ```
 
+### 2.3 本地实操：minikube 里的每租户 Worker Deployment（podman + compose，已验证）
+
+本地拓扑：中间件 PG/Kafka 走 podman compose，沙箱/Worker 走 minikube（kicbase 并入
+compose 网络），host venv 跑 API。**已验证端到端**：API publish → kafka 租户 topic →
+k8s Worker 消费 → 执行 → PG 落库。
+
+```bash
+# 0) 前置
+podman machine start podman-machine-v5
+docker-compose up -d postgres kafka redis      # 镜像全 docker.io（mirror 曾 403）
+# minikube 并入 compose 网络（供 K8s Pod 经 hostNetwork 访问 PG/Kafka）
+podman network connect backend_default minikube
+
+# 1) 装配（管理库 + 租户）——team-alpha 的 PG 管理库注册 + 租户 namespace/配额/NP/SA
+python -m agentflow.tenantctl provision team-alpha --force --k8s
+
+# 2) kafka 双 listener（compose 已配）：
+#    PLAINTEXT  10.89.0.9:9092（静态 IP，advertised 同，供 pod）
+#    EXTERNAL   localhost:19092（宿主 mac：.env 设 AGENTFLOW_KAFKA_BOOTSTRAP=localhost:19092）
+
+# 3) Worker 镜像 + load
+docker build -t agentflow-worker:local -f docker/Dockerfile.worker .
+minikube image load agentflow-worker:local
+
+# 4) 部署（deploy/worker-deployment.yaml：租户 ns + hostNetwork + RQ 显式资源 + --tenant/--dsn）
+kubectl apply -f deploy/worker-deployment.yaml
+kubectl logs deployment/agentflow-worker-team-alpha -n agentflow-team-alpha  # 见接单日志
+
+# 5) 触发验证：POST /run（dev 模式 X-Tenant-ID: team-alpha）→ k8s Worker 消费 → done
+```
+
+**关键约束**：
+- **kafka advertised 必须匹配静态 IP**：compose 给 kafka `ipv4_address: 10.89.0.9`（顶层
+  `networks.ipam`），advertised 不再随 recreate 漂移——否则 broker 自连/客户端全断。
+- **Worker 容器内不用管理库 db_ref**（provision 时记录的是 `localhost` DSN，容器不可达）：
+  以 `--tenant team-alpha --dsn postgresql://…@10.89.0.2:5432/agentflow` **直连共享库**单租户消费。
+- Deployment 在租户 ns 需**显式 resources**（RQ 强制，否则创建被拒）；`hostNetwork: true`
+  走 kicbase 网络栈访问 compose（生产去掉，用同 ns Service/ClusterIP）。
+- 宿主 API 连 kafka 走 EXTERNAL：`.env` 设 `AGENTFLOW_KAFKA_BOOTSTRAP=localhost:19092`。
+
 ## 3. Kafka 安全（P2 的信任边界）
 
 - **SASL**：每租户一个 principal（如 `agentflow-team-a`）。

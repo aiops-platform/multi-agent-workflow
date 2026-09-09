@@ -30,9 +30,8 @@ from .executor.dag_executor import DAGExecutor, NodeRunner, WorkflowNodeFailed
 from .executor.resume import resume_executor
 from .queue import build_queue
 from .queue.base import TOPIC_COMMAND, TOPIC_TRIGGER, Queue, topic_command, topic_trigger
-from .statestore import build_state_store, connect_state_store
 from .statestore.base import StateStore
-from .statestore.router import store_resolver
+from .statestore.router import TenantStoresRouter, store_resolver
 
 log = logging.getLogger("agentflow.worker")
 
@@ -271,12 +270,24 @@ class WorkerPool:
             await asyncio.sleep(self._rescan_interval)
 
 
-async def main() -> None:
-    """独立 Worker 进程入口（queue=kafka 部署形态）。"""
+async def main(argv: list[str] | None = None) -> None:
+    """独立 Worker 进程入口（v5.3 §6.2 多租户形态）。
+
+    装配管理库 + TenantStoresRouter + WorkerPool：
+    - ``--tenant <id>``：只消费该租户的 topic（本地调试单租户，无需 provision）；
+    - 管理库有 active 租户：WorkerPool 为每租户起消费循环（30s 重扫热接入）；
+    - 均无：退化单个全局 Worker（消费旧全局 topic，兼容单库 dev）。
+    """
+    import argparse
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    ap = argparse.ArgumentParser(prog="agentflow.worker", description="agentflow Worker（多租户）")
+    ap.add_argument("--tenant", default=None, help="只消费该租户 topic（本地调试，无需 provision）")
+    ap.add_argument("--dsn", default=None,
+                    help="postgres:// 直连单库（不装配管理库/Router——K8s 容器内 DB 与 provision 时"
+                         "记录的 db_ref 网络不同时用；Worker(单库, tenant_id) 直连共享库）")
+    args = ap.parse_args(argv)
     settings = get_settings()
-    store = build_state_store(settings)
-    await connect_state_store(store)
     queue = build_queue(settings)
     node_runner = None
     if settings.deepseek_api_key:
@@ -285,9 +296,40 @@ async def main() -> None:
 
         node_runner = AgentNodeRunner(build_model(settings))
         log.info("node_runner=agent（DeepSeek）")
-    worker = Worker(store_resolver(store), queue, node_runner=node_runner)
-    log.info("Worker 启动（queue=%s），消费 %s / %s", settings.queue, TOPIC_TRIGGER, TOPIC_COMMAND)
-    await worker.run_forever()
+    # v5.3：管理库 + Router（租户 → 租户库）。Worker 未 provision 的租户时，Router 按默认
+    # 策略回退（sqlite per-tenant 文件 / postgres 共享 DSN），与 API 侧一致 → 读得到 run。
+    from .api.management_store import build_management_store
+
+    mgmt = build_management_store(settings)
+    await mgmt.connect()
+    router = TenantStoresRouter(settings, mgmt)
+
+    if args.tenant and args.dsn:
+        # K8s 容器直连形态：跳过管理库/Router（db_ref 网络不适用容器），单租户 topic + 单库
+        from .statestore.postgres import PostgresStateStore
+
+        store = PostgresStateStore(args.dsn)
+        await store.connect()
+        log.info("Worker(tenant=%s, dsn 直连)：消费 %s / %s",
+                 args.tenant, topic_trigger(args.tenant), topic_command(args.tenant))
+        await Worker(store, queue, node_runner=node_runner, tenant_id=args.tenant).run_forever()
+        return
+    if args.tenant:
+        log.info("Worker(tenant=%s)：消费 %s / %s",
+                 args.tenant, topic_trigger(args.tenant), topic_command(args.tenant))
+        await Worker(router, queue, node_runner=node_runner, tenant_id=args.tenant).run_forever()
+        return
+    active = await mgmt.list_tenants(status="active")
+    if active:
+        async def _active_tenants() -> list[str]:
+            return [r["tenant_id"] for r in await mgmt.list_tenants(status="active")]
+
+        log.info("WorkerPool 启动（queue=%s）：为 %d 个 active 租户起消费循环", settings.queue, len(active))
+        await WorkerPool(router, queue, node_runner=node_runner,
+                         tenants_provider=_active_tenants).run_forever()
+        return
+    log.warning("管理库暂无 active 租户且未指定 --tenant：退化为全局 topic Worker（单库 dev 形态）")
+    await Worker(router, queue, node_runner=node_runner).run_forever()
 
 
 if __name__ == "__main__":  # pragma: no cover

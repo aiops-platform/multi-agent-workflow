@@ -1,0 +1,55 @@
+# v5.3 §6.2/§10：每租户 Worker Deployment（P5 执行面版本随租户）。
+#
+# 本地调试拓扑（podman + minikube）：
+#   - minikube(kicbase) 已 `podman network connect backend_default minikube` 并入 compose 网络
+#     → hostNetwork Pod 走 kicbase 网络栈，可达 compose 容器 IP：kafka=10.89.0.4:9092、pg=10.89.0.2:5432。
+#   - kafka 双 listener（advertised PLAINTEXT=10.89.0.4:9092 供 pod / EXTERNAL=localhost:19092 供宿主 mac）。
+#   - Worker 经 `--dsn` 直连共享 PG（单库 + 租户 topic 形态），不读管理库 db_ref（容器内不可达 localhost）。
+#
+# 生产（每租户真分支镜像）：image=registry/agentflow:{tenant}-{sha}，同 ns 内 ClusterIP 连中间件。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentflow-worker-team-alpha
+  namespace: agentflow-team-alpha
+  labels:
+    app: agentflow-worker
+    tenant: team-alpha
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agentflow-worker
+      tenant: team-alpha
+  template:
+    metadata:
+      labels:
+        app: agentflow-worker
+        tenant: team-alpha
+    spec:
+      serviceAccountName: agentflow-worker
+      # 本地：走 kicbase 网络栈访问 compose 中间件（bridge IP 见 manifest 注释）。生产去掉。
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: worker
+          image: agentflow-worker:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AGENTFLOW_QUEUE
+              value: "kafka"
+            - name: AGENTFLOW_KAFKA_BOOTSTRAP
+              value: "10.89.0.9:9092"
+            - name: AGENTFLOW_RUN_MODE
+              value: "queue"
+          command:
+            - python
+            - -m
+            - agentflow.worker
+            - --tenant
+            - team-alpha
+            - --dsn
+            - "postgresql://agentflow:agentflow@10.89.0.2:5432/agentflow"
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "2", memory: "4Gi" }

@@ -46,7 +46,8 @@ AGENTFLOW_RUN_MODE=inline   # 默认：API 进程内直接执行 DAG（本地 MV
 AGENTFLOW_RUN_MODE=queue    # API 只发布 run.trigger.{tenant} / run.command.{tenant}，Worker 消费：
                             #   queue=memory → API 启动时自动拉起进程内 WorkerPool（按管理库租户热接入）
                             #   queue=kafka  → 每租户 Worker Deployment（镜像 {tenant}-{sha}）
-                            #                  独立进程：python -m agentflow.worker
+                            #                  本地开发：python -m agentflow.worker --tenant <id> [--dsn …]
+                            #                  宿主连 kafka：AGENTFLOW_KAFKA_BOOTSTRAP=localhost:19092
 
 # ── 多租户认证（§9.1）──
 AGENTFLOW_JWT_SECRET=...    # 非空 = 强制 Bearer JWT，tenant 由 claim（tenant_id/org_id）
@@ -93,7 +94,8 @@ agentflow/
 ├── statestore/        # M0/M6：State Model（InMemory / SQLite / PostgreSQL，表结构对齐 §8.8）
 ├── queue/ lock/       # M0/M6：可插拔队列/锁（memory + kafka/redis 生产适配器）
 ├── executor/          # M2：并发 DAG Executor + 幂等 + Retry + Resume + 波间暂停 + 租户上下文
-├── worker.py          # §6/§8.6：Worker/WorkerPool（消费 run.trigger.{tenant}；python -m agentflow.worker）
+├── worker.py          # §6/§8.6：Worker/WorkerPool（消费 run.trigger.{tenant}；
+│                       #   python -m agentflow.worker [--tenant <id>] [--dsn postgres://…] 单库直连）
 ├── tenantctl.py       # v5.3 §10：租户生命周期 CLI（provision/deploy/upgrade/migrate/deprovision）
 ├── agents/            # M1：15-agent 编队 + AgentScope 适配 + 工具治理 + 权限上下文
 │   ├── agent_config.py    # DB 驱动 agent 配置解析（DB 覆盖 + 内置回退合并）
@@ -110,8 +112,6 @@ agentflow/
 │   ├── auth.py            # §9.1：JWT → 派生 tenant_id（get_tenant_context 依赖）
 │   └── management_store.py # v5.3 §5.2：管理库（tenants/schema_versions，db_ref 加密）
 ├── statestore/router.py # v5.3 §5.3：TenantStoresRouter（tenant_id → 租户库 bundle，LRU）
-docs/
-└── DEPLOYMENT_zh-CN.md  # v5.3：部署矩阵/Kafka ACL/每租户 Worker/分支治理
 └── service.py         # RunService：create / approve / resume / pause / stop（inline|queue 双模式）
 workflows/
 ├── bug-fix-pipeline.yaml   # design §8.1 完整示例
@@ -120,7 +120,13 @@ scripts/
 ├── diagnose_scenario1.py   # 场景1 真实联调：DeepSeek + 真实数据源诊断链（需 AGENTFLOW_SHARED_DATASOURCES=1）
 ├── diagnose_scenario2.py   # 场景2 真实联调
 └── run_fix_loop.py         # 场景2 修复闭环 E2E（真实工作区 git 修复 + 审批 + PR）
-docker/sandbox/             # 沙箱镜像（stdlib-only，离线可建；WITH_JDK=1 加 Java）
+docker/
+├── sandbox/               # 沙箱镜像（stdlib-only，离线可建；WITH_JDK=1 加 Java）
+└── Dockerfile.worker      # Worker 镜像（python:3.12-slim + 在线 pip 装 agentflow）
+deploy/
+└── worker-deployment.yaml # v5.3 §6.2 每租户 Worker Deployment（示例 team-alpha）
+docs/
+└── DEPLOYMENT_zh-CN.md    # v5.3：部署矩阵/Kafka ACL/每租户 Worker/本地 minikube 实操
 tests/                 # 268 tests（DAG/幂等/Resume/审批/Worker/队列/多租户路由与数据面）
 ```
 
@@ -213,5 +219,15 @@ GET  /health                       存活检查
 
 ## 本地基础设施（podman + minikube）
 
-- podman-machine 已按 §16.2 审批调整至 **8C / 12G / 60G**。
-- K8s：minikube（M4 沙箱 / testbed 部署时使用）。
+- podman-machine 已按 §16.2 审批调整至 **8C / 12G / 60G**（先 `podman machine start podman-machine-v5`）。
+- **中间件**（`docker-compose up -d postgres kafka redis`，全部 `docker.io` 源）：
+  - PostgreSQL `:5432`（§8.8 表）；Redis `:6379`；Kafka KRaft 单节点。
+  - Kafka **双 listener**：`10.89.0.9:9092`（静态 IP，供 minikube K8s Pod）/ `localhost:19092`（宿主：
+    须设 `AGENTFLOW_KAFKA_BOOTSTRAP=localhost:19092`）。
+- K8s：minikube（M4 沙箱 / testbed / **每租户 Worker Deployment** 部署时使用）。
+  `minikube start --driver=docker --force --cpus=6 --memory=9216 --container-runtime=containerd`
+- **minikube ↔ compose 打通**：`podman network connect backend_default minikube`（kicbase 并入中间件网络，
+  供沙箱/Worker Pod 经 hostNetwork 访问 PG/Kafka）。kafka 静态 IP 见 compose `networks.ipam`。
+- **Worker Deployment 实操**（`agentflow-worker` 镜像 + `deploy/worker-deployment.yaml`）：
+  `docker build -t agentflow-worker:local -f docker/Dockerfile.worker . && minikube image load agentflow-worker:local &&
+  kubectl apply -f deploy/worker-deployment.yaml`；详见 `docs/DEPLOYMENT_zh-CN.md` §本地实操。

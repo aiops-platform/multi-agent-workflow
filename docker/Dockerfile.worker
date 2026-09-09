@@ -1,0 +1,23 @@
+# agentflow Worker 镜像（v5.3 §6.2 每租户 Worker Deployment；P5 镜像 = {tenant}-{sha}）
+#
+# 构建（本地 podman 为 minikube 准备）：
+#   docker build -t agentflow-worker:local -f docker/Dockerfile.worker .
+#   minikube image load agentflow-worker:local
+#
+# 运行：消费 run.trigger.{tenant}/run.command.{tenant}，经 --dsn 直连共享 PG（租户 topic
+# + 共享库单库形态；K8s 容器内 DB 网络与 provision 时记录不一致，故不用管理库 db_ref）。
+#   env: AGENTFLOW_QUEUE=kafka AGENTFLOW_KAFKA_BOOTSTRAP=<pod 可达>:9092
+#        AGENTFLOW_RUN_MODE=queue
+#   command: ["python","-m","agentflow.worker","--tenant","team-alpha","--dsn",
+#             "postgresql://agentflow:agentflow@<pg-pod-ip>:5432/agentflow"]
+FROM docker.io/library/python:3.12-slim
+
+WORKDIR /app
+
+# 先拷依赖清单，利用层缓存（仅 pyproject 变化才重跑 install）
+COPY pyproject.toml README.md ./
+COPY agentflow ./agentflow
+RUN pip install --no-cache-dir -e .
+
+# Worker 入口（--tenant/--dsn 由 Deployment command 注入）
+CMD ["python", "-m", "agentflow.worker"]

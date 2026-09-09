@@ -3,6 +3,28 @@ from __future__ import annotations
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _isolate_settings(monkeypatch):
+    """每个测试前重置全局 settings → 测试默认（sqlite/memory/inline）。
+
+    防止本机 .env（如 AGENTFLOW_STATE_STORE=postgres）污染测试——settings 是进程级
+    单例（lru_cache），import 时已读 .env，须显式归位。个别测试再按需 monkeypatch。
+    """
+    from agentflow.config import get_settings
+
+    s = get_settings()
+    monkeypatch.setattr(s, "state_store", "sqlite")
+    monkeypatch.setattr(s, "queue", "memory")
+    monkeypatch.setattr(s, "run_mode", "inline")
+    monkeypatch.setattr(s, "tenants_file", "")
+    monkeypatch.setattr(s, "jwt_secret", "")
+    monkeypatch.setattr(s, "secret_key", "")
+    monkeypatch.setattr(s, "shared_datasources", False)
+    monkeypatch.setattr(s, "state_db_path", __import__("pathlib").Path("data/agentflow.db"))
+    monkeypatch.setattr(s, "postgres_dsn", "localhost:5432/agentflow?user=agentflow&password=agentflow")
+
+
 # 用系统 Python 全局已装的 agentscope==2.0.3，避免测试因缺依赖而挂（见 pyproject）
 from agentflow.core.dag import DAG
 

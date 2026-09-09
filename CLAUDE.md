@@ -35,11 +35,14 @@ make lint      # ruff 检查
    Resume 永卡 waiting_approval（回归测试 `test_approval_timeout_resume_converges_sqlite`）。
 6. **版本冻结**（`core/workflow.py`）：Run 用 `workflow_hash` 复用 snapshot，Resume 只读原 snapshot。
 6.1 **Worker/双队列**（§6/§8.6，`AGENTFLOW_RUN_MODE`）：`inline`（默认，进程内直跑）|
-   `queue`（API 只发布 run.trigger / run.command，`worker.Worker` 消费；memory=进程内
-   Worker，kafka=`python -m agentflow.worker`）。executor 一律经 `resume_executor`
-   checkpoint 重建（`load_snapshot_workflow` 的 `await` 不可删——曾缺失导致 resume
-   全挂，此前测试未覆盖该路径）。queue 模式 approve 只做 CAS+发命令，零进程内
-   executor 依赖。pause=波间暂停（`request_pause` → run() 返回 "paused"）。
+   `queue`（API 只发布 run.trigger.{tenant} / run.command.{tenant}，Worker 消费；
+   memory=进程内 WorkerPool 自动接 active 租户，kafka=`python -m agentflow.worker`
+   [--tenant <id>] [--dsn postgres://…]）。**--dsn**：容器/共享库直连单租户（管理库
+   db_ref 的 localhost DSN 在 k8s 容器不可达）；**--tenant**：只消费该租户 topic。
+   executor 一律经 `resume_executor` checkpoint 重建（`load_snapshot_workflow` 的
+   `await` 不可删——曾缺失导致 resume 全挂）。queue 模式 approve 只做 CAS+发命令，
+   零进程内 executor 依赖。pause=波间暂停。Worker 镜像 `docker/Dockerfile.worker` +
+   manifest `deploy/worker-deployment.yaml`（本地 minikube 实操见 docs/DEPLOYMENT §2.3）。
 7. **多租户（v5.3 五原则，design-v5.3.md）**：
    - **存储路由**：一切库访问经 `statestore/router.py`——普通 StateStore 包装固定解析
      （既有单库用法/测试零改动），`TenantStoresRouter` 按 tenant_id 路由到租户库
