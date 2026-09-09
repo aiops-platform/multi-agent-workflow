@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 
 from agentflow.core.workflow import Workflow
+from agentflow.queue.base import topic_command, topic_trigger
 from agentflow.queue.memory import InMemoryQueue
 from agentflow.service import RunService
 from agentflow.statestore.memory import InMemoryStateStore
@@ -54,7 +55,7 @@ async def test_worker_executes_trigger_and_run_completes() -> None:
     assert (await store.get_run(run_id))["status"] == "queued"  # 未接单
 
     worker = Worker(store, queue)
-    await _consume_one(queue, "run.trigger", worker.handle_trigger)
+    await _consume_one(queue, topic_trigger("t1"), worker.handle_trigger)
     await worker.wait_run(run_id)
 
     run = await store.get_run(run_id)
@@ -71,7 +72,7 @@ async def test_worker_approve_publishes_resume_and_continues() -> None:
     worker = Worker(store, queue)
     run_id = (await svc.start_run("t1", Workflow.load_yaml(APPROVAL_YAML), {}))["run_id"]
 
-    await _consume_one(queue, "run.trigger", worker.handle_trigger)
+    await _consume_one(queue, topic_trigger("t1"), worker.handle_trigger)
     await worker.wait_run(run_id)
     assert (await store.get_run(run_id))["status"] == "waiting_approval"
 
@@ -79,7 +80,7 @@ async def test_worker_approve_publishes_resume_and_continues() -> None:
     res = await svc.approve(run_id, "approve-changes", approved=True, by="lead", comment="ok")
     assert res["run_status"] == "queued"
 
-    await _consume_one(queue, "run.command", worker.handle_command)
+    await _consume_one(queue, topic_command("t1"), worker.handle_command)
     await worker.wait_run(run_id)
     assert (await store.get_run(run_id))["status"] == "done"
     assert (await store.get_nodes(run_id))["commit"]["status"] == "done"
@@ -114,18 +115,18 @@ edges:
         )
     )["run_id"]
 
-    await _consume_one(queue, "run.trigger", worker.handle_trigger)
+    await _consume_one(queue, topic_trigger("t1"), worker.handle_trigger)
     await asyncio.sleep(0.05)  # 让任务进入 first 节点（阻塞在 release）
 
     await svc.pause_run(run_id)  # 发布 pause 命令
-    await _consume_one(queue, "run.command", worker.handle_command)
+    await _consume_one(queue, topic_command("t1"), worker.handle_command)
     release.set()  # 当前节点放行 → 跑完即暂停
     await worker.wait_run(run_id)
     assert (await store.get_run(run_id))["status"] == "paused"
 
     # resume：checkpoint 重建（first done / second pending）→ 跑到 done
     await svc.resume_run(run_id, "t1")
-    await _consume_one(queue, "run.command", worker.handle_command)
+    await _consume_one(queue, topic_command("t1"), worker.handle_command)
     await worker.wait_run(run_id)
     assert (await store.get_run(run_id))["status"] == "done"
     assert (await store.get_nodes(run_id))["second"]["status"] == "done"
@@ -142,11 +143,11 @@ async def test_worker_stop_marks_cancelled() -> None:
 
     worker = Worker(store, queue, node_runner=blocked_runner)
     run_id = (await svc.start_run("t1", Workflow.load_yaml(SIMPLE_YAML), {}))["run_id"]
-    await _consume_one(queue, "run.trigger", worker.handle_trigger)
+    await _consume_one(queue, topic_trigger("t1"), worker.handle_trigger)
     await asyncio.sleep(0.05)
 
     await svc.stop_run(run_id)  # 发布 stop 命令
-    await _consume_one(queue, "run.command", worker.handle_command)
+    await _consume_one(queue, topic_command("t1"), worker.handle_command)
     release.set()
 
     run = await store.get_run(run_id)
@@ -162,7 +163,7 @@ async def test_worker_ignores_trigger_for_terminal_run() -> None:
     run_id = (await svc.start_run("t1", Workflow.load_yaml(SIMPLE_YAML), {}))["run_id"]
 
     worker = Worker(store, queue)
-    await _consume_one(queue, "run.trigger", worker.handle_trigger)
+    await _consume_one(queue, topic_trigger("t1"), worker.handle_trigger)
     await worker.wait_run(run_id)
     assert (await store.get_run(run_id))["status"] == "done"
 

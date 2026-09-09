@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .config import get_settings
@@ -28,7 +29,7 @@ from .core.dag import TERMINAL
 from .executor.dag_executor import DAGExecutor, NodeRunner, WorkflowNodeFailed
 from .executor.resume import resume_executor
 from .queue import build_queue
-from .queue.base import TOPIC_COMMAND, TOPIC_TRIGGER, Queue
+from .queue.base import TOPIC_COMMAND, TOPIC_TRIGGER, Queue, topic_command, topic_trigger
 from .statestore import build_state_store, connect_state_store
 from .statestore.base import StateStore
 from .statestore.router import store_resolver
@@ -42,12 +43,17 @@ class Worker:
         store: StateStore | Any,
         queue: Queue,
         node_runner: NodeRunner | None = None,
+        *,
+        tenant_id: str | None = None,
     ) -> None:
         # store 可为普通 StateStore（单库）或 TenantStoresRouter——统一经 resolver
         # 按租户解析（design-v5.3 §5.3：每次操作落到该租户自己的库）
         self._stores = store_resolver(store)
         self.queue = queue
         self.node_runner = node_runner
+        # 绑定租户（v5.3 §6.2 生产形态：每租户 Worker 只消费自己的 topic）；
+        # None = 消费全局 topic（单租户回退 / 未注册租户 dev 兜底）
+        self.tenant_id = tenant_id
         # 本 Worker 正在执行的 run；审批挂起/暂停/终态即移出 → 零占用（§8.6）
         self._tasks: dict[str, asyncio.Task] = {}
         self._executors: dict[str, DAGExecutor] = {}  # run_id → executor（pause 反查用）
@@ -59,9 +65,15 @@ class Worker:
     # 常驻消费（trigger 与 command 并行消费）
     # ------------------------------------------------------------------
     async def run_forever(self) -> None:
+        if self.tenant_id is not None:
+            trigger_topic, command_topic = (
+                topic_trigger(self.tenant_id), topic_command(self.tenant_id),
+            )
+        else:
+            trigger_topic, command_topic = TOPIC_TRIGGER, TOPIC_COMMAND
         await asyncio.gather(
-            self._consume(TOPIC_TRIGGER, self.handle_trigger),
-            self._consume(TOPIC_COMMAND, self.handle_command),
+            self._consume(trigger_topic, self.handle_trigger),
+            self._consume(command_topic, self.handle_command),
         )
 
     async def _consume(self, topic: str, handler) -> None:
@@ -92,8 +104,11 @@ class Worker:
             log.info("[%s] run 已终态（%s），忽略 trigger", run_id, run.get("status"))
             return
         tenant = run["tenant_id"]
+        # 接单 CAS（v5.3 §6.3）：queued → running 原子转换，重复消息/多 Worker 恰一个成功
+        if not await store.cas_update_run_status(run_id, "queued", "running"):
+            log.info("[%s] 接单 CAS 失败（已被其他 Worker 接单），忽略 trigger", run_id)
+            return
         ex = await self._build_executor(run_id, tenant, store)
-        await store.update_run(run_id, status="running")  # queued → running（接单）
         log.info("[%s] Worker 接单（trigger）", run_id)
         self._executors[run_id] = ex
         self._tasks[run_id] = asyncio.create_task(self._execute(run_id, ex, tenant))
@@ -158,6 +173,15 @@ class Worker:
             log.info("[%s] run 已终态，忽略 resume", run_id)
             return
         tenant = run["tenant_id"]
+        # 接单 CAS：仅 paused / waiting_approval 可被 resume 接单（防双执行）
+        claimed = False
+        for from_status in ("paused", "waiting_approval"):
+            if await store.cas_update_run_status(run_id, from_status, "running"):
+                claimed = True
+                break
+        if not claimed:
+            log.info("[%s] 接单 CAS 失败（状态已推进），忽略 resume", run_id)
+            return
         ex = await self._build_executor(run_id, tenant, store)
         log.info("[%s] Worker 接单（resume）", run_id)
         self._executors[run_id] = ex
@@ -200,6 +224,51 @@ async def _mark_cancelled(store: StateStore, run_id: str) -> None:
         ex.node_states[nid] = {"status": "cancelled", "output": None}
         await store.put_node(run_id, tenant_id, nid, ex.node_states[nid])
     await store.update_run(run_id, status="cancelled")
+
+
+class WorkerPool:
+    """按管理库租户清单为每租户起消费循环（v5.3 §6.2 本地/单进程形态）。
+
+    生产（queue=kafka）部署形态是**每租户一个 Worker Deployment**（镜像为该租户
+    分支构建，P5）；本池用于 run_mode=queue + memory 的单进程部署：为每个注册租户
+    起一个绑定了 ``run.trigger.{tenant}`` / ``run.command.{tenant}`` 的 Worker，
+    并保留一个全局 Worker 兜底未注册租户（dev）。租户清单周期性重扫（新租户热接入）。
+    """
+
+    def __init__(
+        self,
+        store: StateStore | Any,
+        queue: Queue,
+        node_runner: NodeRunner | None = None,
+        *,
+        tenants_provider: Callable[[], Awaitable[list[str]]] | None = None,
+        rescan_interval: float = 30.0,
+    ) -> None:
+        self._stores = store_resolver(store)
+        self.queue = queue
+        self.node_runner = node_runner
+        self._tenants_provider = tenants_provider
+        self._rescan_interval = rescan_interval
+        self._consumers: list[asyncio.Task] = []
+
+    async def run_forever(self) -> None:
+        # 全局 Worker：兜底未注册租户（dev）+ 兼容旧全局 topic
+        base = Worker(self._stores, self.queue, self.node_runner)
+        self._consumers.append(asyncio.create_task(base.run_forever()))
+        seen: set[str] = set()
+        while True:
+            if self._tenants_provider is not None:
+                try:
+                    for tid in await self._tenants_provider():
+                        if tid in seen:
+                            continue
+                        seen.add(tid)
+                        w = Worker(self._stores, self.queue, self.node_runner, tenant_id=tid)
+                        self._consumers.append(asyncio.create_task(w.run_forever()))
+                        log.info("WorkerPool：已接入租户 %s 的消费循环", tid)
+                except Exception:
+                    log.warning("WorkerPool 租户清单刷新失败", exc_info=True)
+            await asyncio.sleep(self._rescan_interval)
 
 
 async def main() -> None:

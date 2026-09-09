@@ -182,6 +182,14 @@ class PostgresStateStore(StateStore):
         row = await cur.fetchone()
         return int(row[0])
 
+    async def cas_update_run_status(self, run_id, from_status, to_status) -> bool:
+        cur = await self._c.execute(
+            "UPDATE runs SET status=%s, updated_at=now() WHERE run_id=%s AND status=%s",
+            (to_status, run_id, from_status),
+        )
+        await self._c.commit()
+        return cur.rowcount == 1
+
     # ---- nodes ----
     async def put_node(self, run_id, tenant_id, node_id, cp) -> None:
         await self._c.execute(

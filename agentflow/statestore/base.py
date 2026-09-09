@@ -67,6 +67,14 @@ class StateStore(ABC):
     async def count_active_runs(self, tenant_id: str) -> int:
         """租户未终态 run 数（§9.3 max_concurrent_runs 配额判定用）。"""
 
+    @abstractmethod
+    async def cas_update_run_status(
+        self, run_id: str, from_status: str, to_status: str
+    ) -> bool:
+        """run 状态 CAS（v5.3 §6.3 Worker 接单：queued|paused|waiting_approval → running）。
+
+        rowcount 判定：两个 Worker 消费同一 run 的重复消息时恰有一个成功。"""
+
     # ---- nodes：节点级 checkpoint（§8.4 / §4.4）----
     @abstractmethod
     async def put_node(

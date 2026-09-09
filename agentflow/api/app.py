@@ -38,7 +38,7 @@ from ..queue import build_queue
 from ..service import ApproverNotAllowed, RunService, TenantQuotaExceeded
 from ..statestore.router import TenantStoresRouter
 from ..tenants import TenantRegistry, async_bootstrap_tenants
-from ..worker import Worker
+from ..worker import WorkerPool
 from .agent_store import (
     AgentConfigStore,
     build_agent_config_store,
@@ -292,7 +292,10 @@ async def init() -> RunService:
     if queue_mode:
         if settings.queue == "memory":
             # 单进程形态：Worker 以后台任务运行（与独立进程行为一致）
-            worker = Worker(stores_router, queue, node_runner=service.node_runner)
+            worker = WorkerPool(
+                stores_router, queue, node_runner=service.node_runner,
+                tenants_provider=_active_tenant_ids,
+            )
             _worker_task = asyncio.create_task(worker.run_forever())
             print("[agentflow] run_mode=queue + memory：进程内 Worker 已启动")
         else:

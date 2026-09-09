@@ -195,7 +195,9 @@ class _RouterStoreResolver:
 
 
 def store_resolver(store_or_router: Any) -> Any:
-    """StateStore → 固定解析；TenantStoresRouter → 按租户解析（鸭子类型判定）。"""
+    """StateStore → 固定解析；TenantStoresRouter → 按租户解析；已有 resolver 原样返回。"""
     if isinstance(store_or_router, TenantStoresRouter):
         return _RouterStoreResolver(store_or_router)
+    if hasattr(store_or_router, "resolve"):
+        return store_or_router  # 已是 resolver（WorkerPool 复用）
     return _SingleStoreResolver(store_or_router)

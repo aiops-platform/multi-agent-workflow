@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Action Executor（design §10.3：有限集合动作 + 参数白名单）。
 
 Agent → RemediationPlan（结构化）→ Action Executor（参数校验）→ K8s API（执行）。
@@ -10,7 +9,8 @@ import logging
 import re
 from typing import Any
 
-from kubernetes import client, config as k8s_config
+from kubernetes import client
+from kubernetes import config as k8s_config
 
 log = logging.getLogger("agentflow.sandbox.action")
 
@@ -50,9 +50,18 @@ def _in_range(value: str, lo: str, hi: str) -> bool:
 
 
 class ActionExecutor:
-    """执行受限基础设施动作（§10.3 有限集合 + 白名单）。"""
+    """执行受限基础设施动作（§10.3 有限集合 + 白名单）。
 
-    def __init__(self, *, namespace_whitelist: list[str] | None = None, pod_prefix_whitelist: list[str] | None = None) -> None:
+    v5.3 §8（P3）：``tenant_namespace_fn`` 提供时，动作 namespace 白名单从租户
+    派生——租户的 infra-remediator 只能操作自己 namespace 的资源（管理库
+    tenants.namespace → ``agentflow-{tenant}``）。"""
+    def __init__(
+        self,
+        *,
+        namespace_whitelist: list[str] | None = None,
+        pod_prefix_whitelist: list[str] | None = None,
+        tenant_namespace_fn: Any = None,
+    ) -> None:
         try:
             k8s_config.load_incluster_config()
         except Exception:  # noqa: BLE001
@@ -61,14 +70,26 @@ class ActionExecutor:
         self._core = client.CoreV1Api()
         self.namespace_whitelist = namespace_whitelist or []
         self.pod_prefix_whitelist = pod_prefix_whitelist or []
+        self.tenant_namespace_fn = tenant_namespace_fn  # (tenant_id) -> str
 
     # ------------------------------------------------------------------
-    def _check_ns(self, namespace: str) -> None:
+    def _check_ns(self, namespace: str, tenant_id: str | None = None) -> None:
+        if tenant_id is not None and self.tenant_namespace_fn is not None:
+            allowed = self.tenant_namespace_fn(tenant_id)
+            if namespace != allowed:
+                raise ActionValidationError(
+                    f"namespace {namespace!r} 越出租户 {tenant_id!r} 的资源边界（仅允许 {allowed!r}，§8 P3）"
+                )
+            return
         if self.namespace_whitelist and namespace not in self.namespace_whitelist:
             raise ActionValidationError(f"namespace {namespace!r} 不在白名单: {self.namespace_whitelist}")
 
-    async def execute(self, action: str, *, namespace: str, **params: Any) -> dict:
-        """统一入口：action ∈ §10.3 有限集合。返回 {action, namespace, ok, detail, audit}。"""
+    async def execute(
+        self, action: str, *, namespace: str, tenant_id: str | None = None, **params: Any
+    ) -> dict:
+        """统一入口：action ∈ §10.3 有限集合。返回 {action, namespace, ok, detail, audit}。
+
+        ``tenant_id`` 提供时 namespace 白名单按租户派生（§8 P3：租户动作只及自己的 namespace）。"""
         handlers = {
             "scale_deployment": self.scale_deployment,
             "restart_pod": self.restart_pod,
@@ -77,6 +98,8 @@ class ActionExecutor:
         }
         if action not in handlers:
             raise ActionValidationError(f"不支持的动作: {action!r}（有限集合: {list(handlers)}，新增需评审）")
+        if tenant_id is not None:
+            self._check_ns(namespace, tenant_id)
         return await handlers[action](namespace=namespace, **params)
 
     # ------------------------------------------------------------------

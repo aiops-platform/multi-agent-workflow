@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..core.dag import REJECTED_CANCELED
-from ..queue.base import Queue
+from ..queue.base import Queue, topic_command
 from ..statestore.base import APPROVAL_TIMED_OUT, APPROVAL_WAITING, StateStore
 from ..statestore.router import store_resolver
 from .notifier import ApprovalNotifier
@@ -92,7 +92,7 @@ class ApprovalSweeper:
                 output={"approved": False, "reason": "timeout"},
             )
             await self.queue.publish(
-                "run.command",
+                topic_command(ap["tenant_id"]),
                 key=ap["run_id"],
                 message={
                     "type": "resume", "run_id": ap["run_id"],

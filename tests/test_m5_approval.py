@@ -10,6 +10,7 @@ from agentflow.approval.sweeper import ApprovalSweeper
 from agentflow.audit.logger import AuditLogger, mask_input
 from agentflow.core.dag import DAG, DONE, REJECTED_CANCELED
 from agentflow.executor.dag_executor import DAGExecutor
+from agentflow.queue.base import topic_command
 from agentflow.queue.memory import InMemoryQueue
 from agentflow.statestore.base import (
     APPROVAL_APPROVED,
@@ -86,7 +87,7 @@ async def test_sweeper_timeout_cas_and_resume() -> None:
 
     # resume 发布到 run.command
     msgs = []
-    async for m in queue.subscribe("run.command"):
+    async for m in queue.subscribe(topic_command("team-alpha")):
         msgs.append(m)
         if len(msgs) >= 1:
             break

@@ -70,6 +70,13 @@ class InMemoryStateStore(StateStore):
             if r.get("tenant_id") == tenant_id and r.get("status") in ACTIVE_RUN_STATUSES
         )
 
+    async def cas_update_run_status(self, run_id, from_status, to_status) -> bool:
+        run = self._runs.get(run_id)
+        if run is None or run.get("status") != from_status:
+            return False
+        run["status"] = to_status
+        return True
+
     # ---- nodes ----
     async def put_node(self, run_id, tenant_id, node_id, cp) -> None:
         self._nodes.setdefault(run_id, {})[node_id] = {**cp, "tenant_id": tenant_id}

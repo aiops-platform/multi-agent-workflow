@@ -28,7 +28,7 @@ from .core.dag import TERMINAL
 from .core.workflow import Workflow
 from .executor.dag_executor import DAGExecutor, NodeRunner, WorkflowNodeFailed
 from .executor.resume import resume_executor
-from .queue.base import TOPIC_COMMAND, TOPIC_TRIGGER, Queue
+from .queue.base import Queue, topic_command, topic_trigger
 from .statestore.base import StateStore
 from .statestore.router import store_resolver
 from .tenants import TenantRegistry
@@ -167,7 +167,7 @@ class RunService:
             # 先置 queued 再发布：Worker 接单后才置 running，状态机不回跳
             await store.update_run(run_id, status="queued")
             await self.queue.publish(
-                TOPIC_TRIGGER,
+                topic_trigger(tenant_id),
                 key=run_id,
                 message={"type": "trigger", "run_id": run_id, "tenant_id": tenant_id},
             )
@@ -213,7 +213,7 @@ class RunService:
         store, run, tenant = await self._run_context(run_id, tenant_id)
         if self.queue is not None:
             await self.queue.publish(
-                TOPIC_COMMAND,
+                topic_command(tenant),
                 key=run_id,
                 message={"type": "pause", "run_id": run_id, "tenant_id": tenant},
             )
@@ -228,7 +228,7 @@ class RunService:
         await self._check_quota(tenant, store)
         if self.queue is not None:
             await self.queue.publish(
-                TOPIC_COMMAND,
+                topic_command(tenant),
                 key=run_id,
                 message={
                     "type": "resume", "run_id": run_id,
@@ -247,7 +247,7 @@ class RunService:
         store, _run, tenant = await self._run_context(run_id, tenant_id)
         if self.queue is not None:
             await self.queue.publish(
-                TOPIC_COMMAND,
+                topic_command(tenant),
                 key=run_id,
                 message={"type": "stop", "run_id": run_id, "tenant_id": tenant},
             )
@@ -321,7 +321,7 @@ class RunService:
         out = await ex.approve(node_id, approved=approved, by=by, comment=comment)
         if self.queue is not None:
             await self.queue.publish(
-                TOPIC_COMMAND,
+                topic_command(tenant),
                 key=run_id,
                 message={
                     "type": "resume", "run_id": run_id, "tenant_id": tenant,

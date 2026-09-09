@@ -179,6 +179,15 @@ class SqliteStateStore(StateStore):
         (count,) = await cur.fetchone()
         return int(count)
 
+    async def cas_update_run_status(self, run_id, from_status, to_status) -> bool:
+        cur = await self._c.execute(
+            "UPDATE runs SET status=?, updated_at=CURRENT_TIMESTAMP"
+            " WHERE run_id=? AND status=?",
+            (to_status, run_id, from_status),
+        )
+        await self._c.commit()
+        return cur.rowcount == 1
+
     # ---- nodes ----
     async def put_node(self, run_id, tenant_id, node_id, cp) -> None:
         await self._c.execute(
