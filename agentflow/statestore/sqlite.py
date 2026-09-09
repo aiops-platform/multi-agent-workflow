@@ -1,14 +1,14 @@
-# -*- coding: utf-8 -*-
 """SQLite StateStore（本地 MVP 默认后端；表结构对齐 design §8.8）。"""
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
-from .base import APPROVAL_WAITING, StateStore
+from .base import APPROVAL_WAITING, StateStore, approval_time_guard
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS workflow_snapshots (
@@ -87,6 +87,10 @@ CREATE INDEX IF NOT EXISTS idx_node_traces_run ON node_traces(run_id, node_id);
 
 def _j(v: Any) -> str:
     return json.dumps(v, ensure_ascii=False, default=str)
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 class SqliteStateStore(StateStore):
@@ -183,9 +187,27 @@ class SqliteStateStore(StateStore):
         return {r["node_id"]: json.loads(r["cp"]) for r in rows}
 
     async def update_node_status(self, run_id, node_id, status, output=None) -> None:
+        # status/output 列是 cp 的冗余投影（GET /runs 读列、Resume 读 cp），两者必须
+        # 同步更新——否则 from_checkpoint 拿到陈旧 checkpoint（教训：审批超时写
+        # rejected-canceled 只更新列不写 cp，Resume 后节点仍被当作 waiting_approval，
+        # run 永久卡死）。
+        cur = await self._c.execute(
+            "SELECT cp FROM nodes WHERE run_id=? AND node_id=?", (run_id, node_id)
+        )
+        row = await cur.fetchone()
+        cp = json.loads(row["cp"]) if row and row["cp"] else {}
+        cp["status"] = status
+        if output is not None:
+            cp["output"] = output
         await self._c.execute(
-            "UPDATE nodes SET status=?, output=? WHERE run_id=? AND node_id=?",
-            (status, _j(output) if output is not None else None, run_id, node_id),
+            "UPDATE nodes SET status=?, output=?, cp=? WHERE run_id=? AND node_id=?",
+            (
+                status,
+                _j(output) if output is not None else None,
+                _j(cp),
+                run_id,
+                node_id,
+            ),
         )
         await self._c.commit()
 
@@ -226,11 +248,22 @@ class SqliteStateStore(StateStore):
         return d
 
     async def cas_update_approval(self, approval_id, from_status, to_status, *, by=None, comment=None) -> bool:
-        cur = await self._c.execute(
+        sql = (
             "UPDATE approvals SET status=?, approved_by=?, comment=?"
-            " WHERE approval_id=? AND status=?",
-            (to_status, by, comment, approval_id, from_status),
+            " WHERE approval_id=? AND status=?"
         )
+        params: list = [to_status, by, comment, approval_id, from_status]
+        # §8.3.2 时间原子判定。timeout_at 存 UTC ISO 字符串，同格式字典序比较 == 时间序
+        # （写入方均为 timezone-aware .isoformat()，见 dag_executor / sweeper）。
+        guard = approval_time_guard(from_status, to_status)
+        if guard is not None:
+            now = _utcnow_iso()
+            if guard == "expired":
+                sql += " AND timeout_at IS NOT NULL AND timeout_at <= ?"
+            else:
+                sql += " AND (timeout_at IS NULL OR timeout_at > ?)"
+            params.append(now)
+        cur = await self._c.execute(sql, params)
         await self._c.commit()
         return cur.rowcount == 1
 
@@ -271,8 +304,7 @@ class SqliteStateStore(StateStore):
         await self._c.execute(
             "INSERT INTO audit_logs(tenant_id, tool_name, decision, run_id, node_id, input_masked, actor, ts)"
             " VALUES(?,?,?,?,?,?,?,?)",
-            (tenant_id, tool_name, decision, run_id, node_id, input_masked, actor,
-             __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()),
+            (tenant_id, tool_name, decision, run_id, node_id, input_masked, actor, _utcnow_iso()),
         )
         await self._c.commit()
 
@@ -294,7 +326,7 @@ class SqliteStateStore(StateStore):
             "DELETE FROM node_traces WHERE run_id=? AND node_id=?", (run_id, node_id)
         )
         if rows:
-            ts = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+            ts = _utcnow_iso()
             await self._c.executemany(
                 "INSERT INTO node_traces(run_id, node_id, tenant_id, seq, kind, name, payload, ts)"
                 " VALUES(?,?,?,?,?,?,?,?)",

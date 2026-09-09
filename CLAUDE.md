@@ -19,10 +19,20 @@ make lint      # ruff 检查
 2. **基础设施可插拔**：StateStore/Queue/Lock 只通过 `agentflow/statestore|queue|lock/base.py`
    接口访问，配置驱动切换（`config.py`）。本地 InMemory/SQLite，生产 M6 接 Kafka/Postgres/Redis。
 3. **DAG 语义**（`core/dag.py`）：边带 `when`，join `any|all`，全 INACTIVE → SKIPPED 级联。
-   审批节点参与 skip。改语义必须同步 `tests/test_executor.py` 的 S-010b 场景。
-4. **审批 CAS + 终态不可逆**（`statestore/base.py:cas_update_approval`）。严禁绕过 CAS 改终态。
-5. **副作用幂等**（`executor/idempotency.py`）：`execution_id` 唯一 + `external_operation_id`
-   复用。新增副作用节点必须定义幂等键（§8.4.3）。
+   审批节点参与 skip。`rejected-canceled`（审批超时）是正式终态常量 `REJECTED_CANCELED`，
+   已入 `TERMINAL`，`_edge_active` 视同 REJECTED（下游拒绝路径可求值）。
+   改语义必须同步 `tests/test_executor.py` 的 S-010b 场景。
+4. **审批 CAS + 终态不可逆 + 时间原子判定**（`statestore/base.py:cas_update_approval`）。
+   严禁绕过 CAS 改终态。CAS 除状态谓词外还带 `approval_time_guard` 时间谓词（§8.3.2）：
+   approve/reject 仅未超时可批、TIMED_OUT 仅超时后可置。改 SQL 必须保留。
+5. **副作用幂等**（`executor/idempotency.py` + `executor/dag_executor.py:_external_operation_id`）：
+   `execution_id` 唯一 + `external_operation_id` 复用（§8.4.2）。副作用 agent
+   （`SIDE_EFFECT_AGENTS`：committer/infra-remediator）自动用 `run_id:node_id` 确定性键；
+   YAML 节点可声明 `idempotency_key`（支持 `$.` 引用）做内容键（§8.4.3）。新增副作用
+   节点必须加入清单或声明幂等键。
+5.1 **checkpoint 一致性**：`update_node_status` 必须同步写 `cp` 列（status/output 列只是
+   cp 的冗余投影——GET /runs 读列、Resume 读 cp）。只写列不写 cp 曾导致审批超时后
+   Resume 永卡 waiting_approval（回归测试 `test_approval_timeout_resume_converges_sqlite`）。
 6. **版本冻结**（`core/workflow.py`）：Run 用 `workflow_hash` 复用 snapshot，Resume 只读原 snapshot。
 7. **多租户**：所有表带 `tenant_id`；租户身份由 JWT 派生（§9.1），代码里禁止以客户端提交的
    tenant 为授权依据（M5 接入 Gateway 前本地联调可显式传参）。

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """审批超时 Sweeper（design §8.9，控制面独立服务）。
 
 周期扫描 WAITING_APPROVAL 审批：
@@ -11,13 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
-from typing import Any
+from datetime import UTC, datetime
 
+from ..core.dag import REJECTED_CANCELED
 from ..queue.base import Queue
 from ..statestore.base import (
-    APPROVAL_WAITING,
     APPROVAL_TIMED_OUT,
+    APPROVAL_WAITING,
     StateStore,
 )
 from .notifier import ApprovalNotifier
@@ -42,7 +41,7 @@ class ApprovalSweeper:
     async def run_once(self) -> list[dict]:
         """扫描一轮，返回本轮超时并处理的审批。"""
         pending = await self.store.get_pending_approvals()
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         timed_out: list[dict] = []
         for ap in pending:
             timeout_at = ap.get("timeout_at")
@@ -57,7 +56,7 @@ class ApprovalSweeper:
                 except (TypeError, ValueError):
                     continue  # 无法解析的 deadline → 本轮跳过
             if deadline.tzinfo is None:
-                deadline = deadline.replace(tzinfo=timezone.utc)  # naive → 视为 UTC，与 now 对齐
+                deadline = deadline.replace(tzinfo=UTC)  # naive → 视为 UTC，与 now 对齐
             if deadline > now:
                 continue
             # CAS：仅当仍为 WAITING（终态不可逆）
@@ -69,7 +68,7 @@ class ApprovalSweeper:
                 continue  # 已被并发推进，跳过
 
             await self.store.update_node_status(
-                ap["run_id"], ap["node_id"], "rejected-canceled",
+                ap["run_id"], ap["node_id"], REJECTED_CANCELED,
                 output={"approved": False, "reason": "timeout"},
             )
             await self.queue.publish(

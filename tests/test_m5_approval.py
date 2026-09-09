@@ -1,16 +1,21 @@
-# -*- coding: utf-8 -*-
 """M5：审批超时 Sweeper（§8.9）+ 审计日志（§9.5/§8.8）+ 通知。"""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from agentflow.approval.notifier import ApprovalNotifier
 from agentflow.approval.sweeper import ApprovalSweeper
 from agentflow.audit.logger import AuditLogger, mask_input
+from agentflow.core.dag import DAG, DONE, REJECTED_CANCELED
+from agentflow.executor.dag_executor import DAGExecutor
 from agentflow.queue.memory import InMemoryQueue
-from agentflow.statestore.base import APPROVAL_TIMED_OUT, APPROVAL_WAITING
+from agentflow.statestore.base import (
+    APPROVAL_APPROVED,
+    APPROVAL_TIMED_OUT,
+    APPROVAL_WAITING,
+)
 from agentflow.statestore.memory import InMemoryStateStore
 from agentflow.statestore.sqlite import SqliteStateStore
 
@@ -52,7 +57,7 @@ async def test_audit_logger_sqlite() -> None:
 # 审批超时 Sweeper（§8.9）
 # ======================================================================
 async def _expired_approval(store, *, timeout_secs: float = -10, run_id: str = "run_1") -> str:
-    timeout_at = (datetime.now(timezone.utc) + timedelta(seconds=timeout_secs)).isoformat()
+    timeout_at = (datetime.now(UTC) + timedelta(seconds=timeout_secs)).isoformat()
     return await store.create_approval(
         run_id, "approve-changes", "team-alpha",
         params={"name": "审批修复方案"}, approvers=["lead"], timeout_at=timeout_at,
@@ -136,6 +141,105 @@ async def test_sweeper_accepts_datetime_timeout_at_pg_adapter(monkeypatch) -> No
     assert len(timed_out) == 1
     ap = await store.get_approval("run_pg", "approve-changes")
     assert ap["status"] == APPROVAL_TIMED_OUT
+
+
+# ======================================================================
+# 审批超时 → Resume 收敛（§8.9 回归，必须在 SQLite 下验证）
+# ======================================================================
+async def test_approval_timeout_resume_converges_sqlite() -> None:
+    """回归：审批超时后 Resume 必须沿拒绝路径收敛到 done，而非永卡 waiting_approval。
+
+    曾有 bug：sweeper 写 rejected-canceled 走 update_node_status，只更新 status/output
+    列不写 cp；而 from_checkpoint 只读 cp 且白名单不含 rejected-canceled → 超时后
+    resume 把节点当 waiting_approval 重新挂起（approvals 已 TIMED_OUT，CAS 永远失败）。
+    InMemory 测试掩盖了它（status 与 cp 是同一个 dict，天然"同步"）。
+    """
+    store = SqliteStateStore(":memory:")
+    await store.connect()
+    dag = DAG.build(
+        {
+            "plan": {"agent": "fix-planner"},
+            "approve-changes": {
+                "kind": "approval", "name": "审批修复方案",
+                "approvers": ["lead"], "timeout": -1,  # 负超时 → 创建即过期
+            },
+            "recap": {"agent": "postmortem"},
+        },
+        [
+            {"from": "plan", "to": "approve-changes"},
+            {"from": "approve-changes", "to": "recap",
+             "when": "$.nodes.approve-changes.output.approved == false"},
+        ],
+    )
+    calls: list[str] = []
+
+    async def runner(node, params):
+        calls.append(node.id)
+        return {"ok": True}
+
+    ex = DAGExecutor("run_t", "team-alpha", dag, store, node_runner=runner)
+    assert await ex.run() == "waiting_approval"
+
+    sweeper = ApprovalSweeper(store, InMemoryQueue(), interval=1)
+    assert len(await sweeper.run_once()) == 1
+
+    # cp 与 status 列同步（曾是 bug 根因：两处真相分叉）
+    cps = await store.get_nodes("run_t")
+    assert cps["approve-changes"]["status"] == REJECTED_CANCELED
+    assert cps["approve-changes"]["output"] == {"approved": False, "reason": "timeout"}
+
+    ex2 = await DAGExecutor.from_checkpoint(
+        "run_t", "team-alpha", dag, store, node_runner=runner
+    )
+    # rejected-canceled 是终态：保留，不重置 pending、不重新挂起审批
+    assert ex2.node_states["approve-changes"]["status"] == REJECTED_CANCELED
+    assert await ex2.run() == "done"
+    assert ex2.node_states["recap"]["status"] == DONE  # 沿拒绝路径收敛
+    await store.close()
+
+
+# ======================================================================
+# 审批 CAS 时间原子判定（§8.3.2 AND timeout_at > NOW()）
+# ======================================================================
+@pytest.mark.parametrize(
+    "make_store",
+    [lambda: InMemoryStateStore(), lambda: SqliteStateStore(":memory:")],
+    ids=["memory", "sqlite"],
+)
+async def test_cas_time_guard(make_store) -> None:
+    """approve/reject 仅在超时窗口内可批；TIMED_OUT 仅超时后可置。
+
+    曾有竞态：CAS 只有 status 谓词，「已超时但 sweeper 尚未扫到」窗口内 approve
+    仍能成功，审批在超时后依旧被放行。
+    """
+    store = make_store()
+    if isinstance(store, SqliteStateStore):
+        await store.connect()
+    try:
+        await _expired_approval(store, run_id="r_exp")  # 已过期（-10s）
+        # 已过期 → 不可批
+        assert not await store.cas_update_approval(
+            "ap_r_exp_approve-changes", APPROVAL_WAITING, APPROVAL_APPROVED, by="u"
+        )
+        # 已过期 → sweeper 可置 TIMED_OUT
+        assert await store.cas_update_approval(
+            "ap_r_exp_approve-changes", APPROVAL_WAITING, APPROVAL_TIMED_OUT
+        )
+
+        await _expired_approval(store, timeout_secs=3600, run_id="r_ok")  # 未过期
+        # 未过期 → 可批
+        assert await store.cas_update_approval(
+            "ap_r_ok_approve-changes", APPROVAL_WAITING, APPROVAL_APPROVED, by="u"
+        )
+
+        await _expired_approval(store, timeout_secs=3600, run_id="r_no")  # 未过期
+        # 未过期 → 不可置 TIMED_OUT
+        assert not await store.cas_update_approval(
+            "ap_r_no_approve-changes", APPROVAL_WAITING, APPROVAL_TIMED_OUT
+        )
+    finally:
+        if isinstance(store, SqliteStateStore):
+            await store.close()
 
 
 # ======================================================================

@@ -23,6 +23,7 @@ from ..core.dag import (
     DONE,
     PENDING,
     REJECTED,
+    REJECTED_CANCELED,
     RUNNING,
     SKIPPED,
     TERMINAL,
@@ -33,6 +34,7 @@ from ..core.expressions import eval_condition
 from ..statestore.base import (
     APPROVAL_APPROVED,
     APPROVAL_REJECTED,
+    APPROVAL_TIMED_OUT,
     APPROVAL_WAITING,
     StateStore,
 )
@@ -42,6 +44,11 @@ log = logging.getLogger("agentflow.executor")
 
 # 节点 runner：接收 (node, resolved_params) 返回输出
 NodeRunner = Callable[[Node, dict], Awaitable[Any]]
+
+# §8.4.3 副作用节点清单（外部世界可感知、重复执行会造成重复副作用）：
+# committer（建 PR）、infra-remediator（scale/restart）。这两类 agent 的节点
+# 执行前先查同 run+node+幂等键 的成功记录，命中则复用（§8.4.2），crash 重放不重复。
+SIDE_EFFECT_AGENTS = frozenset({"committer", "infra-remediator"})
 
 
 class WorkflowNodeFailed(Exception):
@@ -217,8 +224,9 @@ class DAGExecutor:
         src = self.node_states.get(edge.source)
         if src is None:
             return False
-        # DONE/REJECTED 都产生了输出，可对 when 条件求值（REJECTED → 下游拒绝路径）
-        if src["status"] not in (DONE, REJECTED):
+        # DONE/REJECTED/REJECTED_CANCELED 都产生了输出，可对 when 条件求值
+        # （REJECTED* → 下游拒绝路径；审批超时后 resume 必须能沿拒绝路径收敛）
+        if src["status"] not in (DONE, REJECTED, REJECTED_CANCELED):
             return False  # 未执行 / SKIPPED（输出 None）→ INACTIVE
         if edge.when is not None:
             return bool(eval_condition(edge.when, self.node_states))
@@ -304,7 +312,7 @@ class DAGExecutor:
                     input_masked=mask_input(inp) if inp is not None else None,
                     actor=node.agent,
                 )
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.exception("[%s] flush node_trace %s 失败（忽略，不影响 run）", self.run_id, nid)
 
     async def _mark_skipped(self, nid: str) -> None:
@@ -354,13 +362,41 @@ class DAGExecutor:
                 )
                 log.info("[%s] ⭐ approval %s -> waiting_approval", self.run_id, nid)
 
-    async def _run_with_retry(self, node: Node, params: dict) -> Any:
+    def _external_operation_id(self, node: Node, ctx: dict) -> str | None:
+        """副作用幂等键（§8.4.2/§8.4.3）。
+
+        - 声明 ``idempotency_key``（支持 ``$.`` 引用，按 params 同规则解析）→ 解析出
+          可用值则用之（跨 run 去重，如 repo+base_sha）；解析失败回退确定性默认键。
+        - 未声明但属副作用 agent（committer/infra-remediator）→ ``run_id:node_id``
+          确定性键：crash 后重放同 run 同节点不会重复执行副作用（§8.4.2）。
+        - 非副作用节点 → None（不做幂等复用）。
+        """
+        declared = node.idempotency_key
+        key: str | None = None
+        if declared:
+            resolved = _resolve_param(declared, ctx)
+            if _usable(resolved):
+                key = str(resolved)
+            else:
+                log.warning(
+                    "[%s] %s idempotency_key %r 解析为空，回退确定性键",
+                    self.run_id, node.id, declared,
+                )
+        if key is None and (node.agent in SIDE_EFFECT_AGENTS or declared):
+            key = f"{self.run_id}:{node.id}"
+        return key
+
+    async def _run_with_retry(
+        self, node: Node, params: dict, external_operation_id: str | None = None
+    ) -> Any:
         """幂等执行 + retry + on_failure 策略（§8.4 / §8.1 on_failure）。
 
         - **入参预检**：``node.require`` 里的键解析后不可用（None/空串/空容器）→ 立即
           走 on_error（不调 agent、不空转）。输入有问题直接失败（NodeInputError）。
         - **可选墙钟上限**：``node.timeout``（秒）存在时，单次尝试用 ``asyncio.wait_for``
           限时，超时按节点失败处理（防止网络/模型侧无限等待而整条链卡死）。
+        - **副作用幂等**：``external_operation_id`` 非空时，同 run+node+键 已有成功
+          记录则直接复用结果，不重复执行（§8.4.2）。
         """
 
         async def invoke() -> Any:
@@ -399,6 +435,7 @@ class DAGExecutor:
             action=action,
             max_attempts=node.retry + 1,
             on_error=on_error,
+            external_operation_id=external_operation_id,
         )
 
     async def _exec_node(self, nid: str) -> None:
@@ -420,7 +457,9 @@ class DAGExecutor:
         self.node_states[nid]["params"] = params
         await self._persist(nid)
         try:
-            output = await self._run_with_retry(node, params)
+            output = await self._run_with_retry(
+                node, params, external_operation_id=self._external_operation_id(node, ctx)
+            )
             state: dict = {"status": DONE, "output": output, "params": params}
             # 真实 node_runner（AgentNodeRunner）暴露 take_usage → 合并 token/cost 计量
             # （按节点 pop，防并行 agent 波串扰）；mock _default_runner 无该方法 → 保持无计量
@@ -487,6 +526,12 @@ class DAGExecutor:
             aid, APPROVAL_WAITING, to_status, by=by, comment=comment
         )
         if not ok:
+            # CAS 失败区分两种情况：已被并发推进 / 已过 timeout_at（§8.3.2 时间谓词）
+            ap = await self.store.get_approval(self.run_id, nid)
+            if ap and ap["status"] == APPROVAL_TIMED_OUT:
+                raise ApprovalRaceError(
+                    f"审批 {nid} 已超时（TIMED_OUT，终态不可逆），不可再批"
+                )
             raise ApprovalRaceError(f"审批 {nid} CAS 冲突：已被并发操作推进")
 
         output = {
@@ -522,7 +567,7 @@ class DAGExecutor:
     ) -> DAGExecutor:
         """从 StateStore 的节点级 checkpoint 重建执行器（§8.4 / §4.4 Resume）。
 
-        - 终态（done/skipped/rejected）回填输出；
+        - 终态（done/skipped/rejected/rejected-canceled）回填输出；
         - waiting_approval 保留原状（审批通过后继续，不重复审批）；
         - 其余节点重置为 pending 重新执行。
         """
@@ -533,7 +578,8 @@ class DAGExecutor:
             st.pop("tenant_id", None)
             st.setdefault("output", None)
             st.pop("params", None)  # checkpoint 不存参数，避免陈旧
-            if st.get("status") not in (DONE, SKIPPED, WAITING_APPROVAL, REJECTED):
+            # 终态 + waiting_approval 保留；failed/cancelled/running 重置为 pending
+            if st.get("status") not in TERMINAL and st.get("status") != WAITING_APPROVAL:
                 st = {"status": PENDING, "output": None}
             ex.node_states[nid] = st
         return ex

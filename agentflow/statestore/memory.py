@@ -1,11 +1,26 @@
-# -*- coding: utf-8 -*-
 """InMemory StateStore（本地测试 / 单进程 MVP）。"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
-from .base import APPROVAL_WAITING, StateStore
+from .base import APPROVAL_WAITING, StateStore, approval_time_guard
+
+
+def _parse_deadline(value: Any) -> datetime | None:
+    """timeout_at 兼容 datetime / ISO 字符串；naive 视为 UTC（对齐 sweeper 规则）。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        deadline = value
+    else:
+        try:
+            deadline = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=UTC)
+    return deadline
 
 
 class InMemoryStateStore(StateStore):
@@ -86,6 +101,16 @@ class InMemoryStateStore(StateStore):
         a = self._approvals.get(approval_id)
         if not a or a["status"] != from_status:
             return False
+        # §8.3.2 时间原子判定（与 sqlite/postgres SQL 谓词同语义）
+        guard = approval_time_guard(from_status, to_status)
+        if guard is not None:
+            deadline = _parse_deadline(a.get("timeout_at"))
+            now = datetime.now(UTC)
+            if guard == "expired":
+                if deadline is None or deadline > now:
+                    return False
+            elif deadline is not None and deadline <= now:
+                return False
         a["status"] = to_status
         if by is not None:
             a["approved_by"] = by
@@ -127,7 +152,7 @@ class InMemoryStateStore(StateStore):
             "tenant_id": tenant_id, "tool_name": tool_name, "decision": decision,
             "run_id": run_id, "node_id": node_id, "input_masked": input_masked,
             "actor": actor,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
         })
 
     async def get_audit_logs(self, *, tenant_id=None, run_id=None, limit=100) -> list[dict]:
@@ -144,7 +169,7 @@ class InMemoryStateStore(StateStore):
             t for t in self._traces
             if not (t["run_id"] == run_id and t["node_id"] == node_id)
         ]
-        ts = datetime.now(timezone.utc).isoformat()
+        ts = datetime.now(UTC).isoformat()
         for i, r in enumerate(rows):
             self._traces.append({
                 "id": self._trace_seq,

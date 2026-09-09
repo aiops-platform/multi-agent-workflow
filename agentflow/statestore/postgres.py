@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """PostgreSQL StateStore（design §8.8 完整表结构，M6 生产适配器）。
 
 与 sqlite 实现同接口（runs/nodes/approvals/node_attempts/workflow_snapshots/audit_logs，
@@ -9,7 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .base import APPROVAL_WAITING, StateStore
+from .base import APPROVAL_WAITING, StateStore, approval_time_guard
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS workflow_snapshots (
@@ -189,9 +188,20 @@ class PostgresStateStore(StateStore):
         return {r[0]: r[1] for r in rows}
 
     async def update_node_status(self, run_id, node_id, status, output=None) -> None:
+        # 与 sqlite 同语义：cp 必须与 status/output 列同步（Resume 读 cp），
+        # 否则 from_checkpoint 拿到陈旧 checkpoint（审批超时卡死教训）。
+        cur = await self._c.execute(
+            "SELECT cp FROM nodes WHERE run_id=%s AND node_id=%s", (run_id, node_id)
+        )
+        row = await cur.fetchone()
+        cp = dict(row[0]) if row and row[0] else {}
+        cp["status"] = status
+        if output is not None:
+            cp["output"] = output
         await self._c.execute(
-            "UPDATE nodes SET status=%s, output=%s::jsonb WHERE run_id=%s AND node_id=%s",
-            (status, _j(output) if output is not None else None, run_id, node_id),
+            "UPDATE nodes SET status=%s, output=%s::jsonb, cp=%s::jsonb"
+            " WHERE run_id=%s AND node_id=%s",
+            (status, _j(output) if output is not None else None, _j(cp), run_id, node_id),
         )
         await self._c.commit()
 
@@ -228,11 +238,17 @@ class PostgresStateStore(StateStore):
         return self._approval_dict(_row_to_dict(cur, row)) if row else None
 
     async def cas_update_approval(self, approval_id, from_status, to_status, *, by=None, comment=None) -> bool:
-        cur = await self._c.execute(
+        sql = (
             "UPDATE approvals SET status=%s, approved_by=%s, comment=%s"
-            " WHERE approval_id=%s AND status=%s",
-            (to_status, by, comment, approval_id, from_status),
+            " WHERE approval_id=%s AND status=%s"
         )
+        # §8.3.2 时间原子判定：timeout_at 为 TIMESTAMPTZ，直接用服务器时钟 NOW()
+        guard = approval_time_guard(from_status, to_status)
+        if guard == "expired":
+            sql += " AND timeout_at IS NOT NULL AND timeout_at <= NOW()"
+        elif guard == "unexpired":
+            sql += " AND (timeout_at IS NULL OR timeout_at > NOW())"
+        cur = await self._c.execute(sql, (to_status, by, comment, approval_id, from_status))
         await self._c.commit()
         return cur.rowcount == 1
 

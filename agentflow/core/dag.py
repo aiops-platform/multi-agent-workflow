@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """DAG 拓扑模型 + 静态校验（design §8.2）。
 
 核心语义（§8.2.1 / §8.2.2）：
@@ -27,8 +26,11 @@ DONE = "done"
 SKIPPED = "skipped"
 WAITING_APPROVAL = "waiting_approval"
 REJECTED = "rejected"
+# 审批超时被 sweeper 自动拒绝（§8.9）：语义等同 REJECTED（终态、有 output、
+# 下游拒绝路径边可求值），但与人工 REJECTED 区分，供前端单独渲染。
+REJECTED_CANCELED = "rejected-canceled"
 
-TERMINAL = {DONE, SKIPPED, REJECTED}
+TERMINAL = {DONE, SKIPPED, REJECTED, REJECTED_CANCELED}
 
 # 边状态
 EDGE_ACTIVE = "active"
@@ -64,6 +66,10 @@ class Node:
     # agent 节点可选墙钟上限（秒，可小数）；None = 不设限。
     # 注意：审批节点把 YAML 顶层 timeout 折叠进 params（等待审批超时），语义不同。
     timeout: float | None = None
+    # 副作用幂等键（§8.4.3）：声明后执行前先按同 run+node+key 查成功记录，命中则
+    # 复用结果不重复执行。支持 `$.` 引用（按 params 同规则解析）或字面量；
+    # 未声明时，副作用 agent（committer/infra-remediator）用 run+node 确定性键兜底。
+    idempotency_key: str | None = None
 
     @property
     def is_approval(self) -> bool:
@@ -95,7 +101,7 @@ class DAG:
     # 构建
     # ------------------------------------------------------------------
     @classmethod
-    def build(cls, raw_nodes: dict, raw_edges: list[dict] | None = None) -> "DAG":
+    def build(cls, raw_nodes: dict, raw_edges: list[dict] | None = None) -> DAG:
         """从 YAML 解析后的 ``nodes`` / ``edges`` 构建 DAG。
 
         ``raw_edges`` 为 None 时回退到节点内联 ``upstreams`` + ``when``（spike 兼容）。
@@ -113,6 +119,7 @@ class DAG:
             params = spec.pop("params", {}) or {}
             on_failure = spec.pop("on_failure", "abort")
             on_reject = spec.pop("on_reject", "abort")
+            idempotency_key = spec.pop("idempotency_key", None)
             require = spec.pop("require", []) or []
             if isinstance(require, str):
                 require = [require]
@@ -136,6 +143,7 @@ class DAG:
                 params=params,
                 on_failure=on_failure,
                 on_reject=on_reject,
+                idempotency_key=idempotency_key,
                 require=require,
                 timeout=(float(timeout_raw) if timeout_raw is not None else None),
             )

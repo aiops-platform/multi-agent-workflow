@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """StateStore 接口 + 数据模型（design §8.8 完整表结构）。
 
 本地 MVP 用 InMemory / SQLite；生产切换 PostgreSQL（M6）。所有表带
@@ -20,6 +19,21 @@ APPROVAL_APPROVED = "APPROVED"
 APPROVAL_REJECTED = "REJECTED"
 APPROVAL_TIMED_OUT = "TIMED_OUT"
 APPROVAL_TERMINAL = {APPROVAL_APPROVED, APPROVAL_REJECTED, APPROVAL_TIMED_OUT}
+
+
+def approval_time_guard(from_status: str, to_status: str) -> str | None:
+    """CAS 更新审批时需要的时间谓词种类（§8.3.2 ``AND timeout_at > NOW()``）。
+
+    - ``'unexpired'``：WAITING → APPROVED/REJECTED 仅允许在超时窗口内（审批过期即不可批，
+      堵住「已超时但 sweeper 尚未扫到」窗口内 approve 仍能成功的竞态）。
+    - ``'expired'``：WAITING → TIMED_OUT 仅允许在超时后（sweeper 语义）。
+    - ``None``：其余转换不加时间谓词（状态谓词已足够，如终态不可逆）。
+    """
+    if from_status != APPROVAL_WAITING or to_status == APPROVAL_WAITING:
+        return None
+    if to_status == APPROVAL_TIMED_OUT:
+        return "expired"
+    return "unexpired"
 
 
 class StateStore(ABC):
@@ -89,7 +103,11 @@ class StateStore(ABC):
         by: str | None = None,
         comment: str | None = None,
     ) -> bool:
-        """CAS 更新：仅当当前状态 == from_status 才更新为 to_status。返回是否成功。"""
+        """CAS 更新：仅当当前状态 == from_status 才更新为 to_status。返回是否成功。
+
+        除状态谓词外，还须按 :func:`approval_time_guard` 施加时间原子判定
+        （approve/reject 仅未超时可批；TIMED_OUT 仅超时后可置，§8.3.2）。
+        """
 
     # ---- node_attempts：副作用幂等（§8.4）----
     @abstractmethod
