@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """node_traces 全链路测试：采集 → 落库 → API 读取。
 
 覆盖四条路径（对齐 transcript.py / executor._flush_node_trace / app.get_run_traces）：

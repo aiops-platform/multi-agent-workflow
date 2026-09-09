@@ -31,6 +31,7 @@ from ..core.dag import (
     Node,
 )
 from ..core.expressions import eval_condition
+from ..exec_context import current_tenant
 from ..statestore.base import (
     APPROVAL_APPROVED,
     APPROVAL_REJECTED,
@@ -455,6 +456,16 @@ class DAGExecutor:
             return
         if decision != "ready":
             return
+
+        # 节点执行期的租户上下文（v5.3 §7）：node_runner（AgentNodeRunner）经
+        # current_tenant 读取 → per-tenant MCP store / per-tenant agent 配置路由
+        _tenant_token = current_tenant.set(self.tenant_id)
+        try:
+            await self._exec_node_inner(nid, node)
+        finally:
+            current_tenant.reset(_tenant_token)
+
+    async def _exec_node_inner(self, nid: str, node: Node) -> None:
 
         self.node_states[nid]["status"] = RUNNING
         ctx = {"nodes": self.node_states, "inputs": self.inputs}

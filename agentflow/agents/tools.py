@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """工具治理（design §7 Tool Registry + §10.4 Tool Governance）。
 
 L1：只读工具（Agent 容器内本地执行 / 数据源 MCP）。
@@ -8,7 +7,7 @@ Tool Registry 定义：agent 可见性 / 超时 / 限流 / 结果上限。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """SandboxClient：Worker → 沙箱 Pod exec 服务的 HTTP 客户端（design §4.1 gRPC 的本地形态）。
 
 - ``run_shell`` / ``run_python`` / ``write_file``：对应沙箱 L2 工具（§7 Tool Registry）

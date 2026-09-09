@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 """InMemory Queue（本地测试 / 单进程 MVP）。"""
 from __future__ import annotations
 
 import asyncio
 from collections import defaultdict, deque
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
 
 from .base import Queue
 

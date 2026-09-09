@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Queue 适配层：配置驱动切换（design §5）。"""
 from __future__ import annotations
 

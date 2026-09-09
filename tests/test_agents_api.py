@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """API 控制面测试：GET /agents（静态 agent 编队列表）。
 
 用 httpx.AsyncClient + ASGITransport 驱动 FastAPI 应用——ASGITransport **不触发**

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """ToolPolicy：租户级工具权限 + 资源限制（design §9.5 / §10.2）。
 
 - 决策：deny 优先 → allow → 兜底 DENY（§9.5）

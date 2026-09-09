@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """审批通知（design §5/§8.3 审批流）。
 
 本地 MVP：日志通知（approvers 队列、通知渠道为占位接口，M6 接邮件/Slack/webhook）。

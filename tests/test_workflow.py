@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """M0：Workflow 加载 + 版本冻结 + 静态校验（design §8.1 / §8.2.3 / §8.5）。"""
 from __future__ import annotations
 

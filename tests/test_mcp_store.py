@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """MCPStore CRUD 存储测试：/mcp_servers 表往返 / 列表 / 更新·删除哨兵 / enabled 过滤。
 
 对齐 test_workflow_store 语义；MCPStore 是 aiosqlite 惰性连接，测试可直接用（无需 lifespan）。

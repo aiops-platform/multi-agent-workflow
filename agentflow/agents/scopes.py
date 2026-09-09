@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """AgentScope 2.0.3 适配层（design §5 锁定版本）。
 
 复用 S-011 实测通过的构建模式（`Agent` + `reply` + `Toolkit`，prompt 要求只输出
@@ -6,15 +5,19 @@
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import re
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
 
 from agentscope.agent import Agent, ReActConfig
-from agentscope.message import Msg, TextBlock, ToolCallBlock, UserMsg
+from agentscope.message import TextBlock, ToolCallBlock, UserMsg
 from agentscope.model import ChatModelBase
-from agentscope.permission import PermissionBehavior, PermissionContext, PermissionMode, PermissionRule
+from agentscope.permission import (
+    PermissionBehavior,
+    PermissionContext,
+    PermissionMode,
+    PermissionRule,
+)
 from agentscope.state import AgentState
 
 from ..config import Settings, get_settings

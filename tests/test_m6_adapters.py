@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """M6：生产适配器 —— RedisLock（fakeredis）/ KafkaQueue（mock）/ PostgresStateStore（构造）。
 
 真实 broker/DB 的故障恢复（Kafka 重放、PG 回滚）需生产环境验证（design §14），
@@ -7,7 +6,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 
 import pytest
 

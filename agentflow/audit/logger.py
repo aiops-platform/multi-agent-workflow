@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """审计日志记录（design §9.5 审计字段 + §8.8 审计表）。
 
 每次工具调用写一条：tenant_id / tool_name / decision / run_id + node_id /

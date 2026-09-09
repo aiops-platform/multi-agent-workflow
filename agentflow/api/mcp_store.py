@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """MCPStore：MCP server 配置持久化（供 SIP「MCP Server 配置」页面 CRUD + 运行时 MCPClientManager 读取）。
 
 与运行期 StateStore / WorkflowStore 同库异表（复用 settings.state_db_path），aiosqlite 惰性连接
@@ -14,7 +13,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +53,7 @@ def _dumps_nullable(obj: Any) -> str | None:
 
 def _to_row(data: dict[str, Any]) -> dict[str, Any]:
     """把写入方传入的业务 dict 规整为列值 dict（含时间戳），交给 INSERT/UPDATE。"""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     return {
         "name": data["name"],
         "transport": data["transport"],
@@ -191,7 +190,7 @@ class MCPStore:
         cur = await self._c.execute(
             "UPDATE mcp_servers SET tools=?, updated_at=? WHERE id=?",
             (json.dumps(tools, ensure_ascii=False) if tools is not None else None,
-             datetime.now(timezone.utc).isoformat(), mid),
+             datetime.now(UTC).isoformat(), mid),
         )
         await self._c.commit()
         return cur.rowcount == 1
@@ -290,7 +289,7 @@ class PgMCPStore:
                  col["enable_tools"], col["disable_tools"], col["tools"],
                  col["enabled"], col["updated_at"], col["updated_at"]),
             )
-        except Exception as exc:  # noqa: BLE001 —— 只认 unique violation，其余原样上抛
+        except Exception as exc:
             from psycopg.errors import UniqueViolation
 
             if isinstance(exc, UniqueViolation):
@@ -335,7 +334,7 @@ class PgMCPStore:
         cur = await self._c.execute(
             "UPDATE mcp_servers SET tools=%s, updated_at=%s WHERE id=%s",
             (json.dumps(tools, ensure_ascii=False) if tools is not None else None,
-             datetime.now(timezone.utc).isoformat(), mid),
+             datetime.now(UTC).isoformat(), mid),
         )
         await self._c.commit()
         return cur.rowcount == 1

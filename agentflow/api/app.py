@@ -35,7 +35,7 @@ from ..core.workflow import Workflow
 from ..executor.dag_executor import ApprovalRaceError
 from ..lock import build_lock
 from ..queue import build_queue
-from ..service import ApproverNotAllowed, RunService, TenantQuotaExceeded
+from ..service import ApproverNotAllowed, InputsValidationError, RunService, TenantQuotaExceeded
 from ..statestore.router import TenantStoresRouter
 from ..tenants import TenantRegistry, async_bootstrap_tenants
 from ..worker import WorkerPool
@@ -83,6 +83,8 @@ mcp_manager = MCPClientManager(mcp_store)
 # AgentSpec 配置解析器（DB 覆盖 + 内置静态回退）：init()/CRUD 后经 _reload_agent_config_resolver 重建，
 # 并重接 mcp_manager.server_ids_for（agent→MCP server 绑定，server 粒度）。
 _agent_config_resolver: AgentConfigResolver | None = None
+_resolver_cache: dict[str, tuple[int, AgentConfigResolver]] = {}
+_resolver_generation = 0
 
 # CORS：允许前端跨域调用控制面 API。来源可配（AGENTFLOW_CORS_ORIGINS 逗号分隔，默认 *）。
 # allow_origins=* 时不可开启 allow_credentials（浏览器规范限制）；JWT 走 Authorization 头不受影响。
@@ -167,14 +169,19 @@ async def _reload_agent_config_resolver(tenant_id: str | None = None) -> AgentCo
     init（seed 后）与每次 /agent-configs CRUD 后调用，保证运行时 + GET /agents 读到最新
     DB 覆盖/自定义 agent。构造不做 DB I/O 之外的重活（内存行索引）。
     """
-    global _agent_config_resolver
+    global _agent_config_resolver, _resolver_generation
+    _resolver_generation += 1  # per-tenant 代际缓存失效（CRUD 后重建）
     if stores_router is not None:
         bundle = await stores_router.get(tenant_id or "local")
         rows = await bundle.agent_config.list()
     else:  # 单租户回退（测试/未 init）
         rows = await agent_config_store.list()
     _agent_config_resolver = AgentConfigResolver(rows)
-    mcp_manager.server_ids_for = _agent_config_resolver.server_ids_for
+    async def _tenant_server_ids_for(agent_name: str, tenant_id: str | None = None):
+        resolver = await _agent_config_provider(tenant_id)
+        return resolver.server_ids_for(agent_name)
+
+    mcp_manager.server_ids_for = _tenant_server_ids_for
     # 运行中 node_runner 持 init() 时传入的 resolver 对象快照：CRUD 只重建模块全局 + 重接
     # mcp_manager，若不把新实例重指向 runner，启动后新建/补写 system_prompt 的 agent 在后续 run
     # 里仍按旧快照解析（NULL→默认提示），表现为输出退化（如只有默认提示没有 JSON 契约 → {}）。
@@ -251,6 +258,24 @@ async def init() -> RunService:
     tenant_registry = await TenantRegistry.from_management(management_store)
     # ── 租户库路由（P4）：tenant_id → TenantStores（state+workflow+mcp+agent_config）──
     stores_router = TenantStoresRouter(settings, management_store)
+
+    # per-tenant AgentSpec 解析器（代际缓存：CRUD 后 _reload 递增 → 失效重建）
+    async def _agent_config_provider(tenant_id: str | None) -> AgentConfigResolver:
+        key = tenant_id or "local"
+        hit = _resolver_cache.get(key)
+        if hit is not None and hit[0] == _resolver_generation:
+            return hit[1]
+        bundle = await stores_router.get(key)
+        resolver = AgentConfigResolver(await bundle.agent_config.list())
+        _resolver_cache[key] = (_resolver_generation, resolver)
+        return resolver
+
+    # per-tenant mcp store 路由（§7：租户的 mcp_servers 表在租户自己的库）
+    async def _mcp_store_provider(tenant_id: str | None):
+        bundle = await stores_router.get(tenant_id or "local")
+        return bundle.mcp
+
+    mcp_manager.stores_provider = _mcp_store_provider
     # mcp_manager：预加载全局默认租户的 MCP 连接（per-tenant 缓存在批 C 接入 runner）
     await mcp_manager.load()
     if not settings.jwt_secret:
@@ -271,6 +296,8 @@ async def init() -> RunService:
             build_model(settings),
             mcp_manager=mcp_manager,
             agent_config=resolver,
+            agent_config_provider=_agent_config_provider,
+            shared_datasources=settings.shared_datasources,
         )
         print("[agentflow] node_runner=agent（DeepSeek）：Bug Solve 页将真实调用 agent")
     queue_mode = settings.run_mode == "queue"
@@ -365,6 +392,8 @@ async def create_run(req: RunRequest, ctx: TenantContext = Depends(get_tenant_co
         out = await _service().start_run(tenant_id, workflow, inputs)
     except TenantQuotaExceeded as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except InputsValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"run_id": out["run_id"], "status": "started"}
 
 
@@ -524,7 +553,7 @@ def _mcp_create_row(req: MCPServerCreate) -> dict:
     }
 
 
-async def _mcp_snapshot(data: dict) -> list[dict[str, Any]] | None:
+async def _mcp_snapshot(data: dict, tenant_id: str | None = None) -> list[dict[str, Any]] | None:
     """best-effort 拉一次 tools/list 快照；失败返回 None（不抛，不阻断保存）。
 
     只在请求未显式携带 tools 时调用（create/update 缺省自动探测）；目标 server 不可达/慢 →
@@ -548,12 +577,12 @@ async def create_mcp_server(req: MCPServerCreate, ctx: TenantContext = Depends(g
     """
     cs = await _control_stores(ctx)
     data = _mcp_create_row(req)
-    data["tools"] = await _mcp_snapshot(data)
+    data["tools"] = await _mcp_snapshot(data, ctx.tenant_id)
     try:
         mid = await cs.mcp.save(data)
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="name 已存在（MCP server 名需唯一）") from None
-    await mcp_manager.refresh_server(mid)  # 重建 + best-effort connect（失败仅 log）
+    await mcp_manager.refresh_server(mid, tenant_id=ctx.tenant_id)  # 重建 + best-effort connect
     return {"id": mid}
 
 
@@ -615,7 +644,7 @@ async def update_mcp_server(
         raise HTTPException(status_code=400, detail="name 已存在（MCP server 名需唯一）") from None
     if not hit:  # 并发删除兜底
         raise HTTPException(status_code=404, detail="MCP server 不存在")
-    await mcp_manager.refresh_server(mid)
+    await mcp_manager.refresh_server(mid, tenant_id=ctx.tenant_id)
     return {"ok": True, "id": mid}
 
 
@@ -625,7 +654,7 @@ async def delete_mcp_server(mid: str, ctx: TenantContext = Depends(get_tenant_co
     cs = await _control_stores(ctx)
     if not await cs.mcp.delete(mid):
         raise HTTPException(status_code=404, detail="MCP server 不存在")
-    await mcp_manager.refresh_server(mid)  # store 中已无该行 → 仅 evict
+    await mcp_manager.refresh_server(mid, tenant_id=ctx.tenant_id)  # 已无该行 → 仅 evict
     return {"ok": True}
 
 

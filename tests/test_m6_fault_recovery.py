@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """M6：故障恢复专项测试（design §14）。
 
 - Worker SIGKILL 恢复：Worker 被杀后，新 Worker 从 StateStore checkpoint 恢复，
@@ -11,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 
-from agentflow.core.dag import DONE, WAITING_APPROVAL
+from agentflow.core.dag import DONE
 from agentflow.core.workflow import Workflow
 from agentflow.executor.dag_executor import DAGExecutor
 from agentflow.statestore.sqlite import SqliteStateStore
@@ -64,7 +63,6 @@ async def test_worker_sigkill_resume_no_redo() -> None:
 
 async def test_worker_sigkill_mid_execution_resumes() -> None:
     """Worker 在节点执行中被杀（模拟 task 取消）→ 恢复后 run 仍可收敛。"""
-    from agentflow.core.dag import SKIPPED
 
     wf = Workflow.load_yaml(PARALLEL_YAML)
     store = await _db()

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """AgentSpec 运行时解析器：把 DB 配置（agent_configs）与静态内置默认合并成最终生效值。
 
 纯 agents 层，**不依赖 api 包**（避免 agents→api 反向依赖）。构造时喂入 ``AgentConfigStore.list()``

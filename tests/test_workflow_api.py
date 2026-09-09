@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """workflow CRUD API 测试：/workflows 保存/列表/读取/更新/删除 + /workflows/preview 预览。
 
 与 test_cors.py / test_agents_api.py 同款：httpx.AsyncClient + ASGITransport（不触发 lifespan）。

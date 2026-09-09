@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """15 个职能智能体的 system prompt 模板（design §7）。
 
 诊断侧（triage / log-analyst / root-cause）直接复用 S-011 实测通过的模板

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """全局配置：LLM + 基础设施适配层后端切换。
 
 本地 MVP 与生产统一架构（design §3）：核心逻辑 100% 共享，基础设施通过
@@ -64,6 +63,12 @@ class Settings(BaseSettings):
     tenants_file: str = ""
     # db_ref/凭证加密密钥（Fernet, 32B urlsafe base64，§5.3）；缺省从 jwt_secret 派生（告警）
     secret_key: str = ""
+
+    # ---- 数据面姿态（v5.3 §7/P1）----
+    # False（默认，生产加固姿态）：不注入内置共享数据源工具（ES/Prometheus/kubectl——
+    #   诊断 agent 的数据工具一律来自租户 MCP 绑定），并封堵 inputs.repos 直传；
+    # True（dev/testbed 联调）：注入共享数据源工具 + 允许 inputs.repos（启动告警）。
+    shared_datasources: bool = False
 
     # ---- 沙箱（M4）----
     open_sandbox_domain: str = "localhost:8080"

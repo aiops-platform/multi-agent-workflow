@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """MCP server 配置 API 测试：CRUD / 校验（400 中文）/ 测试连接 / 热刷新调用。
 
 与 test_workflow_api 同款：httpx + ASGITransport（不触发 lifespan）。
@@ -47,7 +46,7 @@ class _FakeManager:
         self.closed = False
         self.test_names: list[str] = []  # 记录每次 test_connection 收到的 name（验证 name 透传）
 
-    async def refresh_server(self, mid: str) -> None:
+    async def refresh_server(self, mid: str, tenant_id: str | None = None) -> None:
         self.refreshed.append(mid)
 
     async def close_all(self) -> None:

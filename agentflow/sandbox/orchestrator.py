@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """SandboxOrchestrator：动态拉起/销毁沙箱 Pod（design §4.1 / §10.2）。
 
 推理容器（Worker/Agent）与执行容器（沙箱）分离：沙箱是独立 Pod，非特权、
@@ -14,7 +13,8 @@ from __future__ import annotations
 
 import logging
 
-from kubernetes import client, config as k8s_config
+from kubernetes import client
+from kubernetes import config as k8s_config
 
 log = logging.getLogger("agentflow.sandbox")
 

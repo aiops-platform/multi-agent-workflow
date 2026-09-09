@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Resume / 断点续跑编排（design §4.4 / §8.5 / §8.6）。
 
 流程可在任意节点停止后恢复：节点级 checkpoint 已持久化（每节点完成后落盘），
@@ -9,7 +8,6 @@ from __future__ import annotations
 
 import logging
 
-from ..core.dag import DAG
 from ..core.workflow import Workflow
 from ..statestore.base import StateStore
 from .dag_executor import DAGExecutor, NodeRunner

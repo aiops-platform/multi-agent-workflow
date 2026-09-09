@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """AgentConfigResolver 测试：DB 覆盖/内置静态默认合并解析（agents 层，纯内存构造）。
 
 纯构造入参（store.list() 形状的行），不碰 DB：验证 merge（NULL→静态回退）、

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """共享测试 fixture。"""
 from __future__ import annotations
 

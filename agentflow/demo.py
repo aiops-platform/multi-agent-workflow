@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """脚本化 demo：跑通 bug-fix-pipeline 全链路（诊断 → 修复 → 合并审批 → 测试 → 提交）。
 
 使用确定性 mock runner（不调用真实 LLM），验证编排语义；真实 LLM 接入见
@@ -7,10 +6,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 
-from .core.dag import DONE, SKIPPED, WAITING_APPROVAL
 from .core.workflow import Workflow
 from .service import RunService
 from .statestore.memory import InMemoryStateStore

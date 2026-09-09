@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """沙箱 exec 服务（运行在沙箱 Pod 内，design §10.2 生产安全基线）。
 
 **纯 Python stdlib 实现**（http.server + json）：镜像零 pip 依赖，
@@ -149,7 +148,7 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             self._send(500, {"error": str(exc)})
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         if self.path == "/exec":
             self._dispatch("/exec")
         elif self.path == "/python":
@@ -159,7 +158,7 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"error": f"unknown: {self.path}"})
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         if self.path == "/health":
             self._send(200, {
                 "status": "ok",

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """CORS 测试：控制面 API 允许前端跨域调用（默认 allow_origins=*）。
 
 与 test_agents_api.py 同款：httpx.AsyncClient + ASGITransport（不触发 lifespan）。

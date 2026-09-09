@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Toolkit 组装（design §5 AgentScope 原生支持 / §7 数据源 / MCP Server 配置共存）。
 
 集成模式已在 spike 验证：
@@ -51,6 +50,7 @@ def _build_function_tools(
     agent_name: str,
     *,
     use_mock: bool = True,
+    shared_datasources: bool = True,
     cmdb=None,
     datasource=None,
     sandbox_client=None,
@@ -58,18 +58,21 @@ def _build_function_tools(
 ) -> list[FunctionTool]:
     """L1（只读）+ L2（执行）function tool 包装。
 
-    - L1：传 ``cmdb``→CMDB 定位，传 ``datasource``→真实 testbed，否则 mock。
+    - L1：传 ``cmdb``→CMDB 定位，传 ``datasource``→真实 testbed，否则 mock；
+      ``shared_datasources=False``（v5.3 §7/P1 加固姿态）→ **不构建任何 L1 工具**
+      （诊断 agent 的数据工具一律来自租户 MCP 绑定，共享数据源是唯一绕过后门）。
     - L2：传 ``sandbox_client``（SandboxClient）→ 沙箱 run/write 工具；传
       ``action_executor``（ActionExecutor）→ §10.3 白名单动作工具；未传执行器时 L2 不可用。
     """
     tools: list[FunctionTool] = []
-    for t in build_l1_tools(agent_name, use_mock=use_mock, cmdb=cmdb, datasource=datasource):
-        if t["func"] is None:
-            continue
-        tools.append(FunctionTool(
-            func=t["func"], name=t["name"], description=t["description"],
-            is_read_only=True,  # L1 只读
-        ))
+    if shared_datasources:
+        for t in build_l1_tools(agent_name, use_mock=use_mock, cmdb=cmdb, datasource=datasource):
+            if t["func"] is None:
+                continue
+            tools.append(FunctionTool(
+                func=t["func"], name=t["name"], description=t["description"],
+                is_read_only=True,  # L1 只读
+            ))
     for t in build_l2_tools(agent_name, sandbox_client=sandbox_client, action_executor=action_executor):
         if t["func"] is None:
             continue
@@ -84,6 +87,7 @@ def build_toolkit(
     agent_name: str,
     *,
     use_mock: bool = True,
+    shared_datasources: bool = True,
     mcp_clients: list | None = None,
     cmdb=None,
     datasource=None,
@@ -95,10 +99,12 @@ def build_toolkit(
     向后兼容：既有调用方（scripts / tests / runner）都只传 ``use_mock`` 且不带
     ``mcp_clients`` → 结果等价于旧行为（纯 function tools）；传入 ``mcp_clients`` 时
     在 function tools 基础上叠加 MCP 工具（``Toolkit(tools=..., mcps=...)``）。
+    ``shared_datasources=False``（P1 加固）→ 不含内置共享数据源 L1 工具。
     """
     func_tools = _build_function_tools(
         agent_name,
         use_mock=use_mock,
+        shared_datasources=shared_datasources,
         cmdb=cmdb,
         datasource=datasource,
         sandbox_client=sandbox_client,

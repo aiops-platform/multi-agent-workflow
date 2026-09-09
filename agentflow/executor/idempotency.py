@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """副作用幂等（design §8.4：execution_id + external_operation_id）。
 
 - 每个节点执行生成唯一 ``execution_id``，写 node_attempts 表。
@@ -9,7 +8,8 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from ..statestore.base import StateStore
 

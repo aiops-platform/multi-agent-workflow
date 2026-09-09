@@ -1,9 +1,7 @@
-# -*- coding: utf-8 -*-
 """InMemory Lock（本地测试 / 单进程 MVP）。"""
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
 
 from .base import Lock
 

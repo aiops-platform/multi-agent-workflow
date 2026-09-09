@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """AgentConfigStore 测试：sqlite CRUD / name 冲突 / ""→NULL 归整 / JSON 列往返 /
 seed 幂等 / builder 选择。
 

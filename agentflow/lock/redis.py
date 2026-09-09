@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Redis Lock（design §5 分布式锁，M6 生产适配器）。
 
 基于 SET key value NX PX ttl：CAS 式原子获取；释放仅删自己持有的 key。

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """AgentNodeRunner × AgentConfigResolver 接线测试：enabled/disabled 短路 + system_prompt 覆盖透传。
 
 monkeypatch runner 模块级的 build_agent/run_agent/build_toolkit/build_permission_context，

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """M3：WorkspaceManager —— base_sha 冻结 / 分支隔离 / 幂等 / 无 git_pull（design §8.7/§4.6）。"""
 from __future__ import annotations
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """AgentConfigStore：AgentSpec 配置持久化（供 SIP「Agent 配置」页 CRUD + 运行时 AgentNodeRunner 读取）。
 
 与运行期 StateStore / 控制面 workflows / mcp_servers 同库异表（复用 settings.state_db_path），
@@ -21,7 +20,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -85,7 +84,7 @@ def _opt_ids(value: Any) -> str | None:
 
 def _to_row(data: dict[str, Any]) -> dict[str, Any]:
     """把写入方传入的业务 dict 规整为列值 dict（含时间戳），交给 INSERT/UPDATE。"""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     return {
         "name": data["name"],
         "origin": data.get("origin", "builtin"),
@@ -296,7 +295,7 @@ class PgAgentConfigStore:
                  col["system_prompt"], col["schema_json"], col["mcp_server_ids"], col["enabled"],
                  col["reasoning_enabled"], col["updated_at"], col["updated_at"]),
             )
-        except Exception as exc:  # noqa: BLE001 —— 只认 unique violation，其余原样上抛
+        except Exception as exc:
             from psycopg.errors import UniqueViolation
 
             if isinstance(exc, UniqueViolation):
@@ -360,8 +359,8 @@ async def seed_builtin_agent_configs(store) -> int:
     - 物化后语义：内置行是非 NULL 快照 → 改代码 SYSTEM_PROMPTS/AGENT_SCHEMAS 不再自动生效；
       要让某内置跟随代码，UI 清空该字段保存（→NULL 即回退），下次启动回填会固化为当前默认。
     """
-    from ..agents.registry import AGENT_DESCRIPTIONS, AGENT_STAGES, DIAGNOSE_AGENTS, FIX_AGENTS
     from ..agents.prompts import AGENT_SCHEMAS, SYSTEM_PROMPTS
+    from ..agents.registry import AGENT_DESCRIPTIONS, AGENT_STAGES, DIAGNOSE_AGENTS, FIX_AGENTS
 
     def _defaults_for(name: str) -> dict[str, Any]:
         return {

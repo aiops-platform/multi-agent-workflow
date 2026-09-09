@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """M4：Sandbox（独立执行 Pod）+ Action Executor + Tool Policy。
 
 - ``exec_service``：沙箱 Pod 内执行的 exec 服务（§10.2 限制）

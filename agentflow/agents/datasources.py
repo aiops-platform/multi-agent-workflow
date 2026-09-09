@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """真实数据源适配器（testbed 联调，design §7 数据源 / SCENARIOS §5）。
 
 与 mock 工具**签名一致**（SCENARIOS §5.2）：query_logs / query_metrics /
@@ -13,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
 
 import httpx
 
@@ -244,7 +242,7 @@ def _promql(metric: str | None, pod_re: str) -> str:
         "memory": f"sum(container_memory_working_set_bytes{{{sel}}})",
         "disk": f'sum(container_fs_usage_bytes{{pod=~"{pod_re}"}})',
         "disk_limit": f'sum(container_fs_limit_bytes{{pod=~"{pod_re}"}})',
-        "restarts": f"sum(kubelet_managed_container_restart_total) ",
+        "restarts": "sum(kubelet_managed_container_restart_total) ",
     }
     if metric in queries:
         return queries[metric]

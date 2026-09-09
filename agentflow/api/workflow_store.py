@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """WorkflowStore：流程配置页面的 workflow 持久化（供 SIP「Workflow Studio」页面使用）。
 
 与运行期 StateStore（runs/nodes/approvals）分离：本表只存「用户保存的 workflow 定义」
@@ -7,9 +6,8 @@
 """
 from __future__ import annotations
 
-import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +59,7 @@ class WorkflowStore:
         wid = uuid.uuid4().hex[:12]
         await self._c.execute(
             "INSERT INTO workflows(id, name, yaml, created_at) VALUES(?,?,?,?)",
-            (wid, name, yaml_text, datetime.now(timezone.utc).isoformat()),
+            (wid, name, yaml_text, datetime.now(UTC).isoformat()),
         )
         await self._c.commit()
         return wid
@@ -157,7 +155,7 @@ class PgWorkflowStore:
         wid = uuid.uuid4().hex[:12]
         await self._c.execute(
             "INSERT INTO workflows(id, name, yaml, created_at) VALUES(%s,%s,%s,%s)",
-            (wid, name, yaml_text, datetime.now(timezone.utc).isoformat()),
+            (wid, name, yaml_text, datetime.now(UTC).isoformat()),
         )
         await self._c.commit()
         return wid

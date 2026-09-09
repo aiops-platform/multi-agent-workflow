@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """M1：AgentScope 适配层冒烟（无 API Key 路径，ScriptedJsonModel 确定性输出）。
 
 验证 build_toolkit（FunctionTool 包装 L1 工具）+ build_agent + run_agent 的
@@ -20,7 +19,7 @@ async def test_toolkit_l1_function_registered() -> None:
 
 def test_permission_context_allow_rules_for_agent_tools() -> None:
     """§9.5：DONT_ASK + allow 规则（agent 注册工具入白名单）。"""
-    from agentscope.permission import PermissionBehavior, PermissionMode
+    from agentscope.permission import PermissionMode
 
     from agentflow.agents.scopes import build_permission_context
 

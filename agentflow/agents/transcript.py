@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """节点级明细采集：TraceRecorder（AgentScope middleware）→ ``node_traces`` 行。
 
 本模块是**纯采集**数据源：不碰 StateStore、不持有 run_id（executor 按 (run,node) 落库），
@@ -199,14 +198,14 @@ class TraceRecorder(MiddlewareBase):
                     try:
                         reasoning = "".join(reasoning_parts) or None
                         self._add_llm(messages, names, model_name, usage, reasoning)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         log.debug("transcript on_model_call record failed", exc_info=True)
 
             return _gen()
         try:
             reasoning = _reasoning_text(getattr(res, "content", None) or []) or None
             self._add_llm(messages, names, model_name, getattr(res, "usage", None), reasoning)
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.debug("transcript on_model_call record failed", exc_info=True)
         return res
 
@@ -242,7 +241,7 @@ class TraceRecorder(MiddlewareBase):
         finally:
             try:
                 await self._record_tool(agent, tc, last)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 log.debug("transcript on_acting record failed", exc_info=True)
 
     async def _record_tool(self, agent, tc, last) -> None:

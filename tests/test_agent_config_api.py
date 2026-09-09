@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """AgentSpec 配置 API 测试：CRUD / 400 中文校验 / bound_servers join / GET /agents 合并视图。
 
 httpx + ASGITransport（不触发 lifespan → 不 init()/seed/起 Sweeper）。monkeypatch app 模块全局：
@@ -11,10 +10,10 @@ import httpx
 import pytest
 
 import agentflow.api.app as app_mod
-from agentflow.api.agent_store import AgentConfigStore
 from agentflow.agents.agent_config import AgentConfigResolver
 from agentflow.agents.prompts import SYSTEM_PROMPTS
 from agentflow.agents.registry import AGENT_DESCRIPTIONS, DIAGNOSE_AGENTS, FIX_AGENTS
+from agentflow.api.agent_store import AgentConfigStore
 from agentflow.api.app import app
 
 CUSTOM = {

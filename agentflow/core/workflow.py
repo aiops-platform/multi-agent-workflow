@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Workflow 模型 + 版本冻结（design §8.1 / §8.5）。
 
 - ``Workflow.load_yaml``：从 YAML 文件 / 字符串 / dict 加载，构建 DAG。
@@ -32,7 +31,7 @@ class Workflow:
     # 加载
     # ------------------------------------------------------------------
     @classmethod
-    def load_yaml(cls, source: str | Path | dict) -> "Workflow":
+    def load_yaml(cls, source: str | Path | dict) -> Workflow:
         if isinstance(source, dict):
             raw = source
         elif isinstance(source, Path):

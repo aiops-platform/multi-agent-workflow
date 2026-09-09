@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """MCPClientManager：把 MCPStore 里的 MCP server 配置解析为 AgentScope ``MCPClient``。
 
 职责（对齐 SIP「MCP Server 配置」页 + AgentNodeRunner 运行时）：
@@ -59,14 +58,58 @@ class MCPClientManager:
     refresh 重建后 id 变化 → 自然失效重算）。
     """
 
-    def __init__(self, store: Any, *, server_ids_for=None) -> None:
+    def __init__(self, store: Any, *, server_ids_for=None, stores_provider=None) -> None:
+        # store：默认（全局/单租户回退）mcp store；stores_provider：async (tenant_id|None) → store
+        # （v5.3 §7 P4：租户的 mcp_servers 表在租户自己的库里，按租户路由）
         self._store = store
-        self._clients: dict[str, MCPClient] = {}
-        self._rows: dict[str, dict[str, Any]] = {}
+        self._stores_provider = stores_provider
+        # 缓存键 (tenant_key, mid)：tenant_key = tenant_id or ""（默认库）——per-tenant 隔离
+        self._clients: dict[tuple[str, str], MCPClient] = {}
+        self._rows: dict[tuple[str, str], dict[str, Any]] = {}
+        self._loaded: set[str] = set()  # 已惰性加载的租户
         self._allow_cache: dict[int, list[str]] = {}
         # agent 主表绑定解析器（AgentConfigResolver.server_ids_for，server 粒度）。不注入（None）→
         # 返回全部 enabled（仅测试/独立用法兼容）；注入后以回调返回的子集过滤——空 set = 无 server。
+        # 回调可为 async 且接受 (agent_name, tenant_id)（v5.3：按租户的 agent 绑定解析）。
         self.server_ids_for = server_ids_for
+
+    async def _store_for(self, tenant_id: str | None) -> Any:
+        if self._stores_provider is not None:
+            return await self._stores_provider(tenant_id)
+        return self._store
+
+    @staticmethod
+    def _key(tenant_id: str | None) -> str:
+        return tenant_id or ""
+
+    async def _ensure_loaded(self, tenant_id: str | None) -> None:
+        """租户的 enabled servers 惰性加载（首次访问该租户时）。"""
+        tkey = self._key(tenant_id)
+        if tkey in self._loaded:
+            return
+        self._loaded.add(tkey)
+        store = await self._store_for(tenant_id)
+        rows = await store.list_enabled()
+        for row in rows:
+            await self._load_row(row, tenant_id)
+
+    async def _load_row(self, row: dict, tenant_id: str | None) -> None:
+        tkey = self._key(tenant_id)
+        mid = row["id"]
+        if (tkey, mid) in self._clients:
+            return  # 防重复加载：同 key 旧 client 的 stateful 连接不能被第二个 task 接管
+        try:
+            client = self._build_client(row)
+        except Exception as e:  # noqa: BLE001 —— 单条配置坏不拖垮启动
+            log.warning("MCP[%s] 配置解析失败，跳过加载: %s", row.get("name"), e)
+            return
+        self._rows[(tkey, mid)] = row
+        self._clients[(tkey, mid)] = client
+        if client.is_stateful:
+            try:
+                await self._connect(client)
+            except Exception as e:  # noqa: BLE001
+                log.warning("MCP[%s] connect 失败（启动加载）: %s", client.name, e)
 
     # ------------------------------------------------------------------
     # client 构造
@@ -129,35 +172,23 @@ class MCPClientManager:
     # ------------------------------------------------------------------
     # 生命周期：load / refresh / evict / close_all
     # ------------------------------------------------------------------
-    async def load(self) -> None:
-        """启动时加载 enabled 记录并建 client；stateful 做 best-effort connect。
-
-        连接失败仅 log 并保留（未连接）状态，不阻塞启动 —— 之后 ``clients_for_agent``
-        对失联 client 还有一次重连机会。
-        """
-        rows = await self._store.list_enabled()
+    async def load(self, tenant_id: str | None = None) -> None:
+        """启动时加载 enabled 记录并建 client（tenant_id=None = 默认库）；stateful 做
+        best-effort connect。连接失败仅 log 不阻塞 —— ``clients_for_agent`` 对失联
+        client 还有一次重连机会。租户库的 server 由 ``_ensure_loaded`` 首访惰性加载。"""
+        store = await self._store_for(tenant_id)
+        rows = await store.list_enabled()
         for row in rows:
-            mid = row["id"]
-            try:
-                client = self._build_client(row)
-            except Exception as e:  # noqa: BLE001 —— 单条配置坏不拖垮启动
-                log.warning("MCP[%s] 配置解析失败，跳过加载: %s", row.get("name"), e)
-                continue
-            self._rows[mid] = row
-            self._clients[mid] = client
-            if client.is_stateful:
-                try:
-                    await self._connect(client)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("MCP[%s] connect 失败（启动加载）: %s", client.name, e)
+            await self._load_row(row, tenant_id)
 
-    async def refresh_server(self, mid: str) -> None:
-        """CRUD 后重建该 server：先 evict 旧 client，再从库里当前记录重建。
+    async def refresh_server(self, mid: str, tenant_id: str | None = None) -> None:
+        """CRUD 后重建该 server（租户维度）：先 evict 旧 client，再从库里当前记录重建。
 
-        enabled=0 或记录已删除 → 只 evict 不重建。这样 PUT/DELETE 端点一个入口即可。
-        """
-        await self._evict(mid)
-        row = await self._store.get(mid)
+        enabled=0 或记录已删除 → 只 evict 不重建。这样 PUT/DELETE 端点一个入口即可。"""
+        tkey = self._key(tenant_id)
+        await self._evict(tkey, mid)
+        store = await self._store_for(tenant_id)
+        row = await store.get(mid)
         if row is None or not row.get("enabled"):
             return
         try:
@@ -165,18 +196,18 @@ class MCPClientManager:
         except Exception as e:  # noqa: BLE001
             log.warning("MCP[%s] 配置重建失败: %s", row.get("name"), e)
             return
-        self._rows[mid] = row
-        self._clients[mid] = client
+        self._rows[(tkey, mid)] = row
+        self._clients[(tkey, mid)] = client
         if client.is_stateful:
             try:
                 await self._connect(client)
             except Exception as e:  # noqa: BLE001
                 log.warning("MCP[%s] connect 失败（refresh）: %s", client.name, e)
 
-    async def _evict(self, mid: str) -> None:
+    async def _evict(self, tkey: str, mid: str) -> None:
         """移除一个 client 并关闭其 stateful 连接（杀 stdio 子进程）。"""
-        client = self._clients.pop(mid, None)
-        self._rows.pop(mid, None)
+        client = self._clients.pop((tkey, mid), None)
+        self._rows.pop((tkey, mid), None)
         if client is not None:
             self._allow_cache.pop(id(client), None)
             if client.is_stateful and client.is_connected:
@@ -187,32 +218,68 @@ class MCPClientManager:
 
     async def close_all(self) -> None:
         """关闭全部（shutdown 用，杀干净 stdio 子进程）。"""
-        for mid in list(self._clients):
-            await self._evict(mid)
+        for key in list(self._clients):
+            await self._evict(key[0], key[1])
+        self._loaded.clear()
+
+    def _resolve_server_ids(self, agent_name: str, tenant_id: str | None) -> set[str] | None:
+        """server 绑定解析：回调支持 (agent) / (agent, tenant) 两种签名 + sync/async。"""
+        if self.server_ids_for is None:
+            return None
+        import inspect
+
+        try:
+            res = self.server_ids_for(agent_name, tenant_id)
+        except TypeError:
+            res = self.server_ids_for(agent_name)
+        if inspect.isawaitable(res):
+            raise TypeError(
+                "server_ids_for 返回了 awaitable——请用 async 绑定（经 _resolve_server_ids_async）"
+            )
+        return res or set()
+
+    async def _resolve_server_ids_async(
+        self, agent_name: str, tenant_id: str | None
+    ) -> set[str] | None:
+        if self.server_ids_for is None:
+            return None
+        import inspect
+
+        try:
+            res = self.server_ids_for(agent_name, tenant_id)
+        except TypeError:
+            res = self.server_ids_for(agent_name)
+        if inspect.isawaitable(res):
+            res = await res
+        return res or set()
 
     # ------------------------------------------------------------------
     # 运行时查询（AgentNodeRunner 用）
     # ------------------------------------------------------------------
-    async def clients_for_agent(self, agent_name: str) -> list[MCPClient]:
+    async def clients_for_agent(
+        self, agent_name: str, tenant_id: str | None = None
+    ) -> list[MCPClient]:
         """返回该 agent 可用的 enabled 且（stateful）已连接的 client（server 粒度）。
 
+        ``tenant_id`` 提供时在该租户自己的 mcp_servers 表（租户库）范围内解析（v5.3 §7）。
         ``server_ids_for`` 为 None（未注入 resolver，仅测试/独立用法）→ 返回全部 enabled；
-        否则按 ``server_ids_for(agent_name)`` 过滤：返回空 set（未配置/明确不绑，v1.12.1 起
-        “没配置就没有 server”）→ 无任何 client；非空 set → 只返回 ``mid in set`` 的 client。
-        只读 MCP 工具在 AgentScope 自动 ALLOW，故“只见所选 server 的 enabled 工具”靠
-        这里只下发绑定 client 天然约束（非只读工具另经 allow_names_for_agent 精确 allow）。
-        stateful 失联 → 尝试一次重连；重连仍失败则跳过（log 告警，不让一个坏 server 拖垮整次 run）。
+        否则按 ``server_ids_for(agent_name, tenant_id)`` 过滤：空 set（未配置/明确不绑）
+        → 无任何 client；非空 set → 只返回 ``mid in set`` 的 client。
+        stateful 失联 → 尝试一次重连；重连仍失败则跳过（不让一个坏 server 拖垮整次 run）。
         """
-        allowed: set[str] | None = None
-        if self.server_ids_for is not None:
-            allowed = self.server_ids_for(agent_name) or set()  # 无/空 → 不绑任何 server（两态：无/子集）
+        await self._ensure_loaded(tenant_id)
+        tkey = self._key(tenant_id)
+        allowed = await self._resolve_server_ids_async(agent_name, tenant_id)
         result: list[MCPClient] = []
-        for mid, row in list(self._rows.items()):
+        for key, row in list(self._rows.items()):
+            if key[0] != tkey:
+                continue  # 其他租户的 server 不可见（P4 物理隔离）
+            mid = key[1]
             if not row.get("enabled"):
                 continue
             if allowed is not None and mid not in allowed:
                 continue
-            client = self._clients.get(mid)
+            client = self._clients.get(key)
             if client is None:
                 continue
             if client.is_stateful and not client.is_connected:
@@ -225,7 +292,9 @@ class MCPClientManager:
             result.append(client)
         return result
 
-    async def allow_names_for_agent(self, agent_name: str) -> list[str]:
+    async def allow_names_for_agent(
+        self, agent_name: str, tenant_id: str | None = None
+    ) -> list[str]:
         """当前该 agent 可见 MCP 工具的 AgentScope 精确名（``mcp__{server}__{tool}``）。
 
         复用 ``clients_for_agent``（含 server_ids_for 过滤）→ 只对真正下发给该 agent 的
@@ -233,7 +302,7 @@ class MCPClientManager:
         client 缓存；client 被 refresh 重建（id 变化）后自动重算。
         """
         names: list[str] = []
-        for client in await self.clients_for_agent(agent_name):
+        for client in await self.clients_for_agent(agent_name, tenant_id):
             cached = self._allow_cache.get(id(client))
             if cached is not None:
                 names.extend(cached)

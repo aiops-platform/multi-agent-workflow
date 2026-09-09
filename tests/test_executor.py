@@ -1,13 +1,11 @@
-# -*- coding: utf-8 -*-
 """M2：并发 DAG 执行 + join/skip + 审批（design §8.2 / §8.3 / §8.6）。"""
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 
 import pytest
 
-from agentflow.core.dag import DONE, REJECTED, SKIPPED, WAITING_APPROVAL
+from agentflow.core.dag import DONE, SKIPPED, WAITING_APPROVAL
 from agentflow.executor.dag_executor import DAGExecutor, WorkflowNodeFailed
 from agentflow.statestore.memory import InMemoryStateStore
 
@@ -124,7 +122,6 @@ async def test_approval_reject_routes_to_recap() -> None:
 
 
 async def test_approval_cas_prevents_double_approve() -> None:
-    from agentflow.executor.dag_executor import ApprovalRaceError
 
     ex, _, _, calls = build_executor(PARALLEL_YAML)
     await ex.run()

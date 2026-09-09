@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """15-agent 编队注册表（design §7）。
 
 映射 agent 名 → 职责 / 工具可见性 / 输出 Schema。executor 的 node_runner

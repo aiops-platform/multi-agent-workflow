@@ -24,6 +24,7 @@ import asyncio
 import logging
 import uuid
 
+from .config import get_settings
 from .core.dag import TERMINAL
 from .core.workflow import Workflow
 from .executor.dag_executor import DAGExecutor, NodeRunner, WorkflowNodeFailed
@@ -42,6 +43,10 @@ class TenantQuotaExceeded(Exception):
 
 class ApproverNotAllowed(Exception):
     """审批人不在租户白名单（§9.3 approvers，default-deny）→ API 映射 403。"""
+
+
+class InputsValidationError(ValueError):
+    """run 入参不合法（v5.3 §7.3：加固姿态下 inputs.repos 直传被封堵）→ API 映射 400。"""
 
 
 class RunService:
@@ -151,6 +156,13 @@ class RunService:
     async def _create(self, tenant_id: str, workflow: Workflow, inputs: dict | None) -> str:
         """公共前缀：配额校验（锁内）→ 冻结 snapshot → 建 run →（queue 模式）发布 trigger。"""
         store = await self._stores.resolve(tenant_id)
+        # §7.3 repo 直传封堵：加固姿态（共享数据源关闭）下，repo 一律经租户 CMDB MCP
+        # 提供——inputs.repos 是"用平台身份操作任意 repo"的绕过入口。
+        if inputs and "repos" in inputs and not get_settings().shared_datasources:
+            raise InputsValidationError(
+                "多租户加固姿态下不接受 inputs.repos 直传（repo 由租户 CMDB MCP 提供；"
+                "本地联调可设 AGENTFLOW_SHARED_DATASOURCES=1 解除）"
+            )
         lock_key = None
         try:
             if self.lock is not None:

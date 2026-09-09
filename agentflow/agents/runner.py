@@ -17,6 +17,7 @@ from typing import Any
 from agentscope.model import ChatModelBase, ChatResponse
 
 from ..core.dag import Node
+from ..exec_context import current_tenant
 from .mcp import build_toolkit
 from .scopes import build_agent, build_permission_context, build_reasoning_model, run_agent
 from .transcript import K_LLM_CALL, K_NODE, K_TOOL_CALL, TraceRecorder, scan_denied_blocks
@@ -107,12 +108,19 @@ class AgentNodeRunner:
         use_mock_datasource: bool = True,
         mcp_manager=None,
         agent_config=None,
+        agent_config_provider=None,
+        shared_datasources: bool = True,
     ) -> None:
         self.model = UsageTrackingModel(model)
         self.use_mock_datasource = use_mock_datasource
         self.mcp_manager = mcp_manager
         # AgentSpec DB 配置解析器（agent_config.AgentConfigResolver）：提供 system_prompt 覆盖 + enabled
         self.agent_config = agent_config
+        # v5.3 §7：per-tenant 配置解析器提供者 async (tenant_id|None) → AgentConfigResolver
+        #（租户库 agent_configs 覆盖行）；注入后按 current_tenant 路由，self.agent_config 作回退
+        self.agent_config_provider = agent_config_provider
+        # P1 加固姿态：False = 不注入内置共享数据源 L1 工具（数据工具一律租户 MCP 绑定）
+        self.shared_datasources = shared_datasources
         # 兼容属性：最近一次节点用量（顺序/单节点场景精确；并行 wave 下以 take_usage 为准）
         self.last_usage: dict[str, float | int] | None = None
         # 按 id(node) 分槽（并行波安全）：executor 跑完取走（pop）→ retry/resume 只留末次成功
@@ -144,8 +152,13 @@ class AgentNodeRunner:
         if not agent:
             return {"node": node.id, "ok": True}
         # AgentSpec DB 配置（覆盖 system_prompt / enabled / reasoning / MCP server 绑定）。
-        # 未接 resolver（agent_config=None）或名字不在配置 → 走内置静态默认，行为不变。
-        cfg = self.agent_config.resolve(agent) if self.agent_config is not None else None
+        # per-tenant（v5.3 §7）：provider 按 current_tenant 取该租户库的覆盖行；
+        # 未接 provider/resolver 或名字不在配置 → 走内置静态默认，行为不变。
+        if self.agent_config_provider is not None:
+            resolver = await self.agent_config_provider(current_tenant.get())
+            cfg = resolver.resolve(agent) if resolver is not None else None
+        else:
+            cfg = self.agent_config.resolve(agent) if self.agent_config is not None else None
         if cfg is not None and not cfg.enabled:
             return {"node": node.id, "ok": True, "disabled": True, "note": f"agent {agent!r} 已在配置中停用"}
         # Agent 级启用推理（cfg.reasoning_enabled）→ thinking-enabled 模型，CoT 落 llm_call 明细；
@@ -156,12 +169,14 @@ class AgentNodeRunner:
         # v1.12.1 起未绑定=没有 server；resolver 注入时空集→无 client，不注入的独立用法才回退全量）
         # + 预计算 allow 名单。allow 规则（§9.5 DONT_ASK + 精确工具名）必须早于 build_agent / 首个工具调用。
         clients, allow_extra = [], None
+        tenant_id = current_tenant.get()
         if self.mcp_manager is not None:
-            clients = await self.mcp_manager.clients_for_agent(agent)
-            allow_extra = await self.mcp_manager.allow_names_for_agent(agent)
+            clients = await self.mcp_manager.clients_for_agent(agent, tenant_id=tenant_id)
+            allow_extra = await self.mcp_manager.allow_names_for_agent(agent, tenant_id=tenant_id)
         toolkit = build_toolkit(
             agent,
             use_mock=self.use_mock_datasource,
+            shared_datasources=self.shared_datasources,
             mcp_clients=clients,
         )
         ctx = build_permission_context(agent, allow_extra=allow_extra)

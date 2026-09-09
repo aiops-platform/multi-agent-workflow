@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Kafka Queue（design §5：双队列 run.trigger + run.command）。
 
 生产适配器：kafka-python 生产者/消费者，消息 JSON 序列化。
@@ -10,7 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 from .base import Queue
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """数据源适配器单测（mock httpx transport，不依赖真实 testbed）。
 
 - ``_promql``：PromQL 表达式生成
@@ -9,7 +8,6 @@
 from __future__ import annotations
 
 import httpx
-import pytest
 
 from agentflow.agents.datasources import RealDataSourceAdapter, _promql
 

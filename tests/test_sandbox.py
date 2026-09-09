@@ -1,15 +1,18 @@
-# -*- coding: utf-8 -*-
 """M4：sandbox 模块 —— exec 服务限制 / ToolPolicy / ActionExecutor 白名单。"""
 from __future__ import annotations
 
-import asyncio
-from pathlib import Path
-
 import pytest
 
-from agentflow.sandbox.action_executor import ActionValidationError, ActionExecutor, _parse_quantity
-from agentflow.sandbox.exec_service import ExecRequest, PythonRequest, WriteRequest, exec_cmd, exec_python, write_file
-from agentflow.sandbox.policy import TenantToolConfig, ToolPolicy
+from agentflow.sandbox.action_executor import ActionExecutor, ActionValidationError, _parse_quantity
+from agentflow.sandbox.exec_service import (
+    ExecRequest,
+    PythonRequest,
+    WriteRequest,
+    exec_cmd,
+    exec_python,
+    write_file,
+)
+from agentflow.sandbox.policy import ToolPolicy
 
 
 # ======================================================================

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """MCPClientManager 测试：真实拉起 stdio mock server 子进程验证连接/下发/allow 名单。
 
 - test_connection：stdio 连上列 3 工具（只读/含`.` sanitize/非只读标注齐全）；http 连不上 → ok:false。

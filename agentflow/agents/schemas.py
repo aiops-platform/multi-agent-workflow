@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Agent 输出 Schema（design §7 输出契约）。
 
 JSON Schema 形态，供 prompt 注入 + 输出校验双重使用。

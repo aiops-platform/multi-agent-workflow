@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """MCP 端到端集成测试：AgentNodeRunner(mcp_manager=...) 把 MCP server 注入 hybrid toolkit。
 
 链路：MCPStore → MCPClientManager.load()（stateful stdio 连 mock server 子进程）
@@ -10,8 +9,6 @@ server 侧已无 agent 绑定（agents 字段移除）→ enabled server 对任�
 """
 import sys
 from pathlib import Path
-
-import pytest
 
 from agentflow.agents.mcp_manager import MCPClientManager
 from agentflow.agents.runner import AgentNodeRunner
