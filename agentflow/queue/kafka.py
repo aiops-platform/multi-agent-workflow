@@ -17,13 +17,13 @@ from .base import Queue
 
 class KafkaQueue(Queue):
     def __init__(self, bootstrap: str, *, group_id: str = "agentflow", timeout_ms: int = 1000) -> None:
-        from kafka import KafkaConsumer, KafkaProducer
-
         self._bootstrap = bootstrap
         self._group_id = group_id
         self._timeout_ms = timeout_ms
-        self._producer: KafkaProducer | None = None
-        self._consumer: KafkaConsumer | None = None
+        self._producer = None
+        # 每个 topic 独立 consumer：双队列（run.trigger / run.command）必须并行消费，
+        # 单实例会被第二个 subscribe 覆盖订阅（曾致 command 永远收不到）。
+        self._consumers: dict[str, Any] = {}
 
     # ---- producer ----
     def _ensure_producer(self):
@@ -49,16 +49,16 @@ class KafkaQueue(Queue):
     def _ensure_consumer(self, topic: str):
         from kafka import KafkaConsumer
 
-        if self._consumer is None:
-            self._consumer = KafkaConsumer(
+        if topic not in self._consumers:
+            self._consumers[topic] = KafkaConsumer(
                 topic,
                 bootstrap_servers=self._bootstrap,
                 group_id=self._group_id,
                 auto_offset_reset="earliest",
-                enable_auto_commit=True,
+                enable_auto_commit=True,  # at-least-once：重复消费由 §8.4 幂等兜底
                 value_deserializer=lambda b: json.loads(b.decode("utf-8")),
             )
-        return self._consumer
+        return self._consumers[topic]
 
     async def subscribe(self, topic: str) -> AsyncIterator[dict]:
         def _poll() -> list[dict]:

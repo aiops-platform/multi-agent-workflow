@@ -34,8 +34,19 @@ make lint      # ruff 检查
    cp 的冗余投影——GET /runs 读列、Resume 读 cp）。只写列不写 cp 曾导致审批超时后
    Resume 永卡 waiting_approval（回归测试 `test_approval_timeout_resume_converges_sqlite`）。
 6. **版本冻结**（`core/workflow.py`）：Run 用 `workflow_hash` 复用 snapshot，Resume 只读原 snapshot。
-7. **多租户**：所有表带 `tenant_id`；租户身份由 JWT 派生（§9.1），代码里禁止以客户端提交的
-   tenant 为授权依据（M5 接入 Gateway 前本地联调可显式传参）。
+6.1 **Worker/双队列**（§6/§8.6，`AGENTFLOW_RUN_MODE`）：`inline`（默认，进程内直跑）|
+   `queue`（API 只发布 run.trigger / run.command，`worker.Worker` 消费；memory=进程内
+   Worker，kafka=`python -m agentflow.worker`）。executor 一律经 `resume_executor`
+   checkpoint 重建（`load_snapshot_workflow` 的 `await` 不可删——曾缺失导致 resume
+   全挂，此前测试未覆盖该路径）。queue 模式 approve 只做 CAS+发命令，零进程内
+   executor 依赖。pause=波间暂停（`request_pause` → run() 返回 "paused"）。
+7. **多租户**（§9）：所有表带 `tenant_id`。`AGENTFLOW_JWT_SECRET` 非空 = JWT 模式：
+   `api/auth.py:get_tenant_context` 从 Bearer token claim（tenant_id/org_id）派生租户，
+   **客户端提交的 tenant 一律忽略**；为空 = dev 回退（X-Tenant-ID 头/body，启动告警）。
+   run 数据跨租户一律 404（`_run_for_tenant`）；/audit 的 tenant JWT 模式强制派生。
+   配额/审批人白名单见 `tenants.py`（AGENTFLOW_TENANTS_FILE，§9.3：超限 429、
+   非白名单审批 403）。workflows/mcp-servers/agent-configs 三张配置表仍为全局
+   （无 tenant_id 列）——多租户配置分片是已知待办。
 8. **Git 版本冻结**（§4.6/§8.7）：`workspace/manager.py` 明确不提供 git_pull；Run 期间工作区
    HEAD 必须 == base_sha，漂移报 `FrozenVersionMismatch`。每个 Run 用 `aiops/RUN_{run_id}` 分支隔离。
 9. **工具权限**（§9.5）：`build_agent` 默认 DONT_ASK + agent 注册工具的 allow 规则。
@@ -99,5 +110,9 @@ docker/sandbox/  沙箱镜像（stdlib-only 离线可建）
 
 ## 里程碑
 
-M0 ✅ → M1 🟡（mock 可跑）→ M2 ✅ → M3-M6 ⏳。下一步（M3）：
-WorkspaceManager（Git base_sha 冻结）+ testbed 联调。
+M0 ✅ → M1 ✅（DB 驱动配置 + MCP 配置化；数据源默认 mock）→ M2 ✅（幂等已接线）→
+M3 ✅ → M4 ✅（组件级；API 认证/egress 未落地）→ M5 ✅（CAS 时间谓词）→
+M6 🟡（适配器可用，真实 broker/DB 专项待生产）→ M7 🟡（诊断真实，解决侧部分 mock）。
+生产化：Worker/双队列（run_mode）✅、JWT 多租户（§9.1/9.3 配额+审批人）✅；
+待办：配置表 tenant 分片、Langfuse/OTel 接入、沙箱 API 认证/egress、
+真实 Kafka/PG 故障恢复专项（§14）。

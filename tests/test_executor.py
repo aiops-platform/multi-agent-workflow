@@ -373,3 +373,74 @@ nodes:
     # 终态覆盖 running 行，无脏数据
     nodes = await store.get_nodes("run_rn")
     assert nodes["a"]["status"] == "done"
+
+
+# ======================================================================
+# 暂停语义（§8.6 pause：波间检查，当前节点跑完即暂停）
+# ======================================================================
+async def test_executor_pause_returns_paused_then_checkpoint_resume() -> None:
+    """request_pause 置位后 run() 不再调度新节点，返回 paused；从 checkpoint
+    重建（新 executor）后可继续到 done。"""
+    from agentflow.core.workflow import Workflow
+
+    yaml_text = """
+name: pause-flow
+nodes:
+  a: { agent: triage }
+  b: { agent: root-cause, params: { code: "$.nodes.a.output.summary" } }
+edges:
+  - { from: a, to: b }
+"""
+    wf = Workflow.load_yaml(yaml_text)
+    store = InMemoryStateStore()
+    calls: list[str] = []
+
+    async def runner(node, params):
+        calls.append(node.id)
+        return {"node": node.id, "ok": True}
+
+    ex = DAGExecutor("run_p", "t", wf.dag, store, node_runner=runner, inputs={})
+    ex.request_pause()
+    assert await ex.run() == "paused"  # 未调度任何节点
+    assert calls == []
+
+    # resume：新 executor 从 checkpoint 继续到 done
+    ex2 = await DAGExecutor.from_checkpoint("run_p", "t", wf.dag, store, node_runner=runner)
+    assert await ex2.run() == "done"
+    assert ex2.get_status("a") == DONE and ex2.get_status("b") == DONE
+
+
+async def test_executor_pause_mid_wave_stops_scheduling() -> None:
+    """暂停请求落在波次执行中：当前节点完成后不再调度下游。"""
+    from agentflow.core.workflow import Workflow
+
+    yaml_text = """
+name: pause-mid
+nodes:
+  a: { agent: triage }
+  b: { agent: root-cause }
+edges:
+  - { from: a, to: b }
+"""
+    wf = Workflow.load_yaml(yaml_text)
+    store = InMemoryStateStore()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_runner(node, params):
+        if node.id == "a":
+            entered.set()
+            await release.wait()  # 卡在 a 执行中（模拟长 LLM 节点）
+        return {"node": node.id, "ok": True}
+
+    ex = DAGExecutor("run_pm", "t", wf.dag, store, node_runner=gated_runner, inputs={})
+    task = asyncio.create_task(ex.run())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)  # 确定性地停在 a 内部
+        ex.request_pause()
+    finally:
+        release.set()  # a 跑完 → 波次结束 → 暂停生效
+    outcome = await asyncio.wait_for(task, timeout=2)
+    assert outcome == "paused"
+    assert ex.get_status("a") == DONE
+    assert ex.get_status("b") == "pending"  # 未被调度

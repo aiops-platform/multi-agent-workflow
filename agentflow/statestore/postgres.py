@@ -8,7 +8,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .base import APPROVAL_WAITING, StateStore, approval_time_guard
+from .base import (
+    ACTIVE_RUN_STATUSES,
+    APPROVAL_WAITING,
+    StateStore,
+    approval_time_guard,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS workflow_snapshots (
@@ -167,6 +172,15 @@ class PostgresStateStore(StateStore):
             f"UPDATE runs SET {', '.join(cols)}, updated_at=now() WHERE run_id=%s", vals
         )
         await self._c.commit()
+
+    async def count_active_runs(self, tenant_id) -> int:
+        placeholders = ",".join("%s" for _ in ACTIVE_RUN_STATUSES)
+        cur = await self._c.execute(
+            f"SELECT COUNT(*) FROM runs WHERE tenant_id=%s AND status IN ({placeholders})",
+            (tenant_id, *ACTIVE_RUN_STATUSES),
+        )
+        row = await cur.fetchone()
+        return int(row[0])
 
     # ---- nodes ----
     async def put_node(self, run_id, tenant_id, node_id, cp) -> None:

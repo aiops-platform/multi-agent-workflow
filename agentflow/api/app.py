@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
-"""控制面 FastAPI（design §6：POST /run / GET /runs/{id} / POST approve|reject）。
+"""控制面 FastAPI（design §6：POST /run / GET /runs/{id} / approve|reject / pause|resume）。
 
-M0-M2 形态：进程内直接执行（无 Worker 池）。JWT → 派生 tenant_id（§9.1）
-在 M5 接入 API Gateway；当前接口接受显式 tenant 参数便于本地联调。
+- **认证**（§9.1）：``get_tenant_context`` 依赖从 Bearer JWT 派生 tenant_id；
+  未配置 ``AGENTFLOW_JWT_SECRET`` 时回退显式传参（dev 联调，启动告警）。
+- **执行模式**（§6/§8.6）：``run_mode=inline`` 进程内直跑（默认）；``run_mode=queue``
+  只发布 run.trigger/run.command，由 Worker 消费（queue=memory 时进程内后台 Worker，
+  queue=kafka 时独立进程 ``python -m agentflow.worker``）。
+- **多租户**（§9.2/§9.3）：run 数据按派生租户隔离（跨租户一律 404）；配额/审批人
+  白名单由 ``TenantRegistry`` 提供。
 """
 from __future__ import annotations
 
@@ -15,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -28,14 +33,22 @@ from ..approval.sweeper import ApprovalSweeper
 from ..config import Settings, get_settings
 from ..core.dag import WAITING_APPROVAL, WorkflowDAGError
 from ..core.workflow import Workflow
+from ..executor.dag_executor import ApprovalRaceError
 from ..queue import build_queue
-from ..service import RunService
+from ..service import ApproverNotAllowed, RunService, TenantQuotaExceeded
 from ..statestore import build_state_store, connect_state_store
+from ..tenants import TenantRegistry
+from ..worker import Worker
 from .agent_store import AgentConfigStore, build_agent_config_store, seed_builtin_agent_configs
+from .auth import TenantContext, get_tenant_context
 from .mcp_store import MCPStore, build_mcp_store
 from .workflow_store import WorkflowStore, build_workflow_store
 
 settings: Settings = get_settings()
+# 租户注册表（§9.3）：配置了 AGENTFLOW_TENANTS_FILE 则文件驱动，否则内置默认（不限制）
+tenant_registry = (
+    TenantRegistry.load(settings.tenants_file) if settings.tenants_file else TenantRegistry.builtin()
+)
 
 
 @asynccontextmanager
@@ -53,6 +66,8 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="agentflow 控制面", version="0.1.0", lifespan=lifespan)
 service: RunService | None = None
 sweeper: ApprovalSweeper | None = None
+worker: Worker | None = None  # run_mode=queue + memory 队列时的进程内 Worker
+_worker_task: asyncio.Task | None = None
 # 控制面配置存储（workflows/mcp_servers/agent_configs）：state_store=postgres 时落 PG，
 # 否则沿用本地 sqlite（构造不做 DB/I/O，惰性 connect；测试可 monkeypatch 模块全局）。
 workflow_store = build_workflow_store(settings)
@@ -125,10 +140,17 @@ def _workflow_graph(wf: Workflow) -> dict:
 def _service() -> RunService:
     global service
     if service is None:
-        store = build_state_store(settings)
         # 生命周期：生产由 Worker/API 进程统一 connect；此处懒初始化
         raise RuntimeError("service 未初始化，先调用 init()")
     return service
+
+
+async def _run_for_tenant(run_id: str, ctx: TenantContext) -> dict:
+    """读 run 并强制租户隔离（§9.2）：跨租户一律 404（不泄漏存在性）。"""
+    run = await _service().store.get_run(run_id)
+    if run is None or run["tenant_id"] != ctx.tenant_id:
+        raise HTTPException(status_code=404, detail="run 不存在")
+    return run
 
 
 async def _reload_agent_config_resolver() -> AgentConfigResolver:
@@ -208,7 +230,8 @@ async def _migrate_sqlite_config_to_pg() -> None:
 
 async def init() -> RunService:
     """应用启动时调用：初始化 StateStore + Queue，并启动审批超时 Sweeper（§8.9）。"""
-    global service, sweeper
+    global service, sweeper, worker, _worker_task
+    app.state.settings = settings  # auth 依赖读取（get_tenant_context）
     await workflow_store.connect()
     await mcp_store.connect()
     await agent_config_store.connect()
@@ -235,19 +258,42 @@ async def init() -> RunService:
             agent_config=resolver,
         )
         print("[agentflow] node_runner=agent（DeepSeek）：Bug Solve 页将真实调用 agent")
-    service = RunService(store, **kwargs)
+    if not settings.jwt_secret:
+        print(
+            "[agentflow][WARN] 未配置 AGENTFLOW_JWT_SECRET：认证关闭，tenant_id 由客户端提交"
+            "（§9.1 禁止作为生产授权依据，仅限本地联调）"
+        )
+    queue_mode = settings.run_mode == "queue"
+    service = RunService(
+        store,
+        queue=queue if queue_mode else None,
+        tenant_registry=tenant_registry,
+        **kwargs,
+    )
     sweeper = ApprovalSweeper(store, queue, ApprovalNotifier(), interval=60)
     asyncio.create_task(sweeper.run_forever())
+    if queue_mode:
+        if settings.queue == "memory":
+            # 单进程形态：Worker 以后台任务运行（与独立进程行为一致）
+            worker = Worker(store, queue, node_runner=service.node_runner)
+            _worker_task = asyncio.create_task(worker.run_forever())
+            print("[agentflow] run_mode=queue + memory：进程内 Worker 已启动")
+        else:
+            print(
+                f"[agentflow] run_mode=queue（{settings.queue}）：请单独运行 `python -m agentflow.worker`"
+            )
     return service
 
 
 @app.post("/run")
-async def create_run(req: RunRequest) -> dict:
+async def create_run(req: RunRequest, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
     """触发一次 run。UI 契约（agentflow 兼容）：立即返回 ``{run_id, status:"started"}``，
     后台任务执行 DAG；轮询方用 ``GET /runs/{run_id}`` 取进度/结果。
 
     - ``workflow_id``：已保存 workflow（workflow_store）——Bug Solve 页主路径
     - ``workflow_yaml``：直接传 YAML 文本（兼容旧用法，脚本/CLI）
+    - 租户：JWT 模式由 token claim 派生（body ``tenant_id`` 忽略，§9.1）；
+      dev 模式回退 body ``tenant_id`` / ``X-Tenant-ID`` 头
     """
     if req.workflow_id:
         wf_row = await workflow_store.get(req.workflow_id)  # get() 内部惰性 connect
@@ -265,7 +311,11 @@ async def create_run(req: RunRequest) -> dict:
     else:
         raise HTTPException(status_code=400, detail="需提供 workflow_id 或 workflow_yaml")
     inputs = req.ticket or req.inputs or {}
-    out = await _service().start_run(req.tenant_id or "local", workflow, inputs)
+    tenant_id = req.tenant_id if (not ctx.is_jwt and req.tenant_id) else ctx.tenant_id
+    try:
+        out = await _service().start_run(tenant_id, workflow, inputs)
+    except TenantQuotaExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     return {"run_id": out["run_id"], "status": "started"}
 
 
@@ -532,17 +582,16 @@ async def mcp_server_tools(mid: str) -> dict:
 
 
 @app.get("/runs/{run_id}")
-async def get_run(run_id: str) -> dict:
+async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
     """聚合 run 详情（UI 轮询契约，对齐 agentflow 后端）：图 + 节点状态 + 统计 + 待审批。
 
     - ``graph``：从原 snapshot 重建（workflow 删除也不影响已跑 run）
     - ``nodes[id]``：{status, output, params, tokens, cost, prompt}；mock 无 LLM → tokens/cost 为 0
     - ``pending_approvals``：[{node_id, trigger, upstream}]，upstream 取上游节点输出
+    - 租户隔离：跨租户访问一律 404（§9.2）
     """
     service = _service()
-    run = await service.store.get_run(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="run 不存在")
+    run = await _run_for_tenant(run_id, ctx)
 
     # 图：从 snapshot 重建（Resume/展示不受 workflow 变更影响）
     graph = {}
@@ -611,6 +660,7 @@ async def get_run_traces(
     node_id: str | None = None,
     kind: str | None = None,
     limit: int = 500,
+    ctx: TenantContext = Depends(get_tenant_context),
 ) -> list[dict]:
     """节点级执行明细（node_traces 流水，按 (node_id, seq) 升序）。
 
@@ -622,42 +672,89 @@ async def get_run_traces(
     ``node_id`` 省略 = 整 run 全量；``kind`` 可过滤。mock runner 无明细 → 空列表。
     """
     store = _service().store
-    if await store.get_run(run_id) is None:
-        raise HTTPException(status_code=404, detail="run 不存在")
+    await _run_for_tenant(run_id, ctx)  # 租户隔离（§9.2）
     return await store.get_node_traces(run_id, node_id=node_id, kind=kind, limit=limit)
 
 
 @app.post("/runs/{run_id}/approve")
-async def approve(run_id: str, node_id: str | None = None, req: ApproveRequest | None = None) -> dict:
-    """通过某审批节点。body ``{node_id}``（UI 契约）或 query ``?node_id=``（旧兼容）。"""
+async def approve(
+    run_id: str,
+    node_id: str | None = None,
+    req: ApproveRequest | None = None,
+    ctx: TenantContext = Depends(get_tenant_context),
+) -> dict:
+    """通过某审批节点。body ``{node_id}``（UI 契约）或 query ``?node_id=``（旧兼容）。
+
+    JWT 模式下审批人身份取 token ``sub``（body ``by`` 仅 dev 模式生效）；
+    审批人须在租户白名单内（§9.3 approvers，非白名单 403）。
+    """
+    await _run_for_tenant(run_id, ctx)
     rid = req.node_id if (req and req.node_id) else node_id
     if not rid:
         raise HTTPException(status_code=400, detail="需提供 node_id")
+    by = (ctx.subject if (ctx.is_jwt and ctx.subject) else (req.by if req else "lead-engineer"))
     try:
         return await _service().approve(
             run_id, rid,
             approved=(req.approved if req else True),
-            by=(req.by if req else "lead-engineer"),
+            by=by,
             comment=(req.comment if req else ""),
         )
     except (ValueError, AssertionError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ApprovalRaceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ApproverNotAllowed as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 @app.post("/runs/{run_id}/reject")
-async def reject(run_id: str, req: RejectRequest) -> dict:
-    """驳回某审批节点（UI 契约）。"""
+async def reject(
+    run_id: str, req: RejectRequest, ctx: TenantContext = Depends(get_tenant_context)
+) -> dict:
+    """驳回某审批节点（UI 契约）。审批人校验同 approve。"""
+    await _run_for_tenant(run_id, ctx)
+    by = ctx.subject if (ctx.is_jwt and ctx.subject) else req.by
     try:
         return await _service().approve(
-            run_id, req.node_id, approved=False, by=req.by, comment=req.comment
+            run_id, req.node_id, approved=False, by=by, comment=req.comment
         )
     except (ValueError, AssertionError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ApprovalRaceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ApproverNotAllowed as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post("/runs/{run_id}/pause")
+async def pause_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
+    """暂停 run（§8.6）：当前节点跑完即暂停，checkpoint 保留；``/resume`` 恢复。"""
+    await _run_for_tenant(run_id, ctx)
+    try:
+        await _service().pause_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True, "run_id": run_id, "status": "pausing"}
+
+
+@app.post("/runs/{run_id}/resume")
+async def resume_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
+    """断点续跑（§4.4）：从 checkpoint + 原 snapshot 继续（queue 模式发布 resume 命令）。"""
+    await _run_for_tenant(run_id, ctx)
+    try:
+        await _service().resume_run(run_id, ctx.tenant_id)
+    except TenantQuotaExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True, "run_id": run_id, "status": "resumed"}
 
 
 @app.post("/runs/{run_id}/stop")
-async def stop_run(run_id: str) -> dict:
-    """停止进行中的 run（置 cancelled + 取消后台任务）。"""
+async def stop_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
+    """停止进行中的 run（置 cancelled + 取消后台任务；queue 模式发布 stop 命令）。"""
+    await _run_for_tenant(run_id, ctx)
     try:
         await _service().stop_run(run_id)
     except ValueError as exc:
@@ -666,9 +763,21 @@ async def stop_run(run_id: str) -> dict:
 
 
 @app.get("/audit")
-async def audit(tenant_id: str | None = None, run_id: str | None = None, limit: int = 100) -> list[dict]:
-    """审计日志查询（§9.5：tenant_id/tool_name/decision/run_id/node_id/input 脱敏/ts）。"""
-    return await _service().store.get_audit_logs(tenant_id=tenant_id, run_id=run_id, limit=limit)
+async def audit(
+    run_id: str | None = None,
+    limit: int = 100,
+    tenant_id: str | None = None,
+    ctx: TenantContext = Depends(get_tenant_context),
+) -> list[dict]:
+    """审计日志查询（§9.5：tenant_id/tool_name/decision/run_id/node_id/input 脱敏/ts）。
+
+    租户强制（§9.2）：JWT 模式下 tenant 取 token 派生值，请求参数 ``tenant_id`` 忽略；
+    dev 模式（无 JWT）允许显式 tenant_id 便于联调。
+    """
+    effective_tenant = ctx.tenant_id if ctx.is_jwt else (tenant_id or ctx.tenant_id)
+    return await _service().store.get_audit_logs(
+        tenant_id=effective_tenant, run_id=run_id, limit=limit
+    )
 
 
 # ── AgentSpec 配置 CRUD（SIP「Agent 配置」页：DB 驱动 agent 配置 + agent→MCP server 绑定）──

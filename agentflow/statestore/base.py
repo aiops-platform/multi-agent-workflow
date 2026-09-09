@@ -20,6 +20,9 @@ APPROVAL_REJECTED = "REJECTED"
 APPROVAL_TIMED_OUT = "TIMED_OUT"
 APPROVAL_TERMINAL = {APPROVAL_APPROVED, APPROVAL_REJECTED, APPROVAL_TIMED_OUT}
 
+# 占用租户并发配额的 run 状态（§9.3 max_concurrent_runs）：未到终态的都算占用
+ACTIVE_RUN_STATUSES = ("running", "queued", "waiting_approval", "paused")
+
 
 def approval_time_guard(from_status: str, to_status: str) -> str | None:
     """CAS 更新审批时需要的时间谓词种类（§8.3.2 ``AND timeout_at > NOW()``）。
@@ -59,6 +62,10 @@ class StateStore(ABC):
     async def update_run(
         self, run_id: str, *, status: str | None = None, **fields: Any
     ) -> None: ...
+
+    @abstractmethod
+    async def count_active_runs(self, tenant_id: str) -> int:
+        """租户未终态 run 数（§9.3 max_concurrent_runs 配额判定用）。"""
 
     # ---- nodes：节点级 checkpoint（§8.4 / §4.4）----
     @abstractmethod

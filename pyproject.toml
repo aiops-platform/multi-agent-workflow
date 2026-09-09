@@ -22,6 +22,8 @@ dependencies = [
     "python-dotenv>=1.0",
     "fastapi>=0.111",
     "uvicorn>=0.30",
+    # JWT 租户派生（§9.1；生产由 API Gateway 签发，控制面只做校验）
+    "pyjwt>=2.8",
     # DeepSeek（OpenAI 兼容）经 AgentScope OpenAI 模型接入
     "openai>=1.60",
     # 生产适配器（M6 前为占位）
@@ -51,3 +53,7 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint]
+# B008：FastAPI 的 `Depends(...)` 参数默认值是官方惯用法，非 bug
+ignore = ["B008"]

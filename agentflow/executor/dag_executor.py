@@ -192,6 +192,13 @@ class DAGExecutor:
             nid: {"status": PENDING, "output": None} for nid in dag.nodes
         }
         self.failed: list[str] = []
+        # 暂停请求（§8.6）：置位后 run() 在当前波次跑完即返回 "paused"
+        # （checkpoint 已逐节点落盘，pause/resume 无需额外持久化）。
+        self._pause_requested = False
+
+    def request_pause(self) -> None:
+        """请求暂停：不再调度新节点，当前已开始的节点跑完后返回 ``paused``。"""
+        self._pause_requested = True
 
     # ==================================================================
     # 查询
@@ -484,9 +491,11 @@ class DAGExecutor:
         await self._process_approvals()
 
     async def run(self) -> str:
-        """执行到可释放（ready 集为空）。返回 ``done`` / ``waiting_approval`` / ``failed``。
+        """执行到可释放（ready 集为空）。返回 ``done`` / ``waiting_approval`` /
+        ``paused`` / ``failed``。
 
         - 每波并发执行 ready 的 agent 节点；慢分支运行期间 run() 不返回。
+        - ``request_pause()`` 置位后：当前波次跑完即返回 ``paused``（不再调度新节点）。
         - ready 集为空时：
           * 存在 waiting_approval → 返回 ``waiting_approval``（Worker 释放，§8.6）
           * 全部终态 → 返回 ``done``
@@ -497,6 +506,8 @@ class DAGExecutor:
             await self._process_skips()
             if self.failed:
                 raise WorkflowNodeFailed(self.failed[0], RuntimeError("上游节点失败"))
+            if self._pause_requested and not self.all_terminal():
+                return "paused"
             ready = self._ready_nodes()
             if ready:
                 await asyncio.gather(*(self._exec_node(nid) for nid in ready))

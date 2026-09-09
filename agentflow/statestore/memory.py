@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from .base import APPROVAL_WAITING, StateStore, approval_time_guard
+from .base import ACTIVE_RUN_STATUSES, APPROVAL_WAITING, StateStore, approval_time_guard
 
 
 def _parse_deadline(value: Any) -> datetime | None:
@@ -62,6 +62,13 @@ class InMemoryStateStore(StateStore):
         if status is not None:
             run["status"] = status
         run.update(fields)
+
+    async def count_active_runs(self, tenant_id) -> int:
+        return sum(
+            1
+            for r in self._runs.values()
+            if r.get("tenant_id") == tenant_id and r.get("status") in ACTIVE_RUN_STATUSES
+        )
 
     # ---- nodes ----
     async def put_node(self, run_id, tenant_id, node_id, cp) -> None:

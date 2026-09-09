@@ -8,7 +8,12 @@ from typing import Any
 
 import aiosqlite
 
-from .base import APPROVAL_WAITING, StateStore, approval_time_guard
+from .base import (
+    ACTIVE_RUN_STATUSES,
+    APPROVAL_WAITING,
+    StateStore,
+    approval_time_guard,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS workflow_snapshots (
@@ -164,6 +169,15 @@ class SqliteStateStore(StateStore):
             vals,
         )
         await self._c.commit()
+
+    async def count_active_runs(self, tenant_id) -> int:
+        placeholders = ",".join("?" for _ in ACTIVE_RUN_STATUSES)
+        cur = await self._c.execute(
+            f"SELECT COUNT(*) FROM runs WHERE tenant_id=? AND status IN ({placeholders})",
+            (tenant_id, *ACTIVE_RUN_STATUSES),
+        )
+        (count,) = await cur.fetchone()
+        return int(count)
 
     # ---- nodes ----
     async def put_node(self, run_id, tenant_id, node_id, cp) -> None:

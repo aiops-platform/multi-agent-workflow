@@ -47,6 +47,21 @@ class Settings(BaseSettings):
     # ---- CORS（控制面 API 前端跨域，逗号分隔的 origin 列表，默认 *）----
     cors_origins: str = "*"
 
+    # ---- 执行模式（§6/§8.6）----
+    # inline：API 进程内直接执行 DAG（本地 MVP 默认）
+    # queue ：API 只发布 run.trigger，Worker 消费执行（生产形态；queue=memory 时
+    #         Worker 以进程内后台任务运行，queue=kafka 时用 `python -m agentflow.worker`）
+    run_mode: str = "inline"  # inline | queue
+
+    # ---- 多租户 / 认证（§9）----
+    # JWT 密钥（HS256）。非空 = 强制 Bearer JWT，tenant_id 由 claim 派生（org_id/
+    # tenant_id），客户端提交的 tenant 一律忽略；为空 = dev 模式，回退显式传参
+    # （本地联调，启动时告警）。
+    jwt_secret: str = ""
+    jwt_algorithm: str = "HS256"
+    # 租户配置文件（§9.3 配额/审批人）；空 = 全部用内置默认（不限制）
+    tenants_file: str = ""
+
     # ---- 沙箱（M4）----
     open_sandbox_domain: str = "localhost:8080"
     open_sandbox_api_key: str = ""

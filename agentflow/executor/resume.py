@@ -17,9 +17,9 @@ from .dag_executor import DAGExecutor, NodeRunner
 log = logging.getLogger("agentflow.executor.resume")
 
 
-def load_snapshot_workflow(store: StateStore, snapshot_id: str) -> Workflow:
+async def load_snapshot_workflow(store: StateStore, snapshot_id: str) -> Workflow:
     """从 StateStore 读 workflow snapshot 重建 Workflow（Resume 用原版本）。"""
-    snap = store.get_snapshot(snapshot_id)
+    snap = await store.get_snapshot(snapshot_id)
     if snap is None:
         raise ValueError(f"snapshot 不存在: {snapshot_id}")
     raw_yaml = snap["workflow_yaml"]
@@ -36,7 +36,7 @@ async def resume_executor(
     run = await store.get_run(run_id)
     if run is None:
         raise ValueError(f"run 不存在: {run_id}")
-    workflow = load_snapshot_workflow(store, run["workflow_snapshot_id"])
+    workflow = await load_snapshot_workflow(store, run["workflow_snapshot_id"])
     return await DAGExecutor.from_checkpoint(
         run_id,
         tenant_id,
