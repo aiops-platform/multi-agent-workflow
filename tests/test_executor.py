@@ -6,6 +6,7 @@ import asyncio
 import pytest
 
 from agentflow.core.dag import DONE, SKIPPED, WAITING_APPROVAL
+from agentflow.core.workflow import Workflow
 from agentflow.executor.dag_executor import DAGExecutor, WorkflowNodeFailed
 from agentflow.statestore.memory import InMemoryStateStore
 
@@ -441,3 +442,57 @@ edges:
     assert outcome == "paused"
     assert ex.get_status("a") == DONE
     assert ex.get_status("b") == "pending"  # 未被调度
+
+
+# ======================================================================
+# 审批超时 → 拒绝路径的级联 skip 收敛（回归：曾误抛 WorkflowStalledError）
+# ======================================================================
+_CASCADE_SKIP_YAML = """
+name: cascade-skip
+nodes:
+  a: { agent: triage }
+  appr: { kind: approval, name: "审批" }
+  b: { agent: tester, upstreams: [appr] }
+  c: { kind: approval, name: "二级审批", upstreams: [b] }
+  d: { agent: committer, upstreams: [c] }
+  recap: { agent: postmortem, upstreams: [appr] }
+edges:
+  - { from: a, to: appr }
+  - { from: appr, to: b, when: "$.nodes.appr.output.approved == true" }
+  - { from: appr, to: recap, when: "$.nodes.appr.output.approved == false" }
+  - { from: b, to: c }
+  - { from: c, to: d, when: "$.nodes.c.output.approved == true" }
+"""
+
+
+async def test_approval_reject_cascades_skip_to_convergence() -> None:
+    """审批被拒（含超时置 REJECTED_CANCELED）后，其后继链必须级联 SKIPPED 并收敛。
+
+    回归背景：skip 判定在「非审批 ↔ 审批」两类节点间交错级联（b 变 SKIPPED 后 c 才
+    可判定，c 变 SKIPPED 后 d 才可判定）。单趟扫描 + 单次 _process_approvals 只能推进
+    一级；若 recap 已是最后一个 ready 节点，run() 会在链尾尚未判定时误判「无 ready、
+    无 waiting、非全终态」→ 抛 WorkflowStalledError，run 卡在 running 永不收敛。
+    """
+    from agentflow.core.dag import REJECTED_CANCELED
+
+    wf = Workflow.load_yaml(_CASCADE_SKIP_YAML)
+    store = InMemoryStateStore()
+    runner, _ = make_runner()
+    ex = DAGExecutor("run_cascade", "t", wf.dag, store, node_runner=runner, inputs={})
+
+    # 模拟真实 resume 起点：a 已 done，审批超时置 rejected-canceled，
+    # recap 已执行完，b/c/d 从未被调度（无 checkpoint）
+    for nid in wf.dag.nodes:
+        ex.node_states[nid] = {"status": "pending", "output": None}
+    ex.node_states["a"] = {"status": DONE, "output": {"summary": "x"}}
+    ex.node_states["appr"] = {
+        "status": REJECTED_CANCELED, "output": {"approved": False, "reason": "timeout"},
+    }
+    ex.node_states["recap"] = {"status": DONE, "output": {"summary": "recap"}}
+
+    outcome = await asyncio.wait_for(ex.run(), timeout=5)
+    assert outcome == "done", f"应级联收敛为 done，实际 {outcome}"
+    assert ex.get_status("b") == SKIPPED
+    assert ex.get_status("c") == SKIPPED   # 审批节点也被级联 skip
+    assert ex.get_status("d") == SKIPPED
+    assert ex.get_status("recap") == DONE

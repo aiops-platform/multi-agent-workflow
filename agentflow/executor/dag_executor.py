@@ -334,6 +334,10 @@ class DAGExecutor:
         ``_ready_nodes()`` 只返回 ready 节点；当某节点所有入边 INACTIVE 且源全部
         终态时（如 approve 拒绝 → test 的 when 不满足），它必须被标记 SKIPPED 终态，
         否则 DAG 永不收敛。审批节点的 skip 已由 _process_approvals 处理。
+
+        **单趟扫描只推进一级**（test→review；review 变 SKIPPED 后 approve-commit 才
+        可判定）。级联收敛由 :meth:`run` 的外层不动点循环负责——那里会与
+        ``_process_approvals`` 交替调用，因为审批节点的 skip 判定同样受本次结果影响。
         """
         for nid, node in self.dag.nodes.items():
             if node.is_approval or self.node_states[nid]["status"] != PENDING:
@@ -513,8 +517,16 @@ class DAGExecutor:
           * 节点 failed → 抛出 WorkflowNodeFailed
         """
         while True:
-            await self._process_approvals()
-            await self._process_skips()
+            # skip 判定在「非审批 ↔ 审批」两类节点间交错级联（review 变 SKIPPED 后
+            # approve-commit 才可判定）。_process_skips 自身收敛，但它改动的状态会影响
+            # 审批节点的判定 → 交替调用直到两者都不再变化，再做终止判定，否则会在链尾
+            # 尚未判定时被误判为停滞（见 _process_skips docstring）。
+            while True:
+                snapshot = {n: st["status"] for n, st in self.node_states.items()}
+                await self._process_approvals()
+                await self._process_skips()
+                if {n: st["status"] for n, st in self.node_states.items()} == snapshot:
+                    break
             if self.failed:
                 raise WorkflowNodeFailed(self.failed[0], RuntimeError("上游节点失败"))
             if self._pause_requested and not self.all_terminal():
