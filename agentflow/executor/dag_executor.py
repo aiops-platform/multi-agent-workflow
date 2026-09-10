@@ -85,6 +85,9 @@ class ApprovalRaceError(Exception):
     """审批 CAS 冲突（已被并发操作推进到终态）。"""
 
 
+_FALLBACK_SEP = " || "  # 参数引用回退分隔符：$.a || $.b → a 解析不到可用值则取 b（新旧 ticket 契约兼容）
+
+
 def _path_steps(path: str) -> list[Any]:
     """把点分路径拆成步（含 ``[idx]`` 下标）：``a.b[0].c[1][2]`` → ['a','b',0,'c',1,2]。"""
     steps: list[Any] = []
@@ -131,8 +134,18 @@ def _resolve_param(value: Any, ctx: dict) -> Any:
 
     支持数组下标：``$.inputs.correlation_hint.sample_trace_ids[0]`` /
     ``$.nodes.X.output.key_logs[0].msg``。
+    支持回退：``$.inputs.requestId || $.inputs.correlation_hint.sample_trace_ids[0]``
+    —— 前分支解析不到可用值（None/空串/空容器，同 require 语义）时取后分支。
     """
     if isinstance(value, str) and value.startswith("$."):
+        if _FALLBACK_SEP in value:
+            branches = [b.strip() for b in value.split(_FALLBACK_SEP)]
+            if all(b.startswith("$.") for b in branches):
+                for branch in branches:
+                    got = _resolve_param(branch, ctx)
+                    if _usable(got):
+                        return got
+                return None
         path = value[2:]  # 去掉 "$."
         if path.startswith("nodes."):
             rest = path[len("nodes."):]

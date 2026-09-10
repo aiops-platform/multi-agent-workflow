@@ -92,6 +92,24 @@ async def test_param_resolution_array_index() -> None:
     assert p2["x"] is None
 
 
+async def test_param_resolution_fallback_priority() -> None:
+    """``$.a || $.b`` 回退：前分支有可用值取前分支（新 ticket 顶层 requestId 优先），否则取后分支。"""
+    from agentflow.executor.dag_executor import resolve_params
+
+    expr = "$.inputs.requestId || $.inputs.correlation_hint.sample_trace_ids[0]"
+    # 新契约：顶层 requestId 存在 → 优先
+    ctx_new = {"inputs": {"requestId": "REQ-NEW", "correlation_hint": {"sample_trace_ids": ["OLD"]}}}
+    assert resolve_params({"requestId": expr}, ctx_new)["requestId"] == "REQ-NEW"
+    # 旧契约：顶层缺失（None）→ 回退 correlation_hint.sample_trace_ids[0]
+    ctx_old = {"inputs": {"correlation_hint": {"sample_trace_ids": ["OLD"]}}}
+    assert resolve_params({"requestId": expr}, ctx_old)["requestId"] == "OLD"
+    # 顶层为空串（require 视为不可用）→ 同样回退
+    ctx_empty = {"inputs": {"requestId": "", "correlation_hint": {"sample_trace_ids": ["OLD"]}}}
+    assert resolve_params({"requestId": expr}, ctx_empty)["requestId"] == "OLD"
+    # 两处皆无 → None（require 判失败，不空转）
+    assert resolve_params({"requestId": expr}, {"inputs": {}})["requestId"] is None
+
+
 async def test_parallel_with_approval_waiting() -> None:
     ex, _, store, calls = build_executor(PARALLEL_YAML)
     outcome = await ex.run()
