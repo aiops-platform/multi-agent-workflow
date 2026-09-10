@@ -248,6 +248,33 @@ async def _migrate_sqlite_config_to_pg() -> None:
     print("[agentflow] 已把本地 SQLite 的 workflows/mcp_servers/agent_configs 配置迁移到 PostgreSQL")
 
 
+def build_datasource(settings):
+    """按数据面姿态构建 L1 真实数据源适配器（testbed：ES/Prometheus/kubectl）。
+
+    ``shared_datasources=False``（默认加固）→ None：不构建 L1 工具，数据工具一律由
+    租户 MCP 提供（v5.3 §7/P1）。=True（testbed 联调）→ RealDataSourceAdapter，
+    端点对齐全仓默认（ES :19200 / Prometheus :19090 / namespace order）。
+    """
+    if not settings.shared_datasources:
+        return None
+    from ..agents.datasources import RealDataSourceAdapter
+
+    return RealDataSourceAdapter()
+
+
+def build_cmdb():
+    """构建租户 CMDB（§9.4 TenantMappingProvider）。
+
+    本地 testbed 用 ``MockCmdbProvider`` + ``workspace.prepare.default_cmdb()`` 的
+    service→repo 映射（file:// 本地源）。**诊断段与工作区准备共用同一映射**——
+    code-locator 输出的 repo_url 与工作区实际克隆的仓库必须一致。
+    """
+    from ..workspace.cmdb import MockCmdbProvider
+    from ..workspace.prepare import default_cmdb
+
+    return MockCmdbProvider(default_cmdb())
+
+
 async def init() -> RunService:
     """应用启动时调用：管理库/租户路由 + StateStore + Queue + 审批超时 Sweeper（§8.9）。"""
     global service, sweeper, worker, _worker_task, stores_router, tenant_registry
@@ -298,6 +325,11 @@ async def init() -> RunService:
             agent_config=resolver,
             agent_config_provider=_agent_config_provider,
             shared_datasources=settings.shared_datasources,
+            # 加固姿态（shared_datasources=False）下 L1 工具本就不构建；=True 时注入真实
+            # testbed 数据源（ES :19200 / Prometheus :19090 / kubectl order ns），否则走 mock。
+            datasource=build_datasource(settings),
+            # 租户 CMDB：code-locator 的 locate_code 走它解析 service→repo（§9.4）
+            cmdb=build_cmdb(),
         )
         print("[agentflow] node_runner=agent（DeepSeek）：Bug Solve 页将真实调用 agent")
     queue_mode = settings.run_mode == "queue"

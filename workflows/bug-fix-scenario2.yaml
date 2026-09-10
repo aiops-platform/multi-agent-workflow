@@ -40,8 +40,13 @@ nodes:
     params: { bug: "$.nodes.triage.output.summary" }
     on_failure: continue
 
+  # join: all —— locate 的 target_service 取自 trace 输出，必须等 trace 完成。
+  # 默认 join: any 会让它在 triage 一完成就被调度（trace 尚未跑完 → failing_service 为 null，
+  # 导致 code-locator 只能按 ticket 的 subcategory 猜服务，可能定位错仓库）。
   locate:
     agent: code-locator
+    join: all
+    required_edges: [triage, trace]
     params:
       bug: "$.nodes.triage.output.summary"
       target_service: "$.nodes.trace.output.failing_service"
@@ -74,6 +79,8 @@ nodes:
     params:
       plan: "$.nodes.plan.output"
       repo_url: "$.nodes.locate.output.repo_url"
+      # 工作区工具的 service 必须是已 prepare 的仓库名（= trace 定位到的故障服务）
+      service: "$.nodes.locate.output.service"
     retry: 1
 
   test:
@@ -81,11 +88,14 @@ nodes:
     params:
       fix: "$.nodes.fix.output"
       plan: "$.nodes.plan.output"
+      service: "$.nodes.locate.output.service"
     retry: 1
 
   review:
     agent: reviewer
-    params: { diff: "$.nodes.fix.output.diff" }
+    params:
+      diff: "$.nodes.fix.output.diff"
+      service: "$.nodes.locate.output.service"
 
   # ===== 提交审批（前置审批）=====
   approve-commit:
@@ -103,6 +113,7 @@ nodes:
     params:
       diff: "$.nodes.fix.output.diff"
       test: "$.nodes.test.output"
+      service: "$.nodes.locate.output.service"
       # 幂等：external_operation_id = PR number
 
   recap:

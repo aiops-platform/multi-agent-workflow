@@ -71,9 +71,13 @@ nodes:
     on_failure: abort
 
   # ===== 修复阶段（并行，join: all）=====
+  # service 显式取自 code-locator 的 CMDB 定位结果——工作区工具（ws_read_file 等）
+  # 要求 service 精确匹配已 prepare 的仓库目录，不能让 LLM 从 bug 描述里猜。
   fix:
     agent: fix-implementer
-    params: { plan: "$.nodes.plan.output" }
+    params:
+      plan: "$.nodes.plan.output"
+      service: "$.nodes.locate.output.service"
     retry: 2
 
   remediate:
@@ -101,11 +105,14 @@ nodes:
     params:
       fix: "$.nodes.fix.output"
       remediate: "$.nodes.remediate.output"
+      service: "$.nodes.locate.output.service"
     retry: 1
 
   review:
     agent: reviewer
-    params: { diff: "$.nodes.fix.output.diff" }
+    params:
+      diff: "$.nodes.fix.output.diff"
+      service: "$.nodes.locate.output.service"
 
   approve-commit:
     kind: approval
@@ -122,6 +129,7 @@ nodes:
     params:
       diff: "$.nodes.fix.output.diff"
       test: "$.nodes.test.output"
+      service: "$.nodes.locate.output.service"
 
   recap:
     agent: postmortem

@@ -21,7 +21,7 @@ import logging
 
 from agentscope.tool import FunctionTool, Toolkit
 
-from .tools import build_l1_tools, build_l2_tools
+from .tools import build_l1_tools, build_l2_tools, build_workspace_tools
 
 log = logging.getLogger("agentflow.toolkit")
 
@@ -73,6 +73,13 @@ def _build_function_tools(
                 func=t["func"], name=t["name"], description=t["description"],
                 is_read_only=True,  # L1 只读
             ))
+    # 工作区工具（§8.7）：修复侧 agent 真实读写本次 run 的工作区。与 shared_datasources
+    # 正交——它不是"共享数据源"（run 间以 current_run 隔离、越界即拒），加固姿态下仍启用。
+    for t in build_workspace_tools(agent_name):
+        tools.append(FunctionTool(
+            func=t["func"], name=t["name"], description=t["description"],
+            is_read_only=t["read_only"],
+        ))
     for t in build_l2_tools(agent_name, sandbox_client=sandbox_client, action_executor=action_executor):
         if t["func"] is None:
             continue

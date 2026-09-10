@@ -25,7 +25,10 @@ from .transcript import K_LLM_CALL, K_NODE, K_TOOL_CALL, TraceRecorder, scan_den
 log = logging.getLogger("agentflow.runner")
 
 # trace-analyst 需 max_iters≥12（2 个工具 + 链合成），默认 6 会迭代耗尽返回 {}（CLAUDE.md §10）
-_MAX_ITERS = {"trace-analyst": 12}
+# 逐 agent 迭代上限（默认 10）。修复侧需要「列目录 → 读文件 → 写文件 → 取 diff →
+# 校验」多轮工具调用，10 轮会在写完前耗尽（实测 fix-implementer 超限返回 {}）；
+# tester 要跑 gradle 并读结果，同样放宽。trace-analyst 见 CLAUDE.md §10。
+_MAX_ITERS = {"trace-analyst": 12, "fix-implementer": 20, "tester": 16}
 _DEFAULT_MAX_ITERS = 10
 
 # DeepSeek 计费（美元 / 百万 token）。deepseek-v4-flash 未公开单独费率，
@@ -110,9 +113,18 @@ class AgentNodeRunner:
         agent_config=None,
         agent_config_provider=None,
         shared_datasources: bool = True,
+        datasource=None,
+        cmdb=None,
     ) -> None:
         self.model = UsageTrackingModel(model)
         self.use_mock_datasource = use_mock_datasource
+        # 租户 CMDB（§9.4 TenantMappingProvider）：code-locator 的 locate_code 经它
+        # 解析 service→repo（真实 repo_url，供诊断段与工作区准备共用同一映射）。
+        self.cmdb = cmdb
+        # 真实数据源适配器（agents/datasources.py:RealDataSourceAdapter）；非 None 时
+        # 覆盖 mock，L1 工具（query_logs/get_trace/query_metrics/check_infra…）走 testbed。
+        # 与 shared_datasources 配合：加固姿态下 L1 工具不构建，此参数随之失效。
+        self.datasource = datasource
         self.mcp_manager = mcp_manager
         # AgentSpec DB 配置解析器（agent_config.AgentConfigResolver）：提供 system_prompt 覆盖 + enabled
         self.agent_config = agent_config
@@ -178,6 +190,8 @@ class AgentNodeRunner:
             use_mock=self.use_mock_datasource,
             shared_datasources=self.shared_datasources,
             mcp_clients=clients,
+            datasource=self.datasource,
+            cmdb=self.cmdb,
         )
         ctx = build_permission_context(agent, allow_extra=allow_extra)
         # 每节点独立 recorder：采集 llm_call / tool_call 明细；DENY 工具跑后补扫

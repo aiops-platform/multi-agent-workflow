@@ -10,3 +10,8 @@ from __future__ import annotations
 from contextvars import ContextVar
 
 current_tenant: ContextVar[str | None] = ContextVar("agentflow_current_tenant", default=None)
+
+# ``current_run`` 同理由 executor 在节点执行前置位，供 node_runner 解析「本次 run 的
+# 工作区」（§8.7.2 布局 workspace/{tenant}/{run}/repos/{service}）——修复侧 agent
+# （fix-implementer/tester/reviewer/committer）的工作区工具按它定位。
+current_run: ContextVar[str | None] = ContextVar("agentflow_current_run", default=None)

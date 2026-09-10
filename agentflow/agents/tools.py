@@ -98,6 +98,30 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         timeout=60, needs_approval=True,
         level="L2", description="重启 Pod（白名单）",
     ),
+    # ---- 工作区工具（修复侧；§8.7 真实读写代码，实现见 workspace_tools.py）----
+    # 路径/命令白名单在 workspace_tools 内强制（工作区前缀 + git 子命令白名单）。
+    "ws_read_file": ToolSpec(
+        "ws_read_file", ["fix-implementer", "tester", "reviewer", "code-locator"],
+        timeout=30, level="L1", description="读本次 run 工作区内文件",
+    ),
+    "ws_list_files": ToolSpec(
+        "ws_list_files", ["fix-implementer", "tester", "reviewer", "code-locator"],
+        timeout=30, level="L1", description="列出工作区内文件",
+    ),
+    "ws_write_file": ToolSpec(
+        "ws_write_file", ["fix-implementer"],
+        timeout=60, needs_approval=True, level="L2",
+        description="写工作区内文件（越界拒绝）",
+    ),
+    "ws_run_tests": ToolSpec(
+        "ws_run_tests", ["tester", "fix-implementer"],
+        timeout=300, level="L2", description="工作区内执行测试命令（白名单前缀）",
+    ),
+    "ws_git": ToolSpec(
+        "ws_git", ["committer", "fix-implementer"],
+        timeout=120, needs_approval=True, level="L2",
+        description="工作区内 git 操作（子命令白名单，无 pull/fetch/reset）",
+    ),
     "patch_resources": ToolSpec(
         "patch_resources",
         ["infra-remediator"],
@@ -260,3 +284,28 @@ def build_l1_tools(agent_name: str, *, use_mock: bool = True, cmdb=None, datasou
             "func": func,
         })
     return tools
+
+
+def build_workspace_tools(agent_name: str) -> list[dict]:
+    """为 agent 生成工作区工具（§8.7；实现见 ``workspace_tools.py``）。
+
+    与 L1/L2 并列的第三类：不经数据源、也不经沙箱，直接读写**本次 run 的工作区**
+    （定位靠 ``exec_context.current_run``，不接受 LLM 传 run/service 之外的越界参数）。
+    ``ws_read_file``/``ws_list_files`` 只读（DONT_ASK 下自动 ALLOW），
+    写/git/测试走 needs_approval，由租户 ToolPolicy 兜底。
+    """
+    from .workspace_tools import WORKSPACE_TOOLS
+
+    out: list[dict] = []
+    for spec in tools_for_agent(agent_name):
+        func = WORKSPACE_TOOLS.get(spec.name)
+        if func is None:
+            continue
+        out.append({
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": {"type": "object", "properties": {}},
+            "func": func,
+            "read_only": spec.level == "L1",
+        })
+    return out

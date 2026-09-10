@@ -290,12 +290,6 @@ async def main(argv: list[str] | None = None) -> None:
     settings = get_settings()
     queue = build_queue(settings)
     node_runner = None
-    if settings.deepseek_api_key:
-        from .agents.runner import AgentNodeRunner
-        from .agents.scopes import build_model
-
-        node_runner = AgentNodeRunner(build_model(settings))
-        log.info("node_runner=agent（DeepSeek）")
     # v5.3：管理库 + Router（租户 → 租户库）。Worker 未 provision 的租户时，Router 按默认
     # 策略回退（sqlite per-tenant 文件 / postgres 共享 DSN），与 API 侧一致 → 读得到 run。
     from .api.management_store import build_management_store
@@ -314,6 +308,53 @@ async def main(argv: list[str] | None = None) -> None:
                  args.tenant, topic_trigger(args.tenant), topic_command(args.tenant))
         await Worker(store, queue, node_runner=node_runner, tenant_id=args.tenant).run_forever()
         return
+
+    # node_runner 装配（需 router 已建：per-tenant MCP store + agent 配置路由）。
+    # 此前 Worker 只传 model → shared_datasources 恒为构造函数默认 True（加固姿态失效）、
+    # 租户 MCP 绑定与 DB agent 配置全部丢失；此处补齐 API 侧同款装配。
+    if settings.deepseek_api_key:
+        from .agents.agent_config import AgentConfigResolver
+        from .agents.mcp_manager import MCPClientManager
+        from .agents.runner import AgentNodeRunner
+        from .agents.scopes import build_model
+        from .api.app import build_cmdb, build_datasource
+
+        # agent 配置解析器（租户库 agent_configs 覆盖行）——API 侧的同名 provider 定义在
+        # init() 闭包内不可导入，此处用同一 router 自建（Worker 进程不做 CRUD，无需代际缓存）。
+        _resolver_cache: dict[str, AgentConfigResolver] = {}
+
+        async def _agent_config_provider(tenant_id: str | None) -> AgentConfigResolver:
+            key = tenant_id or "local"
+            hit = _resolver_cache.get(key)
+            if hit is None:
+                bundle = await router.get(key)
+                hit = AgentConfigResolver(await bundle.agent_config.list())
+                _resolver_cache[key] = hit
+            return hit
+
+        async def _mcp_store_provider(tenant_id: str | None):
+            bundle = await router.get(tenant_id or "local")
+            return bundle.mcp
+
+        mcp_manager = MCPClientManager(router, stores_provider=_mcp_store_provider)
+
+        async def _server_ids_for(agent_name: str, tenant_id: str | None = None):
+            """agent → 绑定的 MCP server id 子集（租户库 agent_configs 行）。"""
+            resolver = await _agent_config_provider(tenant_id)
+            return resolver.server_ids_for(agent_name)
+
+        mcp_manager.server_ids_for = _server_ids_for
+        await mcp_manager.load()
+        node_runner = AgentNodeRunner(
+            build_model(settings),
+            mcp_manager=mcp_manager,
+            agent_config_provider=_agent_config_provider,
+            shared_datasources=settings.shared_datasources,
+            datasource=build_datasource(settings),
+            cmdb=build_cmdb(),
+        )
+        log.info("node_runner=agent（DeepSeek）shared_datasources=%s datasource=%s",
+                 settings.shared_datasources, type(node_runner.datasource).__name__)
     if args.tenant:
         log.info("Worker(tenant=%s)：消费 %s / %s",
                  args.tenant, topic_trigger(args.tenant), topic_command(args.tenant))

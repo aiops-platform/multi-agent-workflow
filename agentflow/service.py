@@ -49,6 +49,10 @@ class InputsValidationError(ValueError):
     """run 入参不合法（v5.3 §7.3：加固姿态下 inputs.repos 直传被封堵）→ API 映射 400。"""
 
 
+# 需要代码工作区的 agent（修复侧，§8.7.2）——workflow 含其一即准备 run 工作区
+WORKSPACE_AGENTS = frozenset({"fix-implementer", "tester", "reviewer", "committer"})
+
+
 class RunService:
     def __init__(
         self,
@@ -175,6 +179,10 @@ class RunService:
         finally:
             if lock_key is not None:
                 await self.lock.release(lock_key)
+        # §8.7.2 工作区准备：必须早于 trigger 发布——修复侧 agent 的工作区工具按
+        # current_run 定位工作区，Worker 接单时工作区须已就绪。仅当 workflow 含
+        # 修复侧节点时准备（纯诊断 workflow 不付克隆代价）。
+        await self._prepare_workspace(run_id, tenant_id, workflow, inputs)
         if self.queue is not None:
             # 先置 queued 再发布：Worker 接单后才置 running，状态机不回跳
             await store.update_run(run_id, status="queued")
@@ -185,6 +193,23 @@ class RunService:
             )
             log.info("[%s] 已发布 run.trigger（queue 模式）", run_id)
         return run_id
+
+    async def _prepare_workspace(
+        self, run_id: str, tenant_id: str, workflow: Workflow, inputs: dict | None
+    ) -> None:
+        """准备 run 工作区；失败只告警不阻断建 run（工具使用时 fail-closed 报错）。"""
+        if not any(n.agent in WORKSPACE_AGENTS for n in workflow.dag.nodes.values()):
+            return
+        from .workspace.prepare import prepare_run_workspace
+
+        try:
+            await prepare_run_workspace(
+                tenant_id, run_id,
+                workspace_root=get_settings().workspace_root,
+                inputs=inputs,
+            )
+        except Exception as exc:  # noqa: BLE001 - 不阻断 run 创建
+            log.warning("[%s] 工作区准备失败（修复侧工具将报错）: %s", run_id, exc)
 
     # ------------------------------------------------------------------
     # inline 模式后台执行

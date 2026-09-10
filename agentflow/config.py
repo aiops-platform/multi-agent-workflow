@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     open_sandbox_domain: str = "localhost:8080"
     open_sandbox_api_key: str = ""
 
+    # ---- 工作区（§8.7.2）----
+    # Run 级代码工作区根目录；布局 {root}/{tenant}/{run}/repos/{service}。
+    # 修复侧 agent 的工作区工具（agents/workspace_tools.py）按 current_run 在此定位。
+    workspace_root: Path = Path("/tmp/agentflow-workspace")
+
     # ---- 观测（可选）----
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
