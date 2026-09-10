@@ -41,7 +41,14 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         "query_metrics",
         ["metrics-analyst", "root-cause"],
         timeout=30, rate_limit=60,
-        level="L1", description="查询 Prometheus 指标",
+        level="L1",
+        # metric 取值与 MetricsEvidenceSchema 字段对齐；未知值会报错（不再静默兜底）
+        description=(
+            "查询 Prometheus 指标（service + metric）。"
+            "metric 取值：cpu_percent | memory_percent | disk_percent | "
+            "error_rate | p95_latency_ms；"
+            "或 promql:<表达式> / cadvisor:<指标名> 直接下钻"
+        ),
     ),
     "check_infra": ToolSpec(
         "check_infra",

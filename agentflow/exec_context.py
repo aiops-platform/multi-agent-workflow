@@ -15,3 +15,8 @@ current_tenant: ContextVar[str | None] = ContextVar("agentflow_current_tenant", 
 # 工作区」（§8.7.2 布局 workspace/{tenant}/{run}/repos/{service}）——修复侧 agent
 # （fix-implementer/tester/reviewer/committer）的工作区工具按它定位。
 current_run: ContextVar[str | None] = ContextVar("agentflow_current_run", default=None)
+
+# ``current_node``：当前执行中的节点 id。供工具侧做「按节点」的配额/幂等计数——
+# ContextVar 在 asyncio task 间天然隔离（并行波次各节点互不影响），比共享实例
+# 计数器安全（同一 adapter 实例被同波多个节点并发调用会串扰）。
+current_node: ContextVar[str | None] = ContextVar("agentflow_current_node", default=None)

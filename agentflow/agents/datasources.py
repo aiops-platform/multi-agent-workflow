@@ -15,6 +15,8 @@ import logging
 
 import httpx
 
+from ..exec_context import current_node
+
 log = logging.getLogger("agentflow.datasources")
 
 ES_INDEX = "app-logs"
@@ -39,6 +41,10 @@ class RealDataSourceAdapter:
         self.namespace = namespace
         self._client = client or httpx.AsyncClient(timeout=timeout)
         self._owns_client = client is None
+        # 逃生舱（promql:/cadvisor:）按**节点**累计的调用数：键取自 ContextVar
+        # current_node（executor 置位，asyncio task 隔离）→ 同一 adapter 实例被同波
+        # 多节点并发调用时互不串扰；键为 ""（无执行上下文，如单测）时退化为全局计数。
+        self._escape_calls: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # query_logs → ES（index app-logs，app.* 字段）
@@ -176,6 +182,19 @@ class RealDataSourceAdapter:
     # ------------------------------------------------------------------
     async def query_metrics(self, service: str | None = None, metric: str | None = None) -> dict:
         pod_re = f"{service}.*" if service else ".*"
+        # 逃生舱硬上限：promql:/cadvisor: 是「五个标准指标取不到数据时的下钻口」，
+        # 不是探索工具。实测 metrics-analyst 用它逐字母枚举指标名跑了 54 次工具调用，
+        # 轮次耗尽 → 整个节点无输出。软约束（prompt）不够，这里兜底。
+        if metric and metric.startswith(("promql:", "cadvisor:")):
+            key = current_node.get() or ""  # ContextVar：并行波次按节点隔离
+            self._escape_calls[key] = self._escape_calls.get(key, 0) + 1
+            if self._escape_calls[key] > _ESCAPE_HATCH_LIMIT:
+                raise DataSourceError(
+                    f"promql:/cadvisor: 逃生舱本节点已用 {self._escape_calls[key] - 1} 次"
+                    f"（上限 {_ESCAPE_HATCH_LIMIT}）——请改用五个标准指标"
+                    "（cpu_percent/memory_percent/disk_percent/error_rate/p95_latency_ms）"
+                    "并立即基于已有数据输出结论；不要再用 promql: 做开放式探索。"
+                )
         expr = _promql(metric, pod_re)
         resp = await self._client.get(f"{self.prom_url}/api/v1/query", params={"query": expr})
         if resp.status_code >= 400:
@@ -235,21 +254,74 @@ class RealDataSourceAdapter:
 # ----------------------------------------------------------------------
 # PromQL 表达式映射（按指标名）
 # ----------------------------------------------------------------------
+# 容器 CPU 用量（cores）：与 _promql 的 cpu_limit 相除得占用百分比
+_CPU_CORES = "sum(rate(container_cpu_usage_seconds_total{{{sel}}}[1m]))"
+
+# promql:/cadvisor: 逃生舱单节点上限（防开放式探索耗尽 ReAct 轮次）
+_ESCAPE_HATCH_LIMIT = 3
+
+
 def _promql(metric: str | None, pod_re: str) -> str:
+    """metric 名 → PromQL 表达式。
+
+    **未知 metric 一律抛 :class:`DataSourceError`，不再静默兜底**。
+
+    此前的兜底是「未知 → 返回 CPU 使用率」：而 LLM 传的 5 个 metric 名
+    （cpu_percent/memory_percent/disk_percent/error_rate/p95_latency_ms，取自
+    ``MetricsEvidenceSchema``）**没有一个**命中旧白名单（旧键是 cpu/memory/disk…），
+    于是五个查询全部落到同一条 CPU 表达式——metrics-analyst 拿到 5 个一模一样的
+    数字，据此得出「CPU 0.5%，任务几乎空闲」的结论。真实数据 + 错误查询比假数据
+    更危险：数字看着可信，语义完全错位。
+
+    键名与 ``agents/schemas.py:MetricsEvidenceSchema`` 的字段保持一致（LLM 按 schema
+    填 metric），并保留 cadvisor:/promql: 前缀作为逃生舱（可直接下钻任意表达式）。
+    """
+    if metric and metric.startswith(("cadvisor:", "promql:")):
+        # 逃生舱：直接执行自定义 PromQL（绕过映射；仍走同一鉴权/异常路径）
+        return metric.split(":", 1)[1]
+
     sel = f'pod=~"{pod_re}",container!="POD"'
+    # 容器 CPU 上限（cores）= quota/period，用于把用量换算成百分比
+    cpu_limit = (
+        f'sum(container_spec_cpu_quota{{{sel}}}/container_spec_cpu_period{{{sel}}})'
+    )
     queries = {
-        "cpu": f"sum(rate(container_cpu_usage_seconds_total{{{sel}}}[1m]))",
-        "memory": f"sum(container_memory_working_set_bytes{{{sel}}})",
-        "disk": f'sum(container_fs_usage_bytes{{pod=~"{pod_re}"}})',
-        "disk_limit": f'sum(container_fs_limit_bytes{{pod=~"{pod_re}"}})',
-        "restarts": "sum(kubelet_managed_container_restart_total) ",
+        # 与 MetricsEvidenceSchema 字段逐一对应
+        "cpu_percent": (
+            f"100 * {_CPU_CORES.format(sel=sel)} / {cpu_limit}"
+        ),
+        # 分母 >0 过滤：容器未设 memory limit 时 limit=0，直接相除得 +Inf（实测
+        # order-service 即是），过滤后变「无数据」——比 Inf 诚实，避免 agent 把
+        # 无穷大当成「内存爆了」。
+        "memory_percent": (
+            f'100 * sum(container_memory_working_set_bytes{{{sel}}})'
+            f' / (sum(container_spec_memory_limit_bytes{{{sel}}}) > 0)'
+        ),
+        # 应用侧 data_disk_*（testbed 的 /data 盘）；total=0 时同样过滤为「无数据」
+        "disk_percent": (
+            f'100 * (1 - sum(data_disk_free_bytes{{service=~"{pod_re}"}})'
+            f' / (sum(data_disk_total_bytes{{service=~"{pod_re}"}}) > 0))'
+        ),
+        # 5xx 占该服务总请求的比例（应用侧 http_server_requests_*，带 service 标签）
+        "error_rate": (
+            f'100 * sum(rate(http_server_requests_seconds_count{{service=~"{pod_re}",'
+            f'status=~"5.."}}[5m]))'
+            f' / sum(rate(http_server_requests_seconds_count{{service=~"{pod_re}"}}[5m]))'
+        ),
+        # P95 延迟（Spring 未开 histogram 时退化为 avg：_sum/_count，仍是真实数据）
+        "p95_latency_ms": (
+            f'1000 * sum(rate(http_server_requests_seconds_sum{{service=~"{pod_re}"}}[5m]))'
+            f' / sum(rate(http_server_requests_seconds_count{{service=~"{pod_re}"}}[5m]))'
+        ),
     }
     if metric in queries:
         return queries[metric]
-    if metric and metric.startswith("cadvisor:"):
-        return metric[len("cadvisor:"):]
-    # 默认：CPU 使用率（cores）
-    return f"sum(rate(container_cpu_usage_seconds_total{{{sel}}}[1m]))"
+
+    raise DataSourceError(
+        f"未知 metric {metric!r}——不再静默兜底成 CPU（那会让不同指标返回同一个数字）。"
+        f"可用：{', '.join(sorted(queries))}；"
+        "或传 promql:<表达式> / cadvisor:<指标名> 直接下钻。"
+    )
 
 
 def _is_full_pod_name(name: str) -> bool:
