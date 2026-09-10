@@ -3,7 +3,7 @@
 **版本**：v5.5
 **最后更新**：2026-09-10
 **基线**：design-v5.4.md（动态编排版）、design-v5.3.md（多租户版）、design-v5.2.md（第三轮评审签字版）
-**状态**：🟢 **批 1 已实施并实测通过**；批 2（agentflow 接入）/批 3（删直连实现）待另行批准
+**状态**：🟢 **批 1 / 批 2 已实施并实测通过**；批 3（删直连实现）待另行批准
 
 ---
 
@@ -137,10 +137,37 @@ return f"sum(rate(container_cpu_usage_seconds_total{{{sel}}}[1m]))"
 | 批次 | 内容 | 状态 |
 |---|---|---|
 | **批 1** | 新建 `aiops-datasource-mcp-server` + 对真实测试床实测 | ✅ **已完成** |
-| 批 2 | agentflow 注册 server（`POST /mcp-servers`）+ 绑定 agent（`PUT /agent-configs/{name}` 的 `mcp_server_ids`）+ prompt 对齐 MCP 工具名 | ⏳ 待批准 |
+| **批 2** | agentflow 注册 server + 绑定 agent + prompt 对齐 + **时间窗下发** + E2E | ✅ **已完成** |
 | 批 3 | 删除直连实现（`datasources.py`、`build_datasource()`、相关测试与脚本），达成 MCP-only | ⏳ 待批准 |
 
 批 2 期间**两条路径并存**（`AGENTFLOW_SHARED_DATASOURCES=1` 仍走直连），可随时回退。
+本次验证采用 `=0`（MCP-only），以取得无歧义的信号。
+
+### 7.1 时间窗由调用方下发（批 2 新增的约定）
+
+MCP 工具要求 `start_time`/`end_time` 必填，但**谁来给**是个新问题——agent 不知道
+"当前时间"，自行编造窗口会得到错误的查询范围（正是本设计要消灭的失败模式）。
+
+**约定**：窗口来自**事件源**（工单 `opened_at` / 告警触发时刻），由调用方算好后经
+workflow `inputs.window_start` / `window_end` 传入；workflow 以 `$.inputs.*` 透传到各
+取数节点，节点再交给 agent，agent 原样转发给工具。
+
+- 取数节点声明 `require: [start_time, end_time]` —— 缺失即**快速失败**，不空转；
+- `check_infra` / `describe_pod` 无时间参数，节点**不**下发窗口。
+
+> 未采用「平台自动按 now-N 分钟填默认值」：那会让"诊断了哪段时间"变成隐式行为，
+> 而窗口选错时返回的数据毫无意义却看不出异常——与 §2.1 的教训同源。
+
+**批 2 验收结果**（`run_84fc520a3b`，MCP-only 姿态，2026-09-10）：
+
+| 验收点 | 结果 |
+|---|---|
+| 数据查询全部经 MCP | ✅ 44 次 MCP 调用（query_metrics 20 / query_logs 10 / check_infra+describe_pod 8 / get_trace 3）；**本地直连数据调用 0 次** |
+| 本地调用仅限工作区工具 | ✅ 31 次全是 `ws_*`（读写代码、跑测试）——设计如此 |
+| 指标值互不相同 | ✅ `cpu_percent=1.12`、`error_rate=0.0`、`p95_latency_ms=2.48` |
+| 诊断结论正确 | ✅ `trace.failing_service=warranty-service`、`rca=code_bug`（0.9） |
+| 时间窗真实生效 | ✅ 工具调用入参携带下发的窗口 |
+| 全链路闭环 | ✅ run → `success`，commit 产出真实 SHA |
 
 **批 1 验收结果**（对 minikube testbed 实测，2026-09-10）：
 
@@ -165,6 +192,10 @@ return f"sum(rate(container_cpu_usage_seconds_total{{{sel}}}[1m]))"
 | 5 | **`search_knowledge` 仍为 mock** | 恒返回 `found:True, INC0001`，按 v5.4 §7.3 属已标注缺口，真接缝=租户 MCP，本轮未动 | 中 |
 | 6 | **无 metrics/限流/Origin 校验** | 对齐 applog 的 v1 取舍；生产部署需由网关承担 | 低 |
 | 7 | **dev 端口 8300 硬编码约定** | 四处需同步（config.py / .env.example / README / 本地 .env） | 低 |
+| 8 | **Worker 不热载 agent 配置** | worker 进程内 `_agent_config_provider` 为**永久缓存**（无代际失效），API 侧 CRUD 后 worker 必须**重启**才生效——绑定新 MCP server 在 queue 模式下需重启 worker。生产需改为 TTL 或订阅变更 | 中 |
+| 9 | **无状态 HTTP 的会话开销** | `HttpMCPConfig` 默认 `is_stateful=False`，**每次工具调用建一个新 MCP session**（实测单 run 数百次握手）。功能正确但开销可观，后续可评估 stateful 或连接复用 | 中 |
+| 10 | **agent 偶发无谓调用** | 实测 `query_metrics` 被调用 20 次（5 个指标各一次即够）；`check_infra(namespace="default")` 传了错误 namespace（应省略以走服务端默认 `order`）而返回 0 pod。prompt 已加约束，仍属**模型行为**范畴，需持续观察 | 中 |
+| 11 | **本地直连实现暂留** | `datasources.py` / `build_datasource()` 仍在（`AGENTFLOW_SHARED_DATASOURCES=1` 时启用）。两套实现并存有**行为漂移**风险——批 3 删除前不应再改直连侧逻辑 | 中 |
 
 ## 9. 版本记录
 
@@ -174,4 +205,4 @@ return f"sum(rate(container_cpu_usage_seconds_total{{{sel}}}[1m]))"
 | v5.2.1 | 2026-09-09 | 实现状态注记（§17，不改签字结论） |
 | v5.3 | 2026-09-09 | 多租户架构版：五条架构原则 + 管理库/Router/tenantctl 三组件 + 实施批次 |
 | v5.4 | 2026-09-10 | 动态编排版（design-only）：四档执行体 + Dispatch 五层漏斗 + Plan-as-DAG + 计划审批 |
-| **v5.5** | 2026-09-10 | **数据面 MCP 化版**：`aiops-datasource-mcp-server`（领域型只读工具）+ 时间区间/查询目标强制契约 + 语义映射 server 侧；批 1 已实测通过，批 2/3 待批准 |
+| **v5.5** | 2026-09-10 | **数据面 MCP 化版**：`aiops-datasource-mcp-server`（领域型只读工具）+ 时间区间/查询目标强制契约 + 语义映射 server 侧 + 时间窗由调用方下发；**批 1/批 2 已实测通过**，批 3（删直连）待批准 |

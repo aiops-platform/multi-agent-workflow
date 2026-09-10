@@ -8,6 +8,17 @@ inputs:
   bug_report:
     type: object
     required: true
+  # 故障时间窗（ISO8601）。数据查询工具（v5.5 §5）**必须**带时间区间——
+  # 窗口来自事件源（工单 opened_at / 告警触发时刻），由调用方算好传入；
+  # 不留默认值：窗口错了返回的数据就没有意义，宁可在入口处要明确的值。
+  window_start:
+    type: string
+    required: true
+    description: "诊断时间窗起（ISO8601），如 2026-09-10T08:30:00（UTC）"
+  window_end:
+    type: string
+    required: true
+    description: "诊断时间窗止（ISO8601），如 2026-09-10T10:30:00（UTC）"
   repos:
     type: object
     required: false
@@ -15,26 +26,44 @@ inputs:
 
 nodes:
   # ===== 诊断阶段（metrics/infra 为负证据）=====
+  # 取数节点把时间窗透传给 agent，agent 再原样传给 MCP 数据工具（必填参数）。
   triage:
     agent: triage
-    params: { bug: "$.inputs.bug_report" }
+    require: [start_time, end_time]
+    params:
+      bug: "$.inputs.bug_report"
+      start_time: "$.inputs.window_start"
+      end_time: "$.inputs.window_end"
     on_failure: abort
 
   logs:
     agent: log-analyst
-    params: { bug: "$.nodes.triage.output.summary" }
+    require: [start_time, end_time]
+    params:
+      bug: "$.nodes.triage.output.summary"
+      start_time: "$.inputs.window_start"
+      end_time: "$.inputs.window_end"
     on_failure: continue
 
   trace:
     agent: trace-analyst
-    params: { bug: "$.nodes.triage.output.summary" }
+    require: [start_time, end_time]
+    params:
+      bug: "$.nodes.triage.output.summary"
+      start_time: "$.inputs.window_start"
+      end_time: "$.inputs.window_end"
     on_failure: abort
 
   metrics:
     agent: metrics-analyst
-    params: { bug: "$.nodes.triage.output.summary" }
+    require: [start_time, end_time]
+    params:
+      bug: "$.nodes.triage.output.summary"
+      start_time: "$.inputs.window_start"
+      end_time: "$.inputs.window_end"
     on_failure: continue
 
+  # infra 用 check_infra/describe_pod（K8s 当前状态），**无时间参数**
   infra:
     agent: infra-locator
     params: { bug: "$.nodes.triage.output.summary" }
@@ -59,6 +88,8 @@ nodes:
 
   rca:
     agent: root-cause
+    # root-cause 也会自行取证（可用全部 5 个数据工具），故同样需要时间窗
+    require: [start_time, end_time]
     params:
       logs: "$.nodes.logs.output.summary"
       trace: "$.nodes.trace.output.summary"
@@ -66,6 +97,8 @@ nodes:
       infra: "$.nodes.infra.output.summary"
       code: "$.nodes.locate.output.summary"
       know: "$.nodes.know.output.summary"
+      start_time: "$.inputs.window_start"
+      end_time: "$.inputs.window_end"
     on_failure: abort
 
   plan:

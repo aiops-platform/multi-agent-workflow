@@ -296,6 +296,10 @@ class PgAgentConfigStore:
                  col["reasoning_enabled"], col["updated_at"], col["updated_at"]),
             )
         except Exception as exc:
+            # 失败语句会中止本连接的事务；**必须回滚**，否则该 PG 连接后续所有语句
+            # 都报 InFailedSqlTransaction（实测：一次 NotNullViolation 后，
+            # 同连接上所有 /agent-configs 请求持续 500，直到进程重启）。
+            await self._c.rollback()
             from psycopg.errors import UniqueViolation
 
             if isinstance(exc, UniqueViolation):

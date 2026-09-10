@@ -290,6 +290,9 @@ class PgMCPStore:
                  col["enabled"], col["updated_at"], col["updated_at"]),
             )
         except Exception as exc:
+            # 失败语句会中止本连接的事务；**必须回滚**，否则该 PG 连接后续所有语句都
+            # 报 InFailedSqlTransaction（同 agent_store.PgAgentConfigStore.save）。
+            await self._c.rollback()
             from psycopg.errors import UniqueViolation
 
             if isinstance(exc, UniqueViolation):

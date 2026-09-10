@@ -38,28 +38,41 @@ def _schema_hint(schema: dict) -> str:
 
 
 # ======================================================================
-# 诊断侧（只读，全部 L1 工具）
+# 诊断侧（只读，工具经 MCP 提供）
 # ======================================================================
+# 数据查询工具（经 MCP 提供）的公共约定：v5.5 §5 —— 查询**必须**带时间区间与目标。
+# 时间窗由工作流经节点入参下发（start_time / end_time），agent 原样转发给工具即可；
+# 工具名在 agent 侧带 `mcp__<server>__` 前缀，按可用工具列表匹配后缀即可。
+_WINDOW_RULE = (
+    "时间参数：数据工具**必须**带 start_time / end_time（ISO8601）——"
+    "入参里已给出这两个值，**原样转发**给工具，不要自行编造时间窗口。\n"
+)
+
 SYSTEM_PROMPTS: dict[str, str] = {
     "triage": (
         "你是 AI 运维平台的「症状分类」Agent（triage）。根据 bug ticket 判断症状类型。\n"
         "规则：\n"
-        "1. 先调用 MCP 工具获取证据（query_logs / get_trace / query_metrics / check_infra / search_knowledge）\n"
-        "2. 最终只输出一个严格 JSON 对象，不要任何多余文字或 markdown 代码块：\n"
+        "1. 先调用 MCP 数据工具获取证据（query_logs / get_trace / query_metrics / "
+        "check_infra / describe_pod）\n"
+        f"2. {_WINDOW_RULE}"
+        "3. 最终只输出一个严格 JSON 对象，不要任何多余文字或 markdown 代码块：\n"
         '{"symptom_type": "hang"|"crash"|"slow"|"degraded", "severity": "high"|"medium"|"low", "summary": "一句话中文摘要"}\n'
         "symptom_type 取值：请求挂起=hang，进程崩溃/反复重启=crash，仅变慢=slow，其他=degraded。"
     ),
     "log-analyst": (
         "你是「日志分析」Agent（log-analyst）。任务：分析日志定位异常类型。\n"
         "规则：\n"
-        "1. 先调用 MCP 工具 query_logs(service, level='ERROR') 获取日志\n"
+        "1. 调用 MCP 工具 query_logs(service, level='ERROR', start_time, end_time) 获取日志\n"
+        f"   {_WINDOW_RULE}"
         "2. 最终只输出一个严格 JSON 对象：\n"
         '{"error_type": "异常类型（如 IOException / BindingException）", "error_message": "首条关键错误消息", "summary": "一句话摘要"}'
     ),
     "trace-analyst": (
         "你是「链路追踪分析」Agent（trace-analyst）。任务：分析 trace 定位故障 span 与失败服务。\n"
         "规则：\n"
-        f"1. 先调用 MCP 工具 get_trace() 获取调用链（返回 chain + failing_service）\n"
+        "1. 先调用 MCP 工具 query_logs 按 trace_id 取链路日志，再调用 get_trace 重建调用链"
+        "（返回 chain + failing_service）\n"
+        f"   {_WINDOW_RULE}"
         "2. 区分「业务根因」与「下游调用症状」：\n"
         "   - 业务根因：服务自身抛的业务/参数异常（如 IllegalArgumentException「必填参数 fin 没有传」、BindingException「not found」）\n"
         "   - 下游调用症状：错误消息含 feign / Read timed out / Connection refused / executing http（调用下游失败）\n"
@@ -70,7 +83,18 @@ SYSTEM_PROMPTS: dict[str, str] = {
     "metrics-analyst": (
         "你是「指标分析」Agent（metrics-analyst）。任务：分析 Prometheus 指标定位异常（CPU/内存/磁盘/延迟/错误率）。\n"
         "规则：\n"
-        f"1. 先调用 MCP 工具 query_metrics(service, metric) 获取指标\n2. {_JSON_RULE}\n"
+        "1. 调用 MCP 工具 query_metrics(service, metric, start_time, end_time)，"
+        "metric 取以下**五个标准指标**：\n"
+        "   cpu_percent | memory_percent | disk_percent | error_rate | p95_latency_ms\n"
+        f"   {_WINDOW_RULE}"
+        "   （metric 是**领域语义，不是 PromQL 表达式**；传入其它值会直接报错并列出\n"
+        "   可用项——按提示纠正，**不要**尝试编写 PromQL，本工具不接受表达式）\n"
+        "2. 指标返回 value=null 表示**该指标无数据**（如容器未设 limit 致百分比无定义、\n"
+        "   应用未暴露该指标、或窗口内无采集点）——如实记入 anomalies 说明某项无法判定，\n"
+        "   **不要臆测数值、更不要当成 0**\n"
+        "3. 五个指标各调用一次即够；不要反复试不同 service/uri 做开放式探索\n"
+        "   ——那会耗尽轮次导致整个节点无输出\n"
+        f"4. {_JSON_RULE}\n"
         f"输出 Schema：{_schema_hint(MetricsEvidenceSchema)}"
     ),
     "infra-locator": (
@@ -94,7 +118,10 @@ SYSTEM_PROMPTS: dict[str, str] = {
     "root-cause": (
         "你是「根因分析」Agent（root-cause）。任务：综合多维证据给出根因。\n"
         "规则：\n"
-        "1. 依次调用 MCP 工具 get_trace / query_metrics / check_infra / locate_code / search_knowledge 获取证据\n"
+        "1. 先看上游已给出的各维证据（下方入参）；**仅在证据不足时**才自行调用\n"
+        "   MCP 数据工具补充（query_logs / get_trace / query_metrics / check_infra / "
+        "describe_pod）\n"
+        f"   {_WINDOW_RULE}"
         "2. 判定优先级：\n"
         "   - 若 trace/log 显示某服务抛业务/参数异常（IllegalArgumentException「必填参数/没有传」、"
         "BindingException「not found」等）→ 优先 code_bug（代码缺陷）\n"

@@ -25,7 +25,7 @@ from pydantic import BaseModel
 
 from ..agents.agent_config import AgentConfigResolver
 from ..agents.mcp_manager import MCPClientManager
-from ..agents.registry import DIAGNOSE_AGENTS, FIX_AGENTS
+from ..agents.registry import DIAGNOSE_AGENTS, FIX_AGENTS, get_agent_spec
 from ..agents.tools import tools_for_agent
 from ..approval.notifier import ApprovalNotifier
 from ..approval.sweeper import ApprovalSweeper
@@ -1076,11 +1076,27 @@ async def update_agent_config(
     name: str, payload: AgentConfigPayload, ctx: TenantContext = Depends(get_tenant_context)
 ) -> dict:
     """完整对象覆盖式更新（builtin/custom 均可）。文本清空/不传 → 归 NULL 回退内置；
-    custom 不允许最终 system_prompt 为空。origin 保持不变。"""
+    custom 不允许最终 system_prompt 为空。origin 保持不变。
+
+    **内置 agent 无覆盖行时为 upsert**：v5.3 起不再 seed 内置行（GET 端点在无行时
+    合成视图），若此处仍要求行存在，则「给未定制过的内置 agent 绑定 MCP server」
+    这条路径根本走不通（PUT 恒 404）——而绑定 mcp_server_ids 正是控制面文档给出的
+    用法。故对 builtin 名单内的名字，无行时按静态注册表合成基线并插入覆盖行。
+    """
     cs = await _control_stores(ctx)
     existing = await cs.agent_config.get(name)
     if existing is None:
-        raise HTTPException(status_code=404, detail=f"agent 配置不存在: {name!r}")
+        if name not in _BUILTIN_AGENT_NAMES:
+            raise HTTPException(status_code=404, detail=f"agent 配置不存在: {name!r}")
+        # role/stage 是 NOT NULL 列，从静态注册表取真值（不能留 None）；
+        # description/system_prompt/schema 留 NULL = 未覆盖 → 运行时回退静态默认。
+        spec = get_agent_spec(name)
+        existing = {
+            "name": name, "origin": "builtin", "role": spec.role, "stage": spec.stage,
+            "enabled": True, "reasoning_enabled": None, "mcp_server_ids": None,
+        }
+        await cs.agent_config.save({**existing, "description": None,
+                                    "system_prompt": None, "schema": None})
     _validate_agent_role_stage(payload.role, payload.stage)
     role = payload.role if payload.role in _AGENT_ROLES else existing["role"]
     stage = _acfg_str(payload.stage) or existing["stage"]
