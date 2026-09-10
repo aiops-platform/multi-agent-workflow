@@ -72,6 +72,13 @@ class Settings(BaseSettings):
     # 名称保留是为了不破坏既有 .env；新代码请按"repos 直传开关"理解。
     shared_datasources: bool = False
 
+    # ---- 配置热载（Worker）----
+    # Worker 独立进程看不到 API 的内存状态，按「库内指纹」判定 agent 配置 / MCP server
+    # 是否变过（`agents/config_sync.py`）。本值 = 两次查库检查之间的**最小间隔**（秒）：
+    # 配置变更最迟在本间隔内生效。0 = 每次节点执行都查（测试用；生产不建议，
+    # 会增加 DB 往返）。
+    config_refresh_sec: float = 5.0
+
     # ---- 沙箱（M4）----
     open_sandbox_domain: str = "localhost:8080"
     open_sandbox_api_key: str = ""

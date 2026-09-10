@@ -313,30 +313,28 @@ async def main(argv: list[str] | None = None) -> None:
     # 此前 Worker 只传 model → 租户 MCP 绑定与 DB agent 配置全部丢失；此处补齐
     # API 侧同款装配。数据源查询全部经 MCP（design-v5.5），无进程内直连。
     if settings.deepseek_api_key:
-        from .agents.agent_config import AgentConfigResolver
+        from .agents.config_sync import TenantConfigSync
         from .agents.mcp_manager import MCPClientManager
         from .agents.runner import AgentNodeRunner
         from .agents.scopes import build_model
         from .api.app import build_cmdb
-
-        # agent 配置解析器（租户库 agent_configs 覆盖行）——API 侧的同名 provider 定义在
-        # init() 闭包内不可导入，此处用同一 router 自建（Worker 进程不做 CRUD，无需代际缓存）。
-        _resolver_cache: dict[str, AgentConfigResolver] = {}
-
-        async def _agent_config_provider(tenant_id: str | None) -> AgentConfigResolver:
-            key = tenant_id or "local"
-            hit = _resolver_cache.get(key)
-            if hit is None:
-                bundle = await router.get(key)
-                hit = AgentConfigResolver(await bundle.agent_config.list())
-                _resolver_cache[key] = hit
-            return hit
 
         async def _mcp_store_provider(tenant_id: str | None):
             bundle = await router.get(tenant_id or "local")
             return bundle.mcp
 
         mcp_manager = MCPClientManager(router, stores_provider=_mcp_store_provider)
+
+        # 配置热载：Worker 是独立进程，看不到 API 侧的内存代际计数器，只能按**库内指纹**
+        # 判定配置是否变过（见 agents/config_sync.py）。此前这里是永久缓存 → 绑定新 MCP
+        # server 后必须重启 Worker 才生效。
+        sync = TenantConfigSync(
+            router, mcp_manager, interval=settings.config_refresh_sec
+        )
+
+        async def _agent_config_provider(tenant_id: str | None):
+            """agent 配置解析器（租户库 agent_configs 覆盖行），按指纹自动热载。"""
+            return await sync.resolver(tenant_id)
 
         async def _server_ids_for(agent_name: str, tenant_id: str | None = None):
             """agent → 绑定的 MCP server id 子集（租户库 agent_configs 行）。"""

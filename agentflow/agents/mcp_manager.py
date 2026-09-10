@@ -181,6 +181,39 @@ class MCPClientManager:
         for row in rows:
             await self._load_row(row, tenant_id)
 
+    async def revalidate(self, tenant_id: str | None = None) -> bool:
+        """与库对齐：淘汰「已删除 / 已禁用 / 配置已改」的 server，并允许下次重载新增的。
+
+        与 :meth:`refresh_server`（本进程 CRUD 后按 mid 精确重建）不同，本方法供**外部
+        进程**（如 Worker）用——它看不到 API 侧的内存状态，只能比对库中现状。
+
+        为什么不能只清 ``_loaded``：``_load_row`` 对已缓存的 (tenant, mid) 会**早退**
+        （防 stateful 连接被第二个 task 接管），所以光清 `_loaded` 只会补上新增项，
+        删掉或改过的旧 client 会一直留着。必须先按 ``updated_at`` 差异 evict。
+
+        :returns: 是否有条目被淘汰
+        """
+        tkey = self._key(tenant_id)
+        store = await self._store_for(tenant_id)
+        fresh = {r["id"]: r for r in await store.list_enabled()}
+
+        changed = False
+        for key in list(self._clients):
+            if key[0] != tkey:
+                continue
+            mid = key[1]
+            cached = self._rows.get((tkey, mid)) or {}
+            row = fresh.get(mid)
+            # 记录已删除 / 已禁用（不在 list_enabled）/ 配置变过（updated_at 变）→ 淘汰
+            if row is None or row.get("updated_at") != cached.get("updated_at"):
+                await self._evict(tkey, mid)
+                changed = True
+        # 允许下次 _ensure_loaded 重新扫库补齐新增项（已缓存的会早退，不重复建）
+        self._loaded.discard(tkey)
+        if changed:
+            log.info("MCP 配置已变更，淘汰陈旧 client（tenant=%s）", tkey or "<default>")
+        return changed
+
     async def refresh_server(self, mid: str, tenant_id: str | None = None) -> None:
         """CRUD 后重建该 server（租户维度）：先 evict 旧 client，再从库里当前记录重建。
 
