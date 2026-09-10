@@ -207,38 +207,54 @@ class AgentNodeRunner:
             middlewares=[recorder],
         )
         user = params if isinstance(params, dict) and params else {"params": params}
-        out = await run_agent(a, user)
-        tokens = model.input_tokens + model.output_tokens
-        cost = (
-            model.input_tokens * _PRICE_INPUT_PER_M
-            + model.output_tokens * _PRICE_OUTPUT_PER_M
-        ) / 1_000_000
-        usage = {"tokens": tokens, "cost": round(cost, 6)}
-        self.last_usage = usage
-        # 明细行 = [node 汇总] + llm/tool + 跑后补扫的 denied；executor 取走落 node_traces
-        node_row = {
-            "agent": agent,
-            "enabled": cfg.enabled if cfg is not None else True,
-            "input": user,
-            "output": out,
-            "tokens": tokens,
-            "cost": round(cost, 6),
-            "llm_steps": sum(1 for r in recorder.rows if r["kind"] == K_LLM_CALL),
-            "tool_steps": sum(1 for r in recorder.rows if r["kind"] == K_TOOL_CALL),
-        }
-        # 跑后补扫 DENY 工具调用；agent 无 .state.context（轻量桩/测试替换）时退回空
-        denied_ctx = getattr(getattr(a, "state", None), "context", None)
-        self._trace_by_node[key] = (
-            [{"kind": K_NODE, "name": None, "payload": node_row}]
-            + recorder.rows
-            + scan_denied_blocks(denied_ctx)
-        )
-        self._usage_by_node[key] = usage
-        log.info(
-            "agent[%s] -> %s (tokens=%s, cost=$%.6f)",
-            agent,
-            (str(out)[:120] if out else "{}"),
-            tokens,
-            cost,
-        )
+
+        def _capture(out_obj, error: BaseException | None) -> None:
+            """记录本次节点执行的用量与 trace 明细（**成功与失败都记**）。
+
+            失败路径尤其需要 trace：轮次耗尽 / 输出不可解析正是最该观测的场景
+            （此前 run_agent 直接抛错会让 llm_call / tool_call 明细整批丢失，
+            现场只剩一句异常文本）。
+            """
+            tokens = model.input_tokens + model.output_tokens
+            cost = (
+                model.input_tokens * _PRICE_INPUT_PER_M
+                + model.output_tokens * _PRICE_OUTPUT_PER_M
+            ) / 1_000_000
+            usage = {"tokens": tokens, "cost": round(cost, 6)}
+            self.last_usage = usage
+            node_row = {
+                "agent": agent,
+                "enabled": cfg.enabled if cfg is not None else True,
+                "input": user,
+                "output": out_obj,
+                "tokens": tokens,
+                "cost": round(cost, 6),
+                "llm_steps": sum(1 for r in recorder.rows if r["kind"] == K_LLM_CALL),
+                "tool_steps": sum(1 for r in recorder.rows if r["kind"] == K_TOOL_CALL),
+            }
+            if error is not None:
+                node_row["error"] = f"{type(error).__name__}: {error}"
+            # 跑后补扫 DENY 工具调用；agent 无 .state.context（轻量桩/测试替换）时退回空
+            denied_ctx = getattr(getattr(a, "state", None), "context", None)
+            self._trace_by_node[key] = (
+                [{"kind": K_NODE, "name": None, "payload": node_row}]
+                + recorder.rows
+                + scan_denied_blocks(denied_ctx)
+            )
+            self._usage_by_node[key] = usage
+            log.info(
+                "agent[%s] -> %s (tokens=%s, cost=$%.6f)%s",
+                agent,
+                (str(out_obj)[:120] if out_obj else "{}"),
+                tokens,
+                cost,
+                f" [FAILED {type(error).__name__}]" if error is not None else "",
+            )
+
+        try:
+            out = await run_agent(a, user)
+        except BaseException as exc:  # 先补记 trace 再原样抛出（含 CancelledError）
+            _capture(None, exc)
+            raise
+        _capture(out, None)
         return out

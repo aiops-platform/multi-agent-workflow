@@ -15,7 +15,8 @@ from agentflow.workspace.models import RepoSpec
 # 测试基础设施：本地源仓库
 # ----------------------------------------------------------------------
 def git(*args: str, cwd: Path | None = None) -> str:
-    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    # check=False：返回码由下面的 assert 显式判定（要读到 stderr 才能给出可读错因）
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
     assert r.returncode == 0, f"git {' '.join(args)} 失败: {r.stderr}"
     return r.stdout.strip()
 
@@ -148,3 +149,28 @@ async def test_code_locator_cmdb_flow(source_repos: dict[str, Path], tmp_path: P
     dest = await wm.prepare_one(spec)
     assert (dest / "src" / "Warranty.java").exists()
     assert (await cmdb.get_services_for_tenant("team-alpha")) == ["warranty-service"]
+
+
+# ----------------------------------------------------------------------
+# 场景 5：工具输出截断必须保留头部且显式可见
+# ----------------------------------------------------------------------
+def test_git_output_truncation_keeps_head_and_is_visible() -> None:
+    """git diff 截断必须保留**头部**并显式标注。
+
+    回归背景：旧实现 ``text[-4000:]`` 保留尾部，把 diff 的元信息
+    （``diff --git a/... b/...`` 与 ``@@ -old,+new @@``）切掉；fix-implementer
+    拿到无头 diff 后自行编造了一段假的 ``index 0000000..1111111`` 上报。
+    截断若静默，模型无从知道所见内容残缺。
+    """
+    from agentflow.agents.workspace_tools import _truncate
+
+    text = "diff --git a/x b/x\n@@ -1,12 +1,12 @@\n" + "x" * 500
+    body, truncated = _truncate(text, 40)
+    assert truncated is True
+    assert body.startswith("diff --git a/x b/x")   # 头部（含路径）保留
+    assert "@@" in body                            # hunk 头保留
+    assert "输出被截断" in body                    # 截断显式可见
+    assert "省略 5" in body or "省略" in body
+
+    same, not_truncated = _truncate("short", 40)
+    assert (same, not_truncated) == ("short", False)

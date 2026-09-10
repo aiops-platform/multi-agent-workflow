@@ -122,25 +122,58 @@ def build_agent(
     )
 
 
+class AgentOutputError(RuntimeError):
+    """agent 回复文本里不含可解析的 JSON（§7 输出契约未满足）。
+
+    典型成因：ReAct 轮次耗尽（AgentScope 在 max_iters 用尽时 yield 一段固定说明文本
+    而非 JSON）、模型只调工具未收尾、回复被截断。
+
+    此前 ``extract_json`` 静默返回 ``{}``，使「做了但没汇报」与「完全没做」不可区分：
+    实测 committer 已成功 add+commit，却因轮次耗尽返回 ``{}``，run 照常显示 success，
+    副作用是否真的发生无从判断（design-v5.4 §3.1 标注的缺口）。
+    """
+
+    def __init__(self, agent_name: str, text: str) -> None:
+        preview = " ".join((text or "").split())[:200]
+        super().__init__(
+            f"agent {agent_name} 未输出合法 JSON（§7 输出契约未满足）: {preview!r}"
+        )
+        self.agent_name = agent_name
+        self.text = text
+
+
 async def run_agent(agent: Agent, user_input: dict | str) -> dict:
-    """喂入输入并解析出严格 JSON（§7 输出契约）。"""
+    """喂入输入并解析出严格 JSON（§7 输出契约）。
+
+    解析失败抛 :class:`AgentOutputError`（**不再静默返回 ``{}``**），交由 executor 的
+    ``retry`` / ``on_failure`` 策略定夺（§8.1）：诊断侧 ``on_failure: continue`` 会退化为
+    负证据（``{"found": false, ...}``），修复侧 ``abort`` 则让节点显式失败。
+    """
     content = user_input if isinstance(user_input, str) else json.dumps(user_input, ensure_ascii=False)
     final = await agent.reply(UserMsg(name="user", content=content))
     text = "".join(b.text for b in final.get_content_blocks("text") if b.text)
-    return extract_json(text)
+    out = extract_json(text)
+    if out is None:
+        raise AgentOutputError(getattr(agent, "name", "?"), text)
+    return out
 
 
 # ======================================================================
 # JSON 提取 / 断言辅助（S-011：子串包含断言，§7）
 # ======================================================================
-def extract_json(text: str) -> dict:
-    """从回复文本中提取第一个完整 JSON 对象（容忍代码块/前后文噪音）。"""
+def extract_json(text: str) -> dict | None:
+    """提取回复文本里第一个完整 JSON 对象；**无合法 JSON 返回 None**。
+
+    容忍 markdown 代码块与前后文噪音。返回 ``None``（而非 ``{}``）以区分
+    「没有 JSON」与「JSON 恰好是空对象」——调用方据此决定失败语义
+    （:func:`run_agent` 抛 AgentOutputError）。
+    """
     if not text:
-        return {}
+        return None
     text = re.sub(r"```(?:json)?|```", "", text)
     start = text.find("{")
     if start == -1:
-        return {}
+        return None
     depth, in_str, esc = 0, False, False
     for i in range(start, len(text)):
         c = text[i]
@@ -163,8 +196,8 @@ def extract_json(text: str) -> dict:
                 try:
                     return json.loads(raw)
                 except json.JSONDecodeError:
-                    return {}
-    return {}
+                    return None
+    return None
 
 
 # ======================================================================

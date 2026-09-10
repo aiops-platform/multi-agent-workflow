@@ -26,6 +26,10 @@ from ..workspace.manager import WorkspaceManager
 
 _MAX_WRITE_BYTES = 1_000_000
 _READ_MAX_BYTES = 200_000
+# git 输出上限：diff 远超旧值 4000（实测场景2 的 diff 约 4.2k 字符，恰好被截掉头部）
+_GIT_OUTPUT_LIMIT = 40_000
+# 测试输出上限（保留尾部：gradle 结论在末尾）
+_TEST_OUTPUT_LIMIT = 8_000
 
 # git 子命令白名单（§4.6：无 pull/fetch/reset——run 期间禁止漂移）
 _GIT_ALLOWED = {"status", "diff", "add", "commit", "push", "rev-parse", "branch", "checkout", "log"}
@@ -143,11 +147,29 @@ async def ws_run_tests(service: str, command: str | None = None, timeout: int = 
         proc.kill()
         out, rc, timed_out = b"(timeout)", -1, True
     text = out.decode("utf-8", "replace")
+    # 测试输出保留**尾部**（结论 BUILD SUCCESSFUL/FAILED 在末尾）；截断处显式标注
+    if len(text) > _TEST_OUTPUT_LIMIT:
+        omitted = len(text) - _TEST_OUTPUT_LIMIT
+        text = f"... [前 {omitted} 字符已省略] ...\n" + text[-_TEST_OUTPUT_LIMIT:]
     return {
         "passed": rc == 0, "rc": rc, "timed_out": timed_out,
-        "output": text[-4000:],
+        "output": text,
         "summary": f"`{cmd}` → rc={rc}" + ("（超时）" if timed_out else ""),
     }
+
+
+def _truncate(text: str, limit: int) -> tuple[str, bool]:
+    """超长输出保留**头部**并显式标注截断。
+
+    git diff 的头部是元信息（``diff --git a/... b/...`` + ``@@ -old,+new @@``），
+    保留尾部会把它们切掉，模型拿到无头 diff 只能自行编造——实测 fix-implementer
+    据此上报了一段伪造的 ``index 0000000..1111111`` / ``@@ -1,12 +1,12 @@``。
+    截断必须显式可见（哨兵文本），否则模型无从知道自己看到的是残缺内容。
+    """
+    if len(text) <= limit:
+        return text, False
+    omitted = len(text) - limit
+    return f"{text[:limit]}\n... [输出被截断，省略 {omitted} 字符] ...", True
 
 
 async def ws_git(service: str, args: list[str], message: str = "", remote: str = "origin") -> dict:
@@ -175,9 +197,10 @@ async def ws_git(service: str, args: list[str], message: str = "", remote: str =
     text = out.decode("utf-8", "replace")
     if proc.returncode != 0:
         raise WorkspaceToolError(f"git {' '.join(args)} 失败: {text[:300]}")
+    body, truncated = _truncate(text, _GIT_OUTPUT_LIMIT)
     return {
-        "rc": proc.returncode, "output": text[-4000:],
-        "summary": f"git {' '.join(args)} → ok",
+        "rc": proc.returncode, "output": body, "truncated": truncated,
+        "summary": f"git {' '.join(args)} → ok" + ("（输出已截断）" if truncated else ""),
     }
 
 
