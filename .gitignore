@@ -21,7 +21,10 @@ htmlcov/
 *.sqlite3
 data/
 tmp/
-workspace/
+# Run 级代码工作区（§8.7.2，默认 /tmp/agentflow-workspace）。**必须锚定根目录**：
+# 裸 `workspace/` 会匹配任意深度的同名目录，把源码包 agentflow/workspace/（M3 工作区
+# 管理器）整个吞掉 —— 曾导致该模块从未入库、新克隆 ImportError。
+/workspace/
 
 # 沙箱镜像构建产物
 docker/sandbox/wheels/
