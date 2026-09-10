@@ -5,7 +5,7 @@
 
 ---
 
-## 一、分层架构总览（7 层）
+## 一、分层架构总览（8 层 + 外部数据源）
 
 ```mermaid
 flowchart TB
@@ -14,7 +14,7 @@ flowchart TB
     end
 
     subgraph L2["② 工作流定义层"]
-        WF["workflows/*.yaml<br/>声明式 DAG（节点+边）"]
+        WF["workflows/*.yaml<br/>声明式 DAG（节点+边）<br/>inputs 含 window_start/window_end"]
         CORE["core/workflow.py 版本冻结<br/>core/dag.py join/skip 语义<br/>core/expressions.py when 条件"]
     end
 
@@ -26,25 +26,35 @@ flowchart TB
     subgraph L4["④ Agent 与工具治理层"]
         REG["15-agent 编队<br/>agents/registry.py"]
         SCOPE["AgentScope 2.0.3 + DeepSeek<br/>agents/scopes.py"]
-        TOOL["工具治理 L1/L2<br/>agents/tools.py · sandbox/policy.py"]
-        DS["真实数据源适配<br/>agents/datasources.py<br/>ES / Prometheus / kubectl"]
+        TOOL["本地工具<br/>agents/tools.py（CMDB 映射 / 知识检索）<br/>workspace_tools.py（代码工作区）"]
+        MCPC["MCP 客户端<br/>agents/mcp_manager.py<br/>per-tenant 绑定 agent_configs.mcp_server_ids"]
     end
 
-    subgraph L5["⑤ 副作用执行层（沙箱 / 集群）"]
+    subgraph L45["⑤ 数据面：MCP（v5.5 起唯一取数路径）"]
+        MCPS["aiops-datasource-mcp-server<br/>独立仓库 aiops-mcp-servers<br/>领域型只读工具 · 时间区间必填<br/>语义映射在 server 侧"]
+    end
+
+    subgraph L5["⑥ 副作用执行层（沙箱 / 集群）"]
         SB["沙箱 Pod<br/>sandbox/orchestrator.py + exec_service.py"]
         AE["ActionExecutor 白名单动作<br/>sandbox/action_executor.py"]
     end
 
-    subgraph L6["⑥ 状态与基础设施层"]
+    subgraph L6["⑦ 状态与基础设施层"]
         SS["StateStore<br/>statestore/ memory·sqlite·postgres"]
         Q["Queue<br/>queue/ memory·kafka"]
         LK["Lock<br/>lock/ memory·redis"]
     end
 
-    subgraph L7["⑦ 审批 / 审计 / 运维"]
+    subgraph L7["⑧ 审批 / 审计 / 运维"]
         SW["审批超时 Sweeper<br/>approval/sweeper.py"]
         NT["审批通知<br/>approval/notifier.py"]
         AU["审计日志<br/>audit/logger.py"]
+    end
+
+    subgraph EXT["外部数据源（经 MCP 访问）"]
+        ES["Elasticsearch<br/>app-logs"]
+        PM["Prometheus"]
+        K8S["Kubernetes"]
     end
 
     API --> SVC
@@ -53,15 +63,21 @@ flowchart TB
     EX --> REG
     REG --> SCOPE
     SCOPE --> TOOL
-    TOOL --> DS
+    SCOPE --> MCPC
+    MCPC -->|Streamable HTTP| MCPS
+    MCPS --> ES
+    MCPS --> PM
+    MCPS --> K8S
     TOOL --> SB
     TOOL --> AE
     EX --> SS
     SVC --> Q
-    SW --> Q
-    EX --> LK
-    AU --> SS
 ```
+
+> **v5.5 变更**：原 ④ 层的「真实数据源适配 `agents/datasources.py`」**已删除**——
+> ES/Prometheus/K8s 查询一律经 ⑤ 层的 MCP server（进程内直连实现不再存在）。
+> 本地只剩两类非数据源工具：CMDB 映射 + 知识检索（`tools.py`）、代码工作区
+> （`workspace_tools.py`）。详见 `docs/design-v5.5.md`。
 
 **层级说明（每层的职责 / 技术 / 为什么）**
 
@@ -125,7 +141,7 @@ flowchart TB
 - **join/skip 语义（§8.2）**：边带 `when` 条件；`any` ≥1 条 ACTIVE 入边即执行，`all` 需全部 required 边 ACTIVE；所有入边 INACTIVE → 节点 SKIPPED 并级联下游。审批节点也参与 skip（S-010b）。
 - **推理/执行分离（§4.1）**：Agent（推理，只读）不直接执行代码/集群动作，全部经沙箱 Pod 或 ActionExecutor（有限动作 + 参数白名单）。
 
-> ⚠️ 注意：`scripts/run_fix_loop.py` 引用了 `agentflow.workspace`（WorkspaceManager，M3）和 CMDB，
+> ⚠️ 注意：修复闭环工作流引用了 `agentflow.workspace`（WorkspaceManager，M3）和 CMDB，
 > 但**该目录在当前分支并未包含在代码树中**（README 声称 M3 已实现，实际目录缺失），脚本目前无法直接运行。
 > 读代码时以磁盘上的 `agentflow/**` 为准。
 

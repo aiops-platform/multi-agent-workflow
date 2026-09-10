@@ -40,7 +40,7 @@ Agent 运行在 AgentScope（锁定 2.0.3，模型 DeepSeek deepseek-v4-flash）
 - `agentflow/service.py` — RunService 编排：create_run（版本冻结）→ approve → resume。把工作流、状态、执行器、队列串起来的胶水层。
 - `agentflow/config.py` — 配置驱动的后端切换（LLM + StateStore/Queue/Lock）。解释本地 InMemory/SQLite 如何切到生产 Kafka/Postgres/Redis。
 - `agentflow/sandbox/action_executor.py` — 沙箱动作的有限白名单（scale/restart/patch_resources/delete_temp）及其边界——平台在集群上被允许做什么。
-- `scripts/run_fix_loop.py` — M7 场景2 端到端修复闭环：诊断 → 在真实 git 工作区修复 → 审批 → PR。整个平台最完整的纵向切片。
+- 场景2 端到端修复闭环（诊断 → 在真实 git 工作区修复 → 审批 → PR）——整个平台最完整的纵向切片。走**控制面 API**：`POST /run` 触发、`GET /runs/{id}` 取详情、`scripts/watch_run.py` 观测。（原 `scripts/run_fix_loop.py` 已在 v5.5 批3 移除——它直连了现已删除的进程内数据源适配器。）
 - `tests/test_executor.py` — 语义契约测试（join/skip/审批 CAS/skip 级联/失败 abort，含 S-010b）。改动 DAG 语义必须保持此套件全绿。
 
 ## 发现的入口点
@@ -68,7 +68,7 @@ Agent 运行在 AgentScope（锁定 2.0.3，模型 DeepSeek deepseek-v4-flash）
 ### Scripts
 - 职责：真实模型 / 真实数据源联调：场景1 与场景2 诊断链（DeepSeek + ES/Prometheus/kubectl）、M7 修复闭环 E2E、沙箱 K8s 验证。
 - 位置：`scripts/**`
-- 入口：`scripts/run_fix_loop.py`
+- 入口：`POST /run`（workflow `bug-fix-scenario2`）+ `scripts/watch_run.py` 观测
 - 何时可跳过：除非你在跑 testbed 联调或端到端修复闭环。
 
 ### Workflows

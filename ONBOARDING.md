@@ -28,7 +28,7 @@ Think of it as a deterministic workflow orchestrator wrapped around AI agents. A
 - `agentflow/service.py` - RunService orchestration: create_run (version freeze) → approve → resume. The glue that wires workflow, state, executor, and queue.
 - `agentflow/config.py` - Config-driven backend switching (LLM + StateStore/Queue/Lock). Explains how local InMemory/SQLite swaps to production Kafka/Postgres/Redis.
 - `agentflow/sandbox/action_executor.py` - The finite whitelist of sandbox actions (scale/restart/patch_resources/delete_temp) and their bounds — what the platform is allowed to do on a cluster.
-- `scripts/run_fix_loop.py` - M7 end-to-end scenario-2 fix loop: diagnosis → repair in a real git workspace → approval → PR. The most complete vertical slice of the whole platform.
+- Run a scenario-2 workflow end to end via the control-plane API (diagnosis → repair in a real git workspace → approval → PR). The most complete vertical slice of the whole platform. Entry: `POST /run` + `GET /runs/{id}`; observe with `scripts/watch_run.py`. (The former `scripts/run_fix_loop.py` was removed in v5.5 batch 3 — it talked to the now-deleted in-process datasource adapter.)
 - `tests/test_executor.py` - The semantic contract tests (join/skip/approval CAS/skip cascade/failure abort, including S-010b). Change DAG semantics only with this suite green.
 
 ## Entry points found
@@ -56,7 +56,7 @@ Skip unless: Skip unless you need to understand the expected behavior contract o
 ### Scripts
 What it does: Real-model / real-datasource integration: scenario 1 & 2 diagnosis chains (DeepSeek + ES/Prometheus/kubectl), the M7 fix-loop E2E, and sandbox K8s verification.
 Where it lives: `scripts/**`
-Entry point: `scripts/run_fix_loop.py`
+Entry point: `POST /run` (workflow `bug-fix-scenario2`) + observe with `scripts/watch_run.py`
 Skip unless: Skip unless you are running testbed integration or the end-to-end fix loop.
 
 ### Workflows

@@ -37,10 +37,12 @@ async def test_agents_item_shape_and_real_tools() -> None:
         assert isinstance(item["tools"], list)
         assert all(isinstance(t, str) for t in item["tools"])
         assert isinstance(item["stage"], str) and item["stage"]
-    # 真实注册表：triage 在 detect 阶段，仅可见 get_trace（TOOL_REGISTRY 无 search_repos）
+    # 数据源工具已迁 MCP（design-v5.5），本地注册表仅剩 CMDB 映射与知识检索。
+    # /agents 的 tools 反映的是**本地**注册表，故 code-locator/knowledge-lookup 有工具，
+    # 而 triage 这类纯取数 agent 不再有本地工具（其 get_trace 现由 MCP 提供）。
     triage = next(a for a in data if a["name"] == "triage")
-    assert triage["tools"] == ["get_trace"]
     assert triage["stage"] == "detect"
-    # 真实注册表：triage 只可见 get_trace（TOOL_REGISTRY 无 search_repos）
-    triage = next(a for a in data if a["name"] == "triage")
-    assert triage["tools"] == ["get_trace"]
+    assert triage["tools"] == []
+
+    locator = next(a for a in data if a["name"] == "code-locator")
+    assert "locate_code" in locator["tools"]

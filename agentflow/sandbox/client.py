@@ -8,7 +8,7 @@ from __future__ import annotations
 import httpx
 from pydantic import BaseModel
 
-from ..agents.datasources import DataSourceError
+from ..errors import DataSourceError
 
 EXEC_PATH = "/exec"
 PYTHON_PATH = "/python"

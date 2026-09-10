@@ -13,7 +13,8 @@
 | 跑测试（72 个） | `make test` | 验证安装正确 |
 | 脚本化 demo | `make demo` | 无 LLM 跑通 bug-fix-pipeline 全链路（create_run → 审批 → done） |
 | **API 控制面** | `make api` | 起 FastAPI 服务，`http://localhost:8000/docs` |
-| 真实诊断（可选） | `scripts/diagnose_scenario1.py` / `diagnose_scenario2.py` | 真实 DeepSeek + 真实数据源 |
+| 数据源 MCP server | `uv run python -m aiops_datasource_mcp_server`（独立仓库 aiops-mcp-servers） | 真实 ES/Prometheus/K8s 查询，供诊断链取数（:8300） |
+| 观测 run | `scripts/watch_run.py --recent --traces` | 逐阶段看节点状态/输出/审批/工具明细 |
 
 ---
 
@@ -132,8 +133,9 @@ cd ../backend && source ../spike/.env
 
 ```bash
 bash fault-inject/scenario1.sh                     # 注入故障
-./venv/bin/python scripts/diagnose_scenario1.py    # 真实诊断
-# → root_cause_type: infra_issue（磁盘 EmptyDir 写满）
+# 触发 run（时间窗必填，见 README「testbed 真实联调」）→ 观测
+./venv/bin/python scripts/watch_run.py --recent --traces
+# → rca: infra_issue（磁盘 EmptyDir 写满）
 bash fault-inject/scenario1-recover.sh             # 恢复
 ```
 
@@ -142,8 +144,8 @@ bash fault-inject/scenario1-recover.sh             # 恢复
 ```bash
 bash fault-inject/scenario2.sh
 curl -s --max-time 8 -X POST "http://localhost:18080/checkout?orderId=ORD20260819001"  # 触发挂起
-./venv/bin/python scripts/diagnose_scenario2.py
-# → root_cause_type: code_bug（warranty-service fin 缺参）
+./venv/bin/python scripts/watch_run.py --recent --traces
+# → rca: code_bug（warranty-service fin 缺参）
 bash fault-inject/scenario2-recover.sh
 ```
 

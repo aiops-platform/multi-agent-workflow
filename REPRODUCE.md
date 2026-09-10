@@ -101,11 +101,12 @@ curl -s "http://localhost:19200/app-logs/_search?size=3" -H 'Content-Type: appli
 # → 应看到 "java.io.IOException: No space left on device"
 ```
 
-### 4.3 跑 AI 诊断链（真实 DeepSeek + ES/Prometheus/kubectl）
+### 4.3 跑 AI 诊断链（真实 DeepSeek + MCP 数据源）
 ```bash
-cd $BACKEND && source ../spike/.env
-./venv/bin/python scripts/diagnose_scenario1.py
-# 期望输出：root_cause_type: infra_issue（磁盘 EmptyDir 写满），命中 SCENARIOS 期望
+# 前置：MCP 数据源 server 已起在 :8300，且已注册/绑定（见 §0.5）
+cd $BACKEND
+./venv/bin/python scripts/watch_run.py --recent --traces
+# 期望：rca 输出 root_cause_type=infra_issue（磁盘 EmptyDir 写满），命中 SCENARIOS 期望
 ```
 
 ### 4.4 恢复
@@ -137,9 +138,9 @@ curl -s "http://localhost:19200/app-logs/_search?size=5" -H 'Content-Type: appli
 
 ### 5.3 跑 AI 诊断链（trace-analyst 用 get_trace 定位故障 span）
 ```bash
-cd $BACKEND && source ../spike/.env
-./venv/bin/python scripts/diagnose_scenario2.py
-# 期望输出：root_cause_type: code_bug（warranty-service fin 缺参），命中期望
+cd $BACKEND
+./venv/bin/python scripts/watch_run.py --recent --traces
+# 期望：root_cause_type=code_bug（warranty-service fin 缺参），命中期望
 ```
 
 > 建议在触发结账后 **60s 内**跑诊断：此时 order-service 的 Feign 超时 ERROR 尚未落日志，

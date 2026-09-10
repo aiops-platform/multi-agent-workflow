@@ -97,7 +97,6 @@ async def test_runner_first_tool_call_hits_mcp_tool() -> None:
         node = Node(id="triage", agent="triage")
         runner = AgentNodeRunner(
             _McpProbeModel("mcp__mock-mcp__get_weather"),
-            use_mock_datasource=True,
             mcp_manager=mgr,
         )
         out = await runner(node, {"bug": "sample"})
@@ -112,6 +111,6 @@ async def test_runner_without_mcp_manager_stays_function_tools() -> None:
     from agentflow.agents.scopes import ScriptedJsonModel
 
     node = Node(id="triage", agent="triage")
-    runner = AgentNodeRunner(ScriptedJsonModel({"summary": "ok"}), use_mock_datasource=True)
+    runner = AgentNodeRunner(ScriptedJsonModel({"summary": "ok"}))
     out = await runner(node, {"bug": "sample"})
     assert out.get("summary") == "ok"

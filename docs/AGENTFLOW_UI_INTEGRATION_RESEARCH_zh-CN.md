@@ -180,7 +180,7 @@ _run_background → ex.run() 后台执行 → 终态/失败/取消 → update_ru
 
 前端轮询 `GET /runs/{id}` 取进度/结果。多 agent 真实 LLM 执行可跑很久，异步模型让前端请求立即返回、可展示运行进度。
 
-> 注意：`RunService.create_run`（同步阻塞）仍保留，供 `scripts/run_fix_loop.py`、`tests/test_resume.py` 等直接调用方使用，两套路径互不干扰。
+> 注意：`RunService.create_run`（同步阻塞）仍保留，供 `tests/test_resume.py` 等直接调用方使用，两套路径互不干扰。
 
 ### 4.3 GET /runs/{id}（v1.10.0 聚合响应）
 

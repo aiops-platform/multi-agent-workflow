@@ -59,11 +59,19 @@ make lint      # ruff 检查
      经 `cas_update_run_status` 原子转换，重复消息恰一个接单；新状态机含 queued/paused。
    - **topic-per-tenant**：发布一律 `topic_trigger(tenant)/topic_command(tenant)`；
      Worker 绑定租户只消费自己的 topic，None=全局兜底（单租户回退）。
-   - **数据面姿态**：`AGENTFLOW_SHARED_DATASOURCES=0`（默认加固）→ toolkit 不注入
-     内置 L1 数据源工具（诊断数据工具一律租户 MCP 绑定）+ inputs.repos 直传 400
-     （testbed 联调脚本需显式 =1）。runner 经 `exec_context.current_tenant`（executor
-     置位）做 per-tenant MCP（mcp_manager 缓存键 (tenant, server_id)，租户间物理不可见）
-     与 per-tenant agent 配置（agent_config_provider 代际缓存，CRUD 后失效）。
+   - **数据面 = 租户 MCP（v5.5 批3 起 MCP-only）**：日志/指标/K8s 查询**全部**由
+     `aiops-datasource-mcp-server` 提供（`POST /mcp-servers` 注册 →
+     `PUT /agent-configs/{name}` 的 `mcp_server_ids` 绑定），**进程内直连实现已删除**
+     （原 `agents/datasources.py`）。本地只读工具仅剩 `locate_code`（CMDB 映射）
+     与 `search_knowledge`（占位）。详见 `docs/design-v5.5.md`。
+   - **`AGENTFLOW_SHARED_DATASOURCES` 语义已收窄**：内置共享数据源工具没了，此开关
+     如今**只剩一个作用**——是否放行 `inputs.repos` 直传（默认 0=封堵）。名称保留是
+     为了不破坏既有 .env，新代码请按「repos 直传开关」理解。
+   - runner 经 `exec_context.current_tenant`（executor 置位）做 per-tenant MCP
+     （mcp_manager 缓存键 (tenant, server_id)，租户间物理不可见）与 per-tenant agent
+     配置（agent_config_provider 代际缓存，CRUD 后失效）。
+     **注意：Worker 进程的 `_agent_config_provider` 是永久缓存**——绑定新 MCP server
+     后需重启 worker 才生效（design-v5.5 §8 第 8 项）。
    - **生命周期**：`python -m agentflow.tenantctl provision|deploy|upgrade|migrate|
      deprovision`（幂等 saga）；standard 租户专属分支被拒（§9.2 规则 4）；部署记录
      pin SHA 不 pin 分支名。
@@ -89,16 +97,20 @@ make lint      # ruff 检查
    `kubectl port-forward`（macOS 宿主不可路由 pod IP；生产 Worker 在集群内直连 ClusterIP）。
    ActionExecutor 动作是**有限集合 + 白名单**（§10.3），新增动作需评审。
    ToolPolicy：deny 优先 → allow → 兜底 DENY（§9.5）。
-10. **真实数据源**（testbed 联调）：`datasources.py` 的 adapter 与 mock 工具签名一致
-    （SCENARIOS §5.2），数据源切换只换 adapter。ES index `app-logs`（字段是 `app.traceId`
-    驼峰，不是 `trace_id`）、Prometheus cAdvisor（`container_*`）、kubectl namespace `order`。
-    `get_trace`：ES 按 traceId 重建调用链判故障 span（testbed 的 traceId 未跨服务共享，
-    无 traceId 回退时间窗）；**故障 span 启发式**：优先「错误非下游调用症状」（feign/
-    Read timed out/Connection refused 视为症状）的服务=业务根因。联调脚本
-    `scripts/diagnose_scenario{1,2}.py`（需 `source ../spike/.env` 供 DEEPSEEK_API_KEY）。
-    trace-analyst 需 `max_iters≥12`（2 个工具 + 链合成，默认 6 会迭代耗尽返回 {}），
-    prompt 已强化区分「业务根因 vs 下游调用症状」。**场景复现需干净日志窗口**：
-    连续跑两场景会互相污染，切换前 `curl -X DELETE :19200/app-logs` 清窗。
+10. **真实数据源 = MCP server**（v5.5）：查询逻辑在
+    `aiops-mcp-servers/servers/aiops-datasource-mcp-server`（独立仓库）。要点：
+    - **查询必须带时间区间与目标**：`start_time`/`end_time` 必填（ISO8601），窗口由
+      workflow `inputs.window_start/window_end` 下发，取数节点 `require` 预检
+    - **metric 是领域语义**（cpu_percent / memory_percent / disk_percent / error_rate /
+      p95_latency_ms），**不传 PromQL 表达式**；未知值报错并列出可用项
+    - ES index `app-logs`（字段 `app.*`，时间 `app.@timestamp`，链路 `app.traceId` 驼峰）；
+      Prometheus :19090；kubectl namespace `order`
+    - `get_trace` 的**故障 span 启发式**（优先「错误非下游调用症状」的服务=业务根因，
+      feign/Read timed out 视为症状）住在 server 侧，属**测试床特定经验**
+    - 本地联调：`uv run python -m aiops_datasource_mcp_server`（:8300），再注册/绑定
+    trace-analyst 需 `max_iters≥12`（2 个工具 + 链合成，默认 6 会迭代耗尽返回 {}）。
+    **场景复现需干净日志窗口**：连续跑两场景会互相污染，切换前
+    `curl -X DELETE :19200/app-logs` 清窗。
 
 ## 结构速览（v5.3 新增：api/management_store.py、statestore/router.py、tenantctl.py、
 exec_context.py、docs/DEPLOYMENT_zh-CN.md）
@@ -119,7 +131,7 @@ statestore/  StateStore（memory/sqlite + postgres 生产适配器）
 service.py   RunService：create / approve / resume 编排
 api/         控制面 FastAPI
 workflows/   bug-fix-pipeline.yaml（§8.1）+ bug-fix-scenario2.yaml（修复闭环）
-scripts/     diagnose_scenario{1,2}.py + run_fix_loop.py（修复闭环E2E）+ verify_sandbox.py
+scripts/     watch_run.py（run 逐阶段观测）+ mock_mcp_server.py + verify_sandbox.py
 docker/sandbox/  沙箱镜像（stdlib-only 离线可建）
 ```
 

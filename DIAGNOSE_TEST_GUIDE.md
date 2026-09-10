@@ -239,48 +239,48 @@ async def test_trace_analyst_root_cause_contract():
     assert "warranty-service" in (out.get("summary") or "")   # 子串断言（S-011 风格）
 ```
 
-### 第③层：E2E 验收（真实模型 + 真实 testbed）`tests/e2e/test_diagnose_e2e.py`
+### 第③层：E2E 验收（真实模型 + 真实 testbed + MCP 数据源）
+
+> v5.5 批3 起，数据查询全部经 `aiops-datasource-mcp-server`（进程内直连实现已删除），
+> 原先的 `scripts/diagnose_scenario{1,2}.py` 一并移除——它们直接 new 了那个适配器。
+> E2E 现在走**控制面 API + workflow**，与线上同一条路径。
 
 ```python
-"""端到端验收：注入故障 → 真实 DeepSeek + 真实 ES/Prometheus/kubectl → 断言根因类型。
-等价于 scripts/diagnose_scenario1.py / diagnose_scenario2.py，默认跳过（需 testbed）。"""
+# 端到端验收：注入故障 → POST /run（带时间窗）→ 断言 run 的 rca 根因类型。
+# 前置：MCP 数据源 server 已起并注册/绑定；testbed 就绪 + port-forward 完成；
+#       RUN_E2E=1（默认跳过）。
 import os
-import subprocess
-import sys
-from pathlib import Path
-
+import httpx
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("RUN_E2E"), reason="需 RUN_E2E=1 + testbed 就绪"
-)
+pytestmark = pytest.mark.skipif(not os.environ.get("RUN_E2E"), reason="需 RUN_E2E=1 + testbed")
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
-
-async def test_scenario_disk_full_infra_issue():
-    """场景1：磁盘打满 → 期望 root_cause_type == infra_issue。
-
-    前置：已注入故障 + port-forward 完成（见 README「testbed 真实联调」）。
-    """
-    proc = subprocess.run(
-        [sys.executable, "scripts/diagnose_scenario1.py"],
-        capture_output=True, text=True, timeout=600,
-    )
-    assert proc.returncode == 0, proc.stderr
-    # diagnose_scenario1.py 打印的根因结论需命中 infra_issue
-    assert "infra_issue" in proc.stdout, proc.stdout
+BASE = "http://localhost:8000"
+HDR = {"X-Tenant-ID": "local"}
 
 
-async def test_scenario2_warranty_code_bug():
-    """场景2：warranty fin 缺参 → 期望 root_cause_type == code_bug。"""
-    proc = subprocess.run(
-        [sys.executable, "scripts/diagnose_scenario2.py"],
-        capture_output=True, text=True, timeout=600,
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert "code_bug" in proc.stdout, proc.stdout
+def run_scenario(workflow_yaml: str, start: str, end: str) -> dict:
+    r = httpx.post(f"{BASE}/run", headers=HDR, timeout=60, json={
+        "workflow_yaml": workflow_yaml,
+        "inputs": {"bug_report": {...}, "window_start": start, "window_end": end},
+    })
+    run_id = r.json()["run_id"]
+    return httpx.get(f"{BASE}/runs/{run_id}", headers=HDR, timeout=60).json()
+
+
+def test_scenario2_warranty_code_bug():
+    # 场景2：warranty fin 缺参 → 期望 rca.root_cause_type == code_bug
+    rd = run_scenario(SCENARIO2_YAML, "2026-09-10T08:30:00", "2026-09-10T10:30:00")
+    assert rd["nodes"]["rca"]["output"]["root_cause_type"] == "code_bug"
+
+    # 且取数确实走了 MCP（工具名带 mcp__ 前缀 → is_mcp=True）
+    traces = httpx.get(f"{BASE}/runs/{rd['run_id']}/traces",
+                       headers=HDR, params={"kind": "tool_call"}, timeout=60).json()
+    assert any(t["payload"]["is_mcp"] for t in traces)
 ```
+
+**关键断言**：① 根因类型命中；② 数据工具调用 `is_mcp=True`（证明走的是 MCP，
+而非已删除的直连路径）；③ 时间窗被透传（工具入参含 start_time/end_time）。
 
 ---
 
@@ -313,4 +313,4 @@ RUN_E2E=1 ./venv/bin/pytest tests/e2e/test_diagnose_e2e.py -q
 | `build_toolkit` | `agents/mcp.py:build_toolkit` | L1 只读 + L2 执行按 agent 装配 |
 | `build_model/build_agent/run_agent` | `agents/scopes.py` | AgentScope 2.0.3 适配 |
 | 工具白名单 | `agents/tools.py:TOOL_REGISTRY` | trace-analyst 只见 `get_trace`/`query_logs` |
-| `max_iters=12` | `scripts/diagnose_scenario{1,2}.py` 已有此设置 | trace-analyst 迭代要求 |
+| `max_iters=12` | runner 的 `_MAX_ITERS` 已配此值 | trace-analyst 迭代要求 |

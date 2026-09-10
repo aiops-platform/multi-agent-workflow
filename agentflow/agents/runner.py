@@ -108,31 +108,21 @@ class AgentNodeRunner:
         self,
         model,
         *,
-        use_mock_datasource: bool = True,
         mcp_manager=None,
         agent_config=None,
         agent_config_provider=None,
-        shared_datasources: bool = True,
-        datasource=None,
         cmdb=None,
     ) -> None:
         self.model = UsageTrackingModel(model)
-        self.use_mock_datasource = use_mock_datasource
         # 租户 CMDB（§9.4 TenantMappingProvider）：code-locator 的 locate_code 经它
         # 解析 service→repo（真实 repo_url，供诊断段与工作区准备共用同一映射）。
         self.cmdb = cmdb
-        # 真实数据源适配器（agents/datasources.py:RealDataSourceAdapter）；非 None 时
-        # 覆盖 mock，L1 工具（query_logs/get_trace/query_metrics/check_infra…）走 testbed。
-        # 与 shared_datasources 配合：加固姿态下 L1 工具不构建，此参数随之失效。
-        self.datasource = datasource
         self.mcp_manager = mcp_manager
         # AgentSpec DB 配置解析器（agent_config.AgentConfigResolver）：提供 system_prompt 覆盖 + enabled
         self.agent_config = agent_config
         # v5.3 §7：per-tenant 配置解析器提供者 async (tenant_id|None) → AgentConfigResolver
         #（租户库 agent_configs 覆盖行）；注入后按 current_tenant 路由，self.agent_config 作回退
         self.agent_config_provider = agent_config_provider
-        # P1 加固姿态：False = 不注入内置共享数据源 L1 工具（数据工具一律租户 MCP 绑定）
-        self.shared_datasources = shared_datasources
         # 兼容属性：最近一次节点用量（顺序/单节点场景精确；并行 wave 下以 take_usage 为准）
         self.last_usage: dict[str, float | int] | None = None
         # 按 id(node) 分槽（并行波安全）：executor 跑完取走（pop）→ retry/resume 只留末次成功
@@ -187,10 +177,7 @@ class AgentNodeRunner:
             allow_extra = await self.mcp_manager.allow_names_for_agent(agent, tenant_id=tenant_id)
         toolkit = build_toolkit(
             agent,
-            use_mock=self.use_mock_datasource,
-            shared_datasources=self.shared_datasources,
             mcp_clients=clients,
-            datasource=self.datasource,
             cmdb=self.cmdb,
         )
         ctx = build_permission_context(agent, allow_extra=allow_extra)

@@ -24,44 +24,13 @@ class ToolSpec:
 
 
 TOOL_REGISTRY: dict[str, ToolSpec] = {
-    # ---- 数据源 MCP 只读工具（§10.4）----
-    "query_logs": ToolSpec(
-        "query_logs",
-        ["log-analyst", "trace-analyst", "root-cause"],
-        timeout=30, rate_limit=100, result_limit=1_000_000,
-        level="L1", description="查询日志（service, level）",
-    ),
-    "get_trace": ToolSpec(
-        "get_trace",
-        ["trace-analyst", "root-cause", "triage"],
-        timeout=30, rate_limit=60,
-        level="L1", description="查询链路追踪",
-    ),
-    "query_metrics": ToolSpec(
-        "query_metrics",
-        ["metrics-analyst", "root-cause"],
-        timeout=30, rate_limit=60,
-        level="L1",
-        # metric 取值与 MetricsEvidenceSchema 字段对齐；未知值会报错（不再静默兜底）
-        description=(
-            "查询 Prometheus 指标（service + metric）。"
-            "metric 取值：cpu_percent | memory_percent | disk_percent | "
-            "error_rate | p95_latency_ms；"
-            "或 promql:<表达式> / cadvisor:<指标名> 直接下钻"
-        ),
-    ),
-    "check_infra": ToolSpec(
-        "check_infra",
-        ["infra-locator", "root-cause"],
-        timeout=10, rate_limit=60,
-        level="L1", description="查询 K8s 资源状态",
-    ),
-    "describe_pod": ToolSpec(
-        "describe_pod",
-        ["infra-locator", "root-cause"],
-        timeout=10,
-        level="L1", description="describe pod",
-    ),
+    # ---- 数据源查询工具：**已迁至 MCP**（design-v5.5）----
+    # query_logs / get_trace / query_metrics / check_infra / describe_pod 不再在这里
+    # 注册——它们由 `aiops-datasource-mcp-server` 提供，经 agent_configs.mcp_server_ids
+    # 绑定（agent 侧名为 mcp__<server>__<tool>），权限经 allow_extra 下发。
+    # 见 design-v5.5 §3/§5 与 skill §批3。
+    #
+    # ---- 本地只读工具（非数据源：CMDB 映射 / 知识检索）----
     "locate_code": ToolSpec(
         "locate_code",
         ["code-locator", "root-cause"],
@@ -191,43 +160,10 @@ def build_l2_tools(agent_name: str, *, sandbox_client=None, action_executor=None
 
 
 # ======================================================================
-# L1 mock 实现（本地联调用，testbed 就绪前提供确定性数据）
+# 本地只读工具实现（非数据源：CMDB 映射 / 知识检索）
 # ======================================================================
-async def _mock_query_logs(service: str, level: str = "ERROR", **_: Any) -> dict:
-    return {
-        "service": service,
-        "level": level,
-        "logs": [
-            {"ts": "2026-08-19T14:31:00+08:00", "level": "ERROR",
-             "msg": "java.io.IOException: No space left on device"},
-        ],
-    }
-
-
-async def _mock_get_trace(trace_id: str, **_: Any) -> dict:
-    return {
-        "trace_id": trace_id,
-        "spans": [
-            {"service": "order-service", "status": "ERROR", "duration_ms": 3200},
-            {"service": "warranty-service", "status": "ERROR", "duration_ms": 2900},
-        ],
-        "failing_service": "warranty-service",
-        "first_error": "java.lang.IllegalStateException: fin must not be null",
-    }
-
-
-async def _mock_query_metrics(service: str, metric: str, **_: Any) -> dict:
-    return {"service": service, "metric": metric, "value": 100.0, "unit": "percent"}
-
-
-async def _mock_check_infra(namespace: str, pod: str | None = None, **_: Any) -> dict:
-    return {"namespace": namespace, "pod": pod, "status": "CrashLoopBackOff", "restarts": 5}
-
-
-async def _mock_describe_pod(namespace: str, pod: str, **_: Any) -> dict:
-    return {"namespace": namespace, "pod": pod, "status": "CrashLoopBackOff", "events": []}
-
-
+# 数据源查询（日志/指标/K8s）已迁至 MCP（design-v5.5），此处不再有对应 mock——
+# 留着会让人以为"还有一条能用的数据路径"，而它其实只返回编造的数据。
 async def _mock_locate_code(service: str, **_: Any) -> dict:
     return {"service": service, "repo_url": f"https://github.com/company/{service}", "base_sha": "abc123"}
 
@@ -249,41 +185,40 @@ async def _cmdb_locate_code(cmdb, service: str, **_: Any) -> dict:
 
 
 async def _mock_search_knowledge(query: str, **_: Any) -> dict:
+    """知识检索占位实现。
+
+    ⚠️ 恒返回同一批虚构条目（INC0001）——**不是真实检索结果**。真实后端按
+    design-v5.4 §7.3 应走租户 MCP（租户自建暴露 search_knowledge 的 server 并绑定）。
+    在此之前，agent 引用它的结论时应知道这是占位数据。
+    """
     return {"found": True, "similar_incidents": ["INC0001"], "suggested_actions": []}
 
 
-MOCK_L1_TOOLS: dict[str, Any] = {
-    "query_logs": _mock_query_logs,
-    "get_trace": _mock_get_trace,
-    "query_metrics": _mock_query_metrics,
-    "check_infra": _mock_check_infra,
-    "describe_pod": _mock_describe_pod,
+LOCAL_TOOLS: dict[str, Any] = {
     "locate_code": _mock_locate_code,
     "search_knowledge": _mock_search_knowledge,
 }
 
 
-def build_l1_tools(agent_name: str, *, use_mock: bool = True, cmdb=None, datasource=None) -> list[dict]:
-    """为 agent 生成 L1 工具列表（AgentScope FunctionTool 形态）。
+def build_local_tools(agent_name: str, *, cmdb=None) -> list[dict]:
+    """为 agent 生成**本地**只读工具（AgentScope FunctionTool 形态）。
 
-    - ``use_mock=True``：绑定 mock 实现（本地联调 / 无数据源时的回退）。
-    - 传 ``cmdb``（TenantMappingProvider）：``locate_code`` 走 CMDB 查询（§9.4）。
-    - 传 ``datasource``（RealDataSourceAdapter）：``query_logs``/``query_metrics``/
-      ``check_infra``/``describe_pod`` 绑定真实数据源（testbed 联调），工具签名不变。
+    仅剩两个非数据源工具：``locate_code``（CMDB 映射，传 ``cmdb`` 时走真实查询）
+    与 ``search_knowledge``（占位实现，见其 docstring）。
+
+    数据源查询（日志/指标/K8s）已迁至 MCP——design-v5.5。
     """
     tools = []
     for spec in tools_for_agent(agent_name):
         if spec.level != "L1":
             continue
-        func = MOCK_L1_TOOLS.get(spec.name)
+        func = LOCAL_TOOLS.get(spec.name)
+        if func is None:
+            continue  # 注册表里的 L1 工具都应在此有实现；无实现的直接跳过
         if spec.name == "locate_code" and cmdb is not None:
             from functools import partial
 
             func = partial(_cmdb_locate_code, cmdb)
-        elif datasource is not None and hasattr(datasource, spec.name):
-            from functools import partial
-
-            func = partial(getattr(datasource, spec.name))
         tools.append({
             "name": spec.name,
             "description": spec.description,

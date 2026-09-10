@@ -21,7 +21,7 @@ import logging
 
 from agentscope.tool import FunctionTool, Toolkit
 
-from .tools import build_l1_tools, build_l2_tools, build_workspace_tools
+from .tools import build_l2_tools, build_local_tools, build_workspace_tools
 
 log = logging.getLogger("agentflow.toolkit")
 
@@ -49,32 +49,25 @@ def _filter_connected_mcps(mcp_clients: list) -> list:
 def _build_function_tools(
     agent_name: str,
     *,
-    use_mock: bool = True,
-    shared_datasources: bool = True,
     cmdb=None,
-    datasource=None,
     sandbox_client=None,
     action_executor=None,
 ) -> list[FunctionTool]:
-    """L1（只读）+ L2（执行）function tool 包装。
+    """本地 function tool 包装：只读（CMDB/知识）+ 工作区 + L2 执行。
 
-    - L1：传 ``cmdb``→CMDB 定位，传 ``datasource``→真实 testbed，否则 mock；
-      ``shared_datasources=False``（v5.3 §7/P1 加固姿态）→ **不构建任何 L1 工具**
-      （诊断 agent 的数据工具一律来自租户 MCP 绑定，共享数据源是唯一绕过后门）。
-    - L2：传 ``sandbox_client``（SandboxClient）→ 沙箱 run/write 工具；传
-      ``action_executor``（ActionExecutor）→ §10.3 白名单动作工具；未传执行器时 L2 不可用。
+    **数据源查询不在此列**——日志/指标/K8s 已迁至 `aiops-datasource-mcp-server`
+    （design-v5.5），经 ``mcp_clients`` 注入，不再有进程内直连实现。
+
+    - 本地只读：``locate_code``（传 ``cmdb``→真实 CMDB 查询）、``search_knowledge``（占位）
+    - 工作区：读写本次 run 的代码工作区（§8.7）
+    - L2：传 ``sandbox_client``→沙箱 run/write；传 ``action_executor``→§10.3 白名单动作
     """
     tools: list[FunctionTool] = []
-    if shared_datasources:
-        for t in build_l1_tools(agent_name, use_mock=use_mock, cmdb=cmdb, datasource=datasource):
-            if t["func"] is None:
-                continue
-            tools.append(FunctionTool(
-                func=t["func"], name=t["name"], description=t["description"],
-                is_read_only=True,  # L1 只读
-            ))
-    # 工作区工具（§8.7）：修复侧 agent 真实读写本次 run 的工作区。与 shared_datasources
-    # 正交——它不是"共享数据源"（run 间以 current_run 隔离、越界即拒），加固姿态下仍启用。
+    for t in build_local_tools(agent_name, cmdb=cmdb):
+        tools.append(FunctionTool(
+            func=t["func"], name=t["name"], description=t["description"],
+            is_read_only=True,  # 本地只读工具
+        ))
     for t in build_workspace_tools(agent_name):
         tools.append(FunctionTool(
             func=t["func"], name=t["name"], description=t["description"],
@@ -93,27 +86,19 @@ def _build_function_tools(
 def build_toolkit(
     agent_name: str,
     *,
-    use_mock: bool = True,
-    shared_datasources: bool = True,
     mcp_clients: list | None = None,
     cmdb=None,
-    datasource=None,
     sandbox_client=None,
     action_executor=None,
 ) -> Toolkit:
-    """为 agent 构建 hybrid Toolkit：function tool（L1/L2）与绑定 MCP 工具共存。
+    """为 agent 构建 hybrid Toolkit：本地 function tool 与绑定的 MCP 工具共存。
 
-    向后兼容：既有调用方（scripts / tests / runner）都只传 ``use_mock`` 且不带
-    ``mcp_clients`` → 结果等价于旧行为（纯 function tools）；传入 ``mcp_clients`` 时
-    在 function tools 基础上叠加 MCP 工具（``Toolkit(tools=..., mcps=...)``）。
-    ``shared_datasources=False``（P1 加固）→ 不含内置共享数据源 L1 工具。
+    本地部分 = 只读（CMDB/知识）+ 工作区 + L2；**数据源查询全部来自 MCP**
+    （``mcp_clients``，由 agent_configs.mcp_server_ids 绑定决定）——design-v5.5。
     """
     func_tools = _build_function_tools(
         agent_name,
-        use_mock=use_mock,
-        shared_datasources=shared_datasources,
         cmdb=cmdb,
-        datasource=datasource,
         sandbox_client=sandbox_client,
         action_executor=action_executor,
     )

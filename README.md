@@ -117,9 +117,9 @@ workflows/
 ├── bug-fix-pipeline.yaml   # design §8.1 完整示例
 └── bug-fix-scenario2.yaml  # 场景2 完整修复工作流（诊断→修复→审批→PR，§3.5）
 scripts/
-├── diagnose_scenario1.py   # 场景1 真实联调：DeepSeek + 真实数据源诊断链（需 AGENTFLOW_SHARED_DATASOURCES=1）
-├── diagnose_scenario2.py   # 场景2 真实联调
-└── run_fix_loop.py         # 场景2 修复闭环 E2E（真实工作区 git 修复 + 审批 + PR）
+├── watch_run.py            # run 逐阶段观测（节点状态/输出/token/审批/工具明细）
+├── mock_mcp_server.py      # MCP 配置页测试用 mock server（mcp v1 FastMCP）
+└── verify_sandbox.py       # 沙箱 K8s 端到端验证
 docker/
 ├── sandbox/               # 沙箱镜像（stdlib-only，离线可建；WITH_JDK=1 加 Java）
 └── Dockerfile.worker      # Worker 镜像（python:3.12-slim + 在线 pip 装 agentflow）
@@ -147,32 +147,49 @@ minikube image load agentflow-sandbox:latest
 - `sandbox/policy.py`：§9.5 租户工具策略（deny 优先→allow→兜底 DENY）
 - L2 工具（sandbox_run_python/shell/write_file）经 SandboxClient 进沙箱（§4.1 推理/执行分离）
 
-## testbed 真实联调（场景1 + 场景2 已验证 ✅）
+## testbed 真实联调（走 MCP，v5.5 批3 起）
+
+**数据查询全部经 MCP server**（进程内直连实现已删除）。需要两个进程：
 
 ```bash
+# 0. 起 MCP 数据源 server（独立仓库 aiops-mcp-servers）
+cd ~/accenture/workspace/aiops-mcp-servers/servers/aiops-datasource-mcp-server
+cp .env.example .env
+cd .. && uv run python -m aiops_datasource_mcp_server          # 监听 :8300
+
 # 1. 部署 testbed（services + ES/Prometheus + configmaps + port-forward）
 cd ../../agentflow-testbed && bash scripts/port-forward-all.sh
 
-# 2. 场景1：注入故障（磁盘 + CPU 打满）→ 诊断 → 恢复
-bash fault-inject/scenario1.sh
-cd ../backend && source ../spike/.env && ./venv/bin/python scripts/diagnose_scenario1.py
-# → root_cause_type: infra_issue（磁盘 EmptyDir 写满），命中期望
-cd ../../agentflow-testbed && bash fault-inject/scenario1-recover.sh
+# 2. 注册 MCP server 并绑定到取数 agent
+curl -X POST localhost:8000/mcp-servers -H 'Content-Type: application/json' \
+  -d '{"name":"aiops-datasource","transport":"http",
+       "config":{"url":"http://127.0.0.1:8300/mcp"}}'
+# 用返回的 id 逐个绑定 triage / log-analyst / trace-analyst /
+# metrics-analyst / infra-locator / root-cause：
+curl -X PUT localhost:8000/agent-configs/metrics-analyst \
+  -H 'Content-Type: application/json' -d '{"mcp_server_ids":["<id>"]}'
+# ⚠️ 绑定后需**重启 worker** 才生效（worker 侧配置解析器为永久缓存）
 
-# 3. 场景2：注入故障（warranty fin 缺参 + 吞异常）→ 诊断 → 恢复
-bash fault-inject/scenario2.sh
-curl -s --max-time 8 -X POST "http://localhost:18080/checkout?orderId=ORD20260819001"   # 触发（挂起）
-cd ../backend && source ../spike/.env && ./venv/bin/python scripts/diagnose_scenario2.py
-# → root_cause_type: code_bug（warranty-service fin 缺参），命中期望
-cd ../../agentflow-testbed && bash fault-inject/scenario2-recover.sh
+# 3. 跑一次 run（时间窗必填），并用 watch_run.py 逐阶段观测
+curl -X POST localhost:8000/run -H 'Content-Type: application/json' \
+  -d '{"workflow_yaml":"<bug-fix-scenario2.yaml 内容>",
+       "inputs":{"bug_report":{...},
+                 "window_start":"2026-09-10T08:30:00",
+                 "window_end":"2026-09-10T10:30:00"}}'
+./venv/bin/python scripts/watch_run.py --recent --traces
 ```
 
-> ⚠️ 每场景需**干净日志窗口**：连续跑两个场景会互相污染（场景1 残留干扰场景2 定位）。
+> ⚠️ 每场景需**干净日志窗口**：连续跑两场景会互相污染（场景1 残留干扰场景2 定位）。
 > 切换前清 ES：`curl -X DELETE :19200/app-logs`。
 
-数据源与工具签名一致（SCENARIOS §5.2），mock/真实切换只换 adapter，agent 定义不变。
-`get_trace`：ES 按 traceId 重建调用链并判定故障 span（真实 testbed 的 traceId 未跨服务共享，
-无 traceId 时回退最近时间窗；故障 span 优先「业务根因」而非「feign 下游调用症状」）。
+**时间窗由调用方下发**：`start_time`/`end_time` 是数据工具的必填参数，窗口来自事件源
+（工单 `opened_at` / 告警触发时刻），算好后经 `inputs.window_start/window_end` 传入——
+agent 不知道"当前时间"，不能让它在运行期猜（猜错会得到错误范围，且看不出异常）。
+
+**故障 span 判定**住在 MCP server 侧：ES 按 traceId 重建调用链，优先「业务根因」而非
+「feign 下游调用症状」。该启发式是**测试床特定经验**，非通用算法。
+
+详见 `docs/design-v5.5.md`。
 
 ## 控制面 API（27 端点）
 

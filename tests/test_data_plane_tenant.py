@@ -43,16 +43,21 @@ def _tool_names(toolkit) -> set[str]:
     return {s["function"]["name"] for s in schemas}
 
 
-def test_toolkit_gate_excludes_shared_datasource_l1_tools() -> None:
-    """加固姿态（shared_datasources=False）→ 不注入内置 L1 数据源工具。"""
-    agent = "log-analyst"
-    hardened = build_toolkit(agent, use_mock=True, shared_datasources=False)
-    names = _tool_names(hardened)
-    assert "query_logs" not in names  # 内置 L1 数据源工具全部缺席
-    assert not any(n.startswith("get_") for n in names), names
+def test_datasource_tools_never_in_local_toolkit() -> None:
+    """数据源工具**一律不在本地 toolkit**——它们由 MCP 提供（design-v5.5 批3）。
 
-    open_mode = build_toolkit(agent, use_mock=True, shared_datasources=True)
-    assert "query_logs" in _tool_names(open_mode)  # dev 姿态保留（testbed 联调）
+    批 3 之前这里测的是 ``shared_datasources`` 开关能否关掉内置数据源工具；那个开关
+    连同内置数据源实现一起删除了。现在无论配置如何，本地都不会再出现它们。
+    """
+    for agent in ("log-analyst", "metrics-analyst", "infra-locator", "root-cause"):
+        names = _tool_names(build_toolkit(agent))
+        for gone in ("query_logs", "get_trace", "query_metrics",
+                     "check_infra", "describe_pod"):
+            assert gone not in names, f"{agent} 不应再有本地 {gone}"
+
+    # 仅存的本地只读工具是 CMDB 映射与知识检索（非数据源）
+    assert "locate_code" in _tool_names(build_toolkit("code-locator"))
+    assert "search_knowledge" in _tool_names(build_toolkit("knowledge-lookup"))
 
 
 # ======================================================================

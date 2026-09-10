@@ -1,7 +1,10 @@
 """M1：AgentScope 适配层冒烟（无 API Key 路径，ScriptedJsonModel 确定性输出）。
 
-验证 build_toolkit（FunctionTool 包装 L1 工具）+ build_agent + run_agent 的
+验证 build_toolkit（FunctionTool 包装**本地**工具）+ build_agent + run_agent 的
 严格 JSON 解析（§7 输出契约）。真实 DeepSeek 路径由 S-011 冒烟覆盖（spike）。
+
+**数据源查询已迁至 MCP**（design-v5.5），故此处用 `code-locator` / `knowledge-lookup`
+——它们持有仅存的本地工具（locate_code / search_knowledge）。
 """
 from __future__ import annotations
 
@@ -9,12 +12,13 @@ from agentflow.agents.mcp import build_toolkit
 from agentflow.agents.scopes import ScriptedJsonModel, build_agent, run_agent
 
 
-async def test_toolkit_l1_function_registered() -> None:
-    toolkit = build_toolkit("log-analyst", use_mock=True)
+async def test_toolkit_local_function_registered() -> None:
+    """本地工具（CMDB 映射）仍进 toolkit；数据源工具已不在本地注册表。"""
+    toolkit = build_toolkit("code-locator")
     schemas = await toolkit.get_tool_schemas()
     names = [s["function"]["name"] for s in schemas]
-    # log-analyst 的 L1 工具（§10.4）
-    assert "query_logs" in names
+    assert "locate_code" in names          # 本地工具
+    assert "query_logs" not in names       # 数据源工具已迁 MCP，不在本地
 
 
 def test_permission_context_allow_rules_for_agent_tools() -> None:
@@ -23,35 +27,35 @@ def test_permission_context_allow_rules_for_agent_tools() -> None:
 
     from agentflow.agents.scopes import build_permission_context
 
-    ctx = build_permission_context("log-analyst", tenant_id="team-alpha")
+    ctx = build_permission_context("code-locator", tenant_id="team-alpha")
     assert ctx.mode == PermissionMode.DONT_ASK
     allowed = set(ctx.allow_rules.keys())
-    assert "query_logs" in allowed  # log-analyst 注册的 L1 工具已入 allow
+    assert "locate_code" in allowed  # code-locator 注册的本地工具已入 allow
     # 未授权工具（如写类）不应在 allow 里
     assert "sandbox_run_shell" not in allowed
 
 
 async def test_agent_scripted_json_roundtrip() -> None:
     """§7 输出契约：agent 输出严格 JSON 且可被 extract_json 解析。"""
-    toolkit = build_toolkit("log-analyst", use_mock=True)
+    toolkit = build_toolkit("knowledge-lookup")
     model = ScriptedJsonModel(
-        {"error_type": "IOException", "error_message": "No space left", "summary": "磁盘满"}
+        {"found": False, "similar_incidents": [], "summary": "无相似历史故障"}
     )
-    agent = build_agent("log-analyst", toolkit, model)
+    agent = build_agent("knowledge-lookup", toolkit, model)
     out = await run_agent(agent, {"bug": "订单报价单打印失败"})
-    assert out.get("error_type") == "IOException"
-    assert out.get("summary") == "磁盘满"
+    assert out.get("found") is False
+    assert out.get("summary") == "无相似历史故障"
 
 
 async def test_code_locator_cmdb_driven() -> None:
     """§9.4：code-locator 的 locate_code 走 CMDB（service → RepoSpec）。"""
-    from agentflow.agents.tools import build_l1_tools
+    from agentflow.agents.tools import build_local_tools
     from agentflow.workspace.cmdb import MockCmdbProvider
 
     cmdb = MockCmdbProvider(
         {"team-alpha": {"warranty-service": "https://github.com/company/warranty-service"}}
     )
-    tools = build_l1_tools("code-locator", use_mock=True, cmdb=cmdb)
+    tools = build_local_tools("code-locator", cmdb=cmdb)
     locate = next(t for t in tools if t["name"] == "locate_code")
     out = await locate["func"](service="warranty-service")
     assert out["found"] is True
@@ -90,14 +94,14 @@ async def test_run_agent_raises_when_reply_has_no_json() -> None:
 
     from agentflow.agents.scopes import AgentOutputError
 
-    toolkit = build_toolkit("log-analyst", use_mock=True)
+    toolkit = build_toolkit("knowledge-lookup")
     model = ScriptedJsonModel(
         "Executed maximum iterations of reasoning-acting loop without finishing the task."
     )
-    agent = build_agent("log-analyst", toolkit, model)
+    agent = build_agent("knowledge-lookup", toolkit, model)
     with pytest.raises(AgentOutputError) as ei:
         await run_agent(agent, {"bug": "订单报价单打印失败"})
-    assert ei.value.agent_name == "log-analyst"
+    assert ei.value.agent_name == "knowledge-lookup"
     assert "maximum iterations" in ei.value.text
 
 

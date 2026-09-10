@@ -3,7 +3,7 @@
 **版本**：v5.5
 **最后更新**：2026-09-10
 **基线**：design-v5.4.md（动态编排版）、design-v5.3.md（多租户版）、design-v5.2.md（第三轮评审签字版）
-**状态**：🟢 **批 1 / 批 2 已实施并实测通过**；批 3（删直连实现）待另行批准
+**状态**：🟢 **批 1 / 批 2 / 批 3 全部实施并实测通过**（MCP-only 已达成）
 
 ---
 
@@ -58,16 +58,50 @@ return f"sum(rate(container_cpu_usage_seconds_total{{{sel}}}[1m]))"
 
 ## 3. 目标架构
 
+```mermaid
+flowchart LR
+    subgraph AF["agentflow（backend）"]
+        WF["workflow YAML<br/>inputs.window_start/end"]
+        EX["DAGExecutor<br/>逐节点执行"]
+        RN["AgentNodeRunner<br/>+ per-tenant MCP 客户端"]
+        TK["Toolkit<br/>本地工具 + MCP 工具"]
+        WF --> EX --> RN --> TK
+    end
+
+    subgraph MCPC["MCP 客户端层"]
+        MM["MCPClientManager<br/>绑定 = agent_configs.mcp_server_ids<br/>注册 = mcp_servers 表（租户库）"]
+    end
+
+    subgraph SRV["aiops-datasource-mcp-server（独立仓库）"]
+        direction TB
+        T1["query_logs / get_trace<br/>（时间区间必填）"]
+        T2["query_metrics<br/>领域语义，非 PromQL"]
+        T3["check_infra / describe_pod<br/>K8s 当前状态"]
+        PMAP["语义映射住在这里<br/>未知 metric → 报错，不兜底"]
+        T2 --- PMAP
+    end
+
+    subgraph EXT["外部数据源"]
+        ES[("Elasticsearch")]
+        PM[("Prometheus")]
+        K8S[("Kubernetes")]
+    end
+
+    TK -->|"mcp__aiops-datasource__*"| MM
+    MM -->|Streamable HTTP| SRV
+    T1 --> ES
+    T2 --> PM
+    T3 --> K8S
+
+    style SRV fill:#e8f4ff,stroke:#4a90d9
+    style PMAP fill:#fff4e6,stroke:#d98b4a
 ```
-┌──────────────┐   MCP (Streamable HTTP)   ┌────────────────────────────┐
-│  agentflow   │ ────────────────────────► │ aiops-datasource-mcp-server│
-│  agent 节点  │   mcp__aiops-datasource__*│  （领域型只读工具）          │
-└──────────────┘                           └─────────┬──────────────────┘
-      ▲                                              │
-      │ 绑定关系：agent_configs.mcp_server_ids         ├─► Elasticsearch
-      │ 服务器注册：mcp_servers 表（租户库）              ├─► Prometheus
-      │ （v5.3 P4：配置在租户自己的库）                   └─► kubectl (K8s)
-```
+
+**要点**：
+- **取数只有这一条路**——进程内直连实现（原 `agents/datasources.py`）已在批 3 删除；
+- **语义映射住在 server 侧**（图中橙色）：调用方传 `metric=cpu_percent` 而非 PromQL，
+  避免"不同指标映射到同一条查询"这类语义错位（§2.1）；
+- **注册与绑定都在租户库**：server 注册行随租户库走（v5.3 P4），跨租户物理不可见。
 
 - **接入方式**：复用 v5.3 既有的 `mcp_servers` 表 + `agent_configs.mcp_server_ids`
   绑定（控制面 API 已完备，无需改代码）；
@@ -138,10 +172,19 @@ return f"sum(rate(container_cpu_usage_seconds_total{{{sel}}}[1m]))"
 |---|---|---|
 | **批 1** | 新建 `aiops-datasource-mcp-server` + 对真实测试床实测 | ✅ **已完成** |
 | **批 2** | agentflow 注册 server + 绑定 agent + prompt 对齐 + **时间窗下发** + E2E | ✅ **已完成** |
-| 批 3 | 删除直连实现（`datasources.py`、`build_datasource()`、相关测试与脚本），达成 MCP-only | ⏳ 待批准 |
+| **批 3** | 删除直连实现（`datasources.py`、`build_datasource()`、相关测试与脚本），达成 **MCP-only** | ✅ **已完成** |
 
-批 2 期间**两条路径并存**（`AGENTFLOW_SHARED_DATASOURCES=1` 仍走直连），可随时回退。
-本次验证采用 `=0`（MCP-only），以取得无歧义的信号。
+批 2 期间两条路径曾并存；**批 3 已删除直连实现**，现在取数只有 MCP 一条路。
+
+**批 3 验收结果**（`run_76516f37fe`，2026-09-10）：
+
+| 验收点 | 结果 |
+|---|---|
+| 取数全部经 MCP | ✅ 27 次 MCP 调用；**本地数据源调用 0 次** |
+| 本地调用仅剩非数据源工具 | ✅ 29 次 = 工作区工具（ws_*）+ `locate_code`(CMDB) + `search_knowledge`(占位) |
+| 诊断正确 | ✅ `rca=code_bug`(0.85)、`trace.failing_service=warranty-service` |
+| 全链路闭环 | ✅ run → `success` |
+| 回归 | ✅ 253 passed；ruff 债 67 → 43（删文件所致，零新增） |
 
 ### 7.1 时间窗由调用方下发（批 2 新增的约定）
 
@@ -195,7 +238,7 @@ workflow `inputs.window_start` / `window_end` 传入；workflow 以 `$.inputs.*`
 | 8 | **Worker 不热载 agent 配置** | worker 进程内 `_agent_config_provider` 为**永久缓存**（无代际失效），API 侧 CRUD 后 worker 必须**重启**才生效——绑定新 MCP server 在 queue 模式下需重启 worker。生产需改为 TTL 或订阅变更 | 中 |
 | 9 | **无状态 HTTP 的会话开销** | `HttpMCPConfig` 默认 `is_stateful=False`，**每次工具调用建一个新 MCP session**（实测单 run 数百次握手）。功能正确但开销可观，后续可评估 stateful 或连接复用 | 中 |
 | 10 | **agent 偶发无谓调用** | 实测 `query_metrics` 被调用 20 次（5 个指标各一次即够）；`check_infra(namespace="default")` 传了错误 namespace（应省略以走服务端默认 `order`）而返回 0 pod。prompt 已加约束，仍属**模型行为**范畴，需持续观察 | 中 |
-| 11 | **本地直连实现暂留** | `datasources.py` / `build_datasource()` 仍在（`AGENTFLOW_SHARED_DATASOURCES=1` 时启用）。两套实现并存有**行为漂移**风险——批 3 删除前不应再改直连侧逻辑 | 中 |
+| 11 | ~~本地直连实现暂留~~ | **已解决**：批 3 已删除 `datasources.py` / `build_datasource()` 及相关脚本，`AGENTFLOW_SHARED_DATASOURCES` 语义收窄为「repos 直传开关」（名称保留以免破坏既有 .env） | — |
 
 ## 9. 版本记录
 
@@ -205,4 +248,4 @@ workflow `inputs.window_start` / `window_end` 传入；workflow 以 `$.inputs.*`
 | v5.2.1 | 2026-09-09 | 实现状态注记（§17，不改签字结论） |
 | v5.3 | 2026-09-09 | 多租户架构版：五条架构原则 + 管理库/Router/tenantctl 三组件 + 实施批次 |
 | v5.4 | 2026-09-10 | 动态编排版（design-only）：四档执行体 + Dispatch 五层漏斗 + Plan-as-DAG + 计划审批 |
-| **v5.5** | 2026-09-10 | **数据面 MCP 化版**：`aiops-datasource-mcp-server`（领域型只读工具）+ 时间区间/查询目标强制契约 + 语义映射 server 侧 + 时间窗由调用方下发；**批 1/批 2 已实测通过**，批 3（删直连）待批准 |
+| **v5.5** | 2026-09-10 | **数据面 MCP 化版（已完成）**：`aiops-datasource-mcp-server`（领域型只读工具）+ 时间区间/查询目标强制契约 + 语义映射 server 侧 + 时间窗由调用方下发；批 1/2/3 全部实测通过，**取数 MCP-only** |

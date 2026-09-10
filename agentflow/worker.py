@@ -310,14 +310,14 @@ async def main(argv: list[str] | None = None) -> None:
         return
 
     # node_runner 装配（需 router 已建：per-tenant MCP store + agent 配置路由）。
-    # 此前 Worker 只传 model → shared_datasources 恒为构造函数默认 True（加固姿态失效）、
-    # 租户 MCP 绑定与 DB agent 配置全部丢失；此处补齐 API 侧同款装配。
+    # 此前 Worker 只传 model → 租户 MCP 绑定与 DB agent 配置全部丢失；此处补齐
+    # API 侧同款装配。数据源查询全部经 MCP（design-v5.5），无进程内直连。
     if settings.deepseek_api_key:
         from .agents.agent_config import AgentConfigResolver
         from .agents.mcp_manager import MCPClientManager
         from .agents.runner import AgentNodeRunner
         from .agents.scopes import build_model
-        from .api.app import build_cmdb, build_datasource
+        from .api.app import build_cmdb
 
         # agent 配置解析器（租户库 agent_configs 覆盖行）——API 侧的同名 provider 定义在
         # init() 闭包内不可导入，此处用同一 router 自建（Worker 进程不做 CRUD，无需代际缓存）。
@@ -349,12 +349,9 @@ async def main(argv: list[str] | None = None) -> None:
             build_model(settings),
             mcp_manager=mcp_manager,
             agent_config_provider=_agent_config_provider,
-            shared_datasources=settings.shared_datasources,
-            datasource=build_datasource(settings),
             cmdb=build_cmdb(),
         )
-        log.info("node_runner=agent（DeepSeek）shared_datasources=%s datasource=%s",
-                 settings.shared_datasources, type(node_runner.datasource).__name__)
+        log.info("node_runner=agent（DeepSeek）数据源经 MCP")
     if args.tenant:
         log.info("Worker(tenant=%s)：消费 %s / %s",
                  args.tenant, topic_trigger(args.tenant), topic_command(args.tenant))

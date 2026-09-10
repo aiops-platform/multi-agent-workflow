@@ -181,7 +181,7 @@ async def invoke() -> Any:
 |---|---|---|
 | `DAGExecutor.__init__`（`dag_executor.py:129`） | 不传 → `_default_runner` | mock：`sleep(0.01) + {"node": ..., "ok": True}`，**无 LLM** |
 | `RunService`（`service.py:22`） | 透传外部 `node_runner` → executor / `resume_executor` | API 层不传 → 全 mock |
-| `scripts/diagnose_scenario{1,2}.py` / `run_fix_loop.py` | 闭包：每次 `build_toolkit(name)` → `build_agent(...)` → `run_agent(...)` | 真实 DeepSeek |
+| `agentflow/agents/runner.py:AgentNodeRunner`（经 API/Worker 注入） | 每节点 `build_toolkit(...)` → `build_agent(...)` → `run_agent(...)` | 真实 DeepSeek |
 | 测试（`tests/test_diagnose_chain.py` 骨架） | `scripted_runner(node, params)` 字典映射 | 确定性，锁死编排语义 |
 
 ### 5.5 与 agent 生命周期的关系
@@ -241,4 +241,4 @@ async def invoke() -> Any:
 | `agentflow/agents/scopes.py` | `build_agent` / `build_model` / `run_agent` / `build_permission_context` |
 | `agentflow/executor/dag_executor.py` | DAG 编排 + `NodeRunner` 类型别名（:46）+ 默认 mock `_default_runner`（:208）+ `_run_with_retry` 调注入点（:265） |
 | `agentflow/service.py` | `RunService` 透传 `node_runner` 给 executor / `resume_executor` |
-| `scripts/diagnose_scenario{1,2}.py` / `scripts/run_fix_loop.py` | 注入真实 LLM 的 node_runner（每次 `build_toolkit` → `build_agent` → `run_agent`） |
+| `API/Worker`（同一 `AgentNodeRunner` 装配路径） | 注入真实 LLM 的 node_runner（每次 `build_toolkit` → `build_agent` → `run_agent`） |
