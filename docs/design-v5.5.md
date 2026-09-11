@@ -1,7 +1,7 @@
 # AI 运维 Bug Fix 智能体平台设计文档（v5.5 — 数据面 MCP 化）
 
 **版本**：v5.5
-**最后更新**：2026-09-10
+**最后更新**：2026-09-11
 **基线**：design-v5.4.md（动态编排版）、design-v5.3.md（多租户版）、design-v5.2.md（第三轮评审签字版）
 **状态**：🟢 **批 1 / 批 2 / 批 3 全部实施并实测通过**（MCP-only 已达成）
 
@@ -114,7 +114,6 @@ flowchart LR
 全部 `readOnlyHint=True`。**带时间的查询，`start_time`/`end_time` 为必填**。
 
 | 工具 | 时间区间 | 查询目标 | 后端 |
-|---|---|---|---|
 | `query_logs` | `start_time`/`end_time` 必填 | `service`(可空)、`level`、`limit` | ES `_search` + `range` on `app.@timestamp` |
 | `get_trace` | `start_time`/`end_time` 必填 | `trace_id` 必填 | ES + 调用链重建 + 故障 span 判定 |
 | `query_metrics` | `start_time`/`end_time` 必填、`step_seconds` | `service` 必填、`metric` 必填（5 选 1） | Prometheus `/api/v1/query_range` |
@@ -224,23 +223,66 @@ workflow `inputs.window_start` / `window_end` 传入；workflow 以 `$.inputs.*`
 | `check_infra`/`describe_pod` | ✅ 返回真实 6 个 pod 与 2210 字符 describe 文本 |
 | 单元测试 / lint / mypy | ✅ 46 passed（全仓 106）/ ruff 全清 / mypy 无问题 |
 
-## 8. 残余风险与待办
+## 8. 设计的适用边界与局限
 
-| # | 风险/待办 | 说明 | 优先级 |
-|---|---|---|---|
-| 1 | **MCP 凭证明文** | 若给 server 配 `AUTH_TOKEN`，`mcp_servers.config.headers` 在 agentflow 库中**明文存储且 GET 回显**（CLAUDE.md 待办已列）。本地联调未启用认证 | 高（批 2 前） |
-| 2 | **kubectl 依赖** | server 进程需 kubectl 二进制 + kubeconfig。Docker 化时镜像内需装（git-mcp-server 装 git 是同类先例） | 中 |
-| 3 | **`get_trace` 启发式是测试床特定经验** | 下游症状词表（feign / Read timed out…）与"完成/成功"关键字判定，非通用算法。已加注释标注适用边界 | 中 |
-| 4 | **`memory_percent`/`disk_percent` 在测试床恒为无数据** | 前者因容器未设 memory limit，后者因 testbed 应用侧 `data_disk_total_bytes` 为 NaN。**这是数据源侧的配置/缺陷，不应在查询层掩盖**——已如实返回 null + 归因提示 | 中（testbed 侧修） |
-| 5 | **`search_knowledge` 仍为 mock** | 恒返回 `found:True, INC0001`，按 v5.4 §7.3 属已标注缺口，真接缝=租户 MCP，本轮未动 | 中 |
-| 6 | **无 metrics/限流/Origin 校验** | 对齐 applog 的 v1 取舍；生产部署需由网关承担 | 低 |
-| 7 | **dev 端口 8300 硬编码约定** | 四处需同步（config.py / .env.example / README / 本地 .env） | 低 |
-| 8 | **Worker 不热载 agent 配置** | worker 进程内 `_agent_config_provider` 为**永久缓存**（无代际失效），API 侧 CRUD 后 worker 必须**重启**才生效——绑定新 MCP server 在 queue 模式下需重启 worker。生产需改为 TTL 或订阅变更 | 中 |
-| 9 | **无状态 HTTP 的会话开销** | 已定位并**大幅缓解**（2026-09-11）。根因不是"每次调用建会话"这么简单：**上游 `list_raw_tools()` 写 `_cached_tools` 却从不读它**，而 Toolkit 每轮 LLM 调用 + 每次工具执行前都会触发列举 → 实测单次节点执行 56 个会话里 **44 个是重复列举**（3.7 次/工具调用）。已加 TTL 记忆化（`agents/mcp_tool_cache.py`）：**56 → 13，降 80%**。<br>**残余**：1 次/调用的执行会话仍是 stateless 固有；彻底消除需连接池（见本表新增项） | 中 |
-| 10 | **agent 偶发无谓调用** | 实测 `query_metrics` 被调用 20 次（5 个指标各一次即够）；`check_infra(namespace="default")` 传了错误 namespace（应省略以走服务端默认 `order`）而返回 0 pod。prompt 已加约束，仍属**模型行为**范畴，需持续观察 | 中 |
-| 12 | **MCP 连接池化（设计已定，未实施）** | 提议在 tenant 粒度池化 MCP 连接（池持有连接、任意 task 借用/归还）。**已用原型验证可行**：owner task 独占持有，enter/use/exit 都在其内 → 消除 anyio 跨 task 取消域问题（实测任意 task 借用、并发复用、跨 task 关闭均通过）。收益：执行会话 1/调用 → 0、修好 **stdio 子进程泄漏**（既存缺陷：stdio 强制 stateful，evict 时跨 task close 失败只打警告）。成本 ~150-250 行 + 与 revalidate/evict 的交互设计。<br>**前置**：先评估上游 2.0.8（见 docs/TODO.md 第 5 项）—— 若上游已解决，可降级为"升级 + 开 stateful" | 中 |
-| 13 | **AgentScope 落后 5 个版本** | 锁 2.0.3，最新 2.0.8。升级前须重跑 S-001/S-011 冒烟（CLAUDE.md 约束 1）。详见 `docs/TODO.md` 第 5 项 | 中 |
-| 11 | ~~本地直连实现暂留~~ | **已解决**：批 3 已删除 `datasources.py` / `build_datasource()` 及相关脚本，`AGENTFLOW_SHARED_DATASOURCES` 语义收窄为「repos 直传开关」（名称保留以免破坏既有 .env） | — |
+> 本节只收录**设计本身的局限**——即"这样设计，就必然接受这样的后果"，评审需要知道的
+> 那类。**实施债（某适配器还没换成生产实现、某依赖还没装、某性能项还没优化）一律
+> 移到 `docs/TODO.md`**，不在此处堆积——否则"v5.5 做完"会被误读成"生产就绪"。
+
+### 8.1 `get_trace` 的故障 span 判定是**测试床特定经验**
+
+词表（`feign` / `Read timed out` / `Connection refused` 视为下游调用症状）与
+"完成/成功"关键字判定，来自当前测试床的日志/链路形态。**换一套服务、换一种
+trace 埋点，这套启发式可能失效**——它不是通用算法，已加注释标注适用边界。
+
+设计含义：把它放在 server 侧是对的（可随环境替换实现而不动 agent），但**它的正确性
+依赖于部署环境**，不能当作跨环境保证。
+
+### 8.2 无数据**不掩盖**——宁可 null，也不给可疑数字
+
+`memory_percent` / `disk_percent` 在当前测试床恒为 `null`（前者因容器未设 memory
+limit → 百分比无定义；后者因 testbed 应用侧 `data_disk_total_bytes` 为 NaN）。
+
+**这是设计立场而非缺陷**：数据源侧的配置问题/缺陷**不该在查询层被"修"成看起来正常
+的数字**。返回 null + 归因提示，让调用方知道"这项判定不了"——与 §2.1 的教训同源
+（真实数据 + 错误语义，比"没数据"更危险）。
+
+### 8.3 平台侧范围外事项（明确交由部署承担）
+
+MCP server **不做** metrics / 限流 / Origin-Host 校验（对齐 applog-mcp-server 的 v1
+取舍）。设计上认为这些应由**网关/服务网格**承担，不由业务 server 重复实现。
+
+### 8.4 两条硬约定带来的固有约束
+
+- **时间窗由调用方下发**（§7.1）→ 平台**离不开事件源**。若事件源不提供时刻，就没有
+  可信窗口；平台不会替它猜（宁可失败）。
+- **语义映射住 server 侧**（§5.2）→ **新增指标必须改 server 并重启**，不能靠调用方
+  现场扩展。这是为换取"查询语义可信"而接受的运维成本。
+
+### 8.5 v5.5 未覆盖、但仍需生产化的部分
+
+v5.5 只负责**数据面 MCP 化**。系统里仍有若干**继承自 v5.2/v5.3、尚未生产化**的
+本地简化实现。它们**不属于本设计范围**，但**会决定系统能否上生产**——已集中登记在
+`docs/TODO.md`，此处只留索引（不重复内容，避免两处漂移）：
+
+| 项 | TODO | 为何是生产阻塞 |
+|---|---|---|
+| CMDB 仍是 mock，接口不带 tenant，且硬编码个人绝对路径 | §6 | 生产路径依赖它；**接口本身已违反多租户隔离** |
+| 审批通知仍是日志桩 | §7 | 审批人收不到通知 → human-in-the-loop 断链 |
+| MCP server 无部署资产 / 默认无认证 / 凭证明文 | §8 | 上不了生产环境 |
+| 沙箱 exec 服务无认证、无 egress 控制 | §10 | 谁能连上就能执行代码 |
+
+| # | 局限 | 性质 |
+|---|---|---|
+| 1 | `get_trace` 启发式依赖部署环境（§8.1） | 设计的适用边界 |
+| 2 | 无数据返回 null 而非兜底数字（§8.2） | 设计立场 |
+| 3 | 不做 metrics/限流/Origin，交网关（§8.3） | 范围划分 |
+| 4 | 时间窗必须由调用方给（§8.4） | 约定的固有约束 |
+| 5 | 新增指标须改 server（§8.4） | 约定的运维成本 |
+| 6 | CMDB / 通知 / 沙箱等仍未生产化（§8.5） | 范围外，见 TODO |
+
+> **已解决项不再保留墓碑**（如"Worker 不热载配置"「本地直连实现暂留」），
+> 历史见 git log 与 `docs/TODO.md` 的完成记录。
 
 ## 9. 版本记录
 
@@ -251,3 +293,4 @@ workflow `inputs.window_start` / `window_end` 传入；workflow 以 `$.inputs.*`
 | v5.3 | 2026-09-09 | 多租户架构版：五条架构原则 + 管理库/Router/tenantctl 三组件 + 实施批次 |
 | v5.4 | 2026-09-10 | 动态编排版（design-only）：四档执行体 + Dispatch 五层漏斗 + Plan-as-DAG + 计划审批 |
 | **v5.5** | 2026-09-10 | **数据面 MCP 化版（已完成）**：`aiops-datasource-mcp-server`（领域型只读工具）+ 时间区间/查询目标强制契约 + 语义映射 server 侧 + 时间窗由调用方下发；批 1/2/3 全部实测通过，**取数 MCP-only** |
+| v5.5.1 | 2026-09-11 | **§8 重构**：原「残余风险与待办」把设计局限与实施债混在一起，拆分为「设计的适用边界与局限」——只留「这样设计就必然如此」的 6 条（启发式环境依赖性 / 无数据不掩盖 / 范围外交网关 / 时间窗须由调用方给 / 新增指标须改 server / 范围外未生产化项）。**实施债全部移入 `docs/TODO.md`**，并补入本轮审计发现的三处漏列（CMDB mock 且硬编码个人路径、审批通知桩、MCP server 缺部署资产）。另新增实测结论：工具列举 TTL 记忆化使 MCP 会话降 80% |

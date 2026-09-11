@@ -99,3 +99,138 @@
 `pyproject.toml`（版本 pin）、`agents/scopes.py`（AgentScope 适配层）、
 `agents/mcp_manager.py`、`agents/mcp_tool_cache.py`（可能可删）、
 `agents/transcript.py`（streaming 事件）
+
+---
+
+## 6. ⭐⭐ CMDB 生产化（**当前最关键的生产阻塞**）
+
+> 2026-09-11 审计发现。**生产路径依赖一个 mock，且硬编码了个人绝对路径，还违反多租户隔离。**
+
+### 现状（三处叠加）
+
+**① 硬编码个人路径** —— `workspace/prepare.py:27`
+
+```python
+DEFAULT_REPO_ROOT = Path("/Users/bo.gong/Documents/accenture/workspace/agentflow-testbed/services")
+```
+
+**② 走的是 mock，且在 API/Worker 的生产装配里** —— `api/app.py:251` `build_cmdb()`
+→ `MockCmdbProvider(default_cmdb())`，被 `app.py:315` 与 `worker.py:350` 注入
+`AgentNodeRunner`。`default_cmdb()` 只映射 `local` / `team-alpha` **两个租户**。
+
+**③ 接口本身不支持多租户** —— `workspace/cmdb.py:31`
+
+```python
+async def get_repo_for_service(self, service: str) -> RepoSpec | None:
+    for services in self._mapping.values():     # ← 遍历所有租户的映射
+        if service in services: ...
+```
+
+`TenantMappingProvider.get_repo_for_service(service)` **签名里没有 tenant_id**，
+无法做租户隔离；实现遍历全部租户 → **跨租户返回同一个 repo**（违反 v5.3 P1）。
+
+### 影响
+
+- 换台机器 / 换个人跑 → 路径不存在 → 工作区准备全失败 → 修复侧 agent 拿不到工作区
+- 非 `local`/`team-alpha` 的租户 → CMDB 全空 → `locate_code` 返回 `found=false`
+  → code-locator 定位不到仓库
+
+### 目标
+
+1. **接口加 tenant**：`get_repo_for_service(tenant_id, service)`（调用方与两处实现同步改）
+2. **repo 根配置化**：`AGENTFLOW_REPO_ROOT`（或直接由 CMDB 给出绝对 URL），去掉个人路径
+3. **真实 CMDB 适配器**：接 v5.3 §9.4 的 `TenantMappingProvider` 生产实现（CMDB + 拓扑查询）
+4. 或（v5.3 P1 方向）改为**由租户 MCP 提供 repo 映射**，与数据面统一
+
+### 涉及文件
+
+`workspace/cmdb.py`（接口 + Mock 实现）、`workspace/prepare.py`（default_cmdb + 路径）、
+`api/app.py:build_cmdb`、`worker.py`、`agents/tools.py`（`_cmdb_locate_code`）
+
+---
+
+## 7. ⭐⭐ 审批通知渠道（human-in-the-loop 断链）
+
+> `approval/notifier.py:3` 自述：「本地 MVP：日志通知（通知渠道为占位接口，**M6 接邮件/Slack/webhook**）」——
+> **M6 已交付，但这部分没做**。
+
+### 现状
+
+`ApprovalNotifier.notify()` 只 `log.info(...)` 并返回记录，**不推送给任何人**。
+
+### 影响
+
+审批挂起时**审批人不会收到任何通知**，只能靠人盯 UI 或等 sweeper 超时自动拒绝。
+在 v5.4「审批是稀缺资源、human-in-the-loop」的设计里这是硬伤——它让"人会及时批"
+这个前提不成立，实际会退化成"审批必然超时"。
+
+### 目标
+
+- 通知渠道适配器（邮件 / Slack / webhook，至少一种）
+- 通知模板（含 run/node/租户、审批链接、超时时刻）
+- 重试与失败降级（通知失败不能阻断审批流）
+- 与 sweeper 联动：临近超时要不要二次提醒
+
+### 涉及文件
+
+`approval/notifier.py`、`config.py`（渠道配置）、`approval/sweeper.py`（超时前提醒）
+
+---
+
+## 8. MCP server 部署与安全
+
+`aiops-mcp-servers/servers/aiops-datasource-mcp-server/`
+
+| 项 | 现状 | 目标 |
+|---|---|---|
+| **Dockerfile** | ❌ 无（同仓 `git-mcp-server` 有，可对照） | 多阶段构建 + 非 root + HEALTHCHECK + 镜像内装 kubectl |
+| **认证** | `AUTH_TOKEN=` 为空（dev） | 生产设 `ENVIRONMENT=production` + 非空 token |
+| **凭证明文** | 若启用 token，`mcp_servers.config.headers` 在 agentflow 库**明文存储 + GET 回显** | 加密列 + 回显脱敏（`cryptography` 已在依赖里） |
+| **kubectl** | 进程需 kubectl + kubeconfig | 镜像内置 + ServiceAccount 挂载 |
+
+---
+
+## 9. MCP 连接池化（设计已定，前置见第 5 项）
+
+**收益**：执行会话 1/调用 → 0；**修好 stdio 子进程泄漏**（既存缺陷——stdio 强制
+stateful，evict 时跨 task `close()` 失败只打警告，子进程真泄漏）。
+
+**已用原型验证可行**（2026-09-11）：owner task 独占持有连接，enter/use/exit 都在其内
+→ 消除 anyio 跨 task 取消域问题。实测任意 task 借用、5 路并发复用、跨 task 关闭**全部通过**。
+
+**前置**：先做第 5 项（AgentScope 升级评估）——若上游 2.0.8 的
+`fix(mcp) cleanup of cancelled MCP connections`（#2499）已解决 task-affinity，
+本项可降级为「升级 + 开 stateful」，不必自建池。
+
+**设计要点**：池键必须含 tenant（否则跨租户复用）；借用超时；故障重建；优雅关闭顺序。
+
+**涉及**：新增池模块 + `agents/mcp_manager.py`（revalidate/evict 交互）
+
+---
+
+## 10. 沙箱安全加固
+
+- `sandbox/exec_service.py` 只有**路径白名单**，**无请求认证**（谁能连上就能执行代码）
+- 无 egress 控制（沙箱可外联）
+- 目标：exec 服务加 token 校验 + NetworkPolicy 限定出口
+
+---
+
+## 11. 其余小项
+
+| 项 | 说明 |
+|---|---|
+| 端口约定同步 | `8300` 等端口在 config.py / .env.example / README / 本地 .env 四处需人工同步，易漂移 |
+| agent 无谓调用 | 实测 `query_metrics` 被调 20 次（5 个指标各一次即够）；`check_infra(namespace="default")` 传错 namespace 而返回 0 pod。prompt 已加约束，属模型行为，需持续观察 |
+| `search_knowledge` 真后端 | 恒返回 `INC0001`（**每次诊断都"命中"同一条假事故**）。按 design-v5.4 §7.3 走租户 MCP，等接缝 |
+| `get_trace` 启发式环境依赖 | 词表是测试床经验，换环境可能失效（design-v5.5 §8.1 已声明为设计边界） |
+
+---
+
+## 12. 已完成（留痕）
+
+- ~~Worker 不热载 agent 配置~~ → ✅ `911c7d3`：按库内指纹 TTL 热载，绑定 MCP server 无需重启
+- ~~本地直连数据源实现~~ → ✅ `578ea40`（批 3）：`datasources.py` 及脚本删除，取数 MCP-only
+- ~~MCP 工具列举重复握手~~ → ✅ `b8e1c88`：TTL 记忆化，单次节点执行会话 56 → 13（-80%）
+- ~~`agentflow.workspace` 未入库~~ → ✅ `67c9549`：`.gitignore` 裸 `workspace/` 吞源码
+- ~~审批超时 Resume 卡死 / 幂等未接线 / JWT 多租户~~ → ✅ `bb7b8ce` / `383b6b7`
