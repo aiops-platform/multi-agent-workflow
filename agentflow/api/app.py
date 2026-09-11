@@ -674,6 +674,82 @@ async def mcp_server_tools(mid: str, ctx: TenantContext = Depends(get_tenant_con
     return res
 
 
+# run 状态对外映射：DB 存的节点终态是 ``done``，对 UI 统一呈现为 ``success``。
+# **GET /runs 与 GET /runs/{id} 必须共用同一张表** —— 早期列表端点直接透传 DB 原始值，
+# 与详情端点不一致（同样是跑完的 run，列表说 done、详情说 success），前端没法统一判终态。
+_RUN_STATUS_TO_API = {"done": "success"}
+_RUN_STATUS_TO_DB = {v: k for k, v in _RUN_STATUS_TO_API.items()}
+
+
+def _api_run_status(db_status: str) -> str:
+    return _RUN_STATUS_TO_API.get(db_status, db_status)
+
+
+def _db_run_status(api_status: str) -> str:
+    """对外状态反查 DB 状态（列表过滤用）。未知值原样返回，交给 DB 过滤 → 结果为空。"""
+    return _RUN_STATUS_TO_DB.get(api_status, api_status)
+
+
+@app.get("/runs")
+async def list_runs(
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    ctx: TenantContext = Depends(get_tenant_context),
+) -> list[dict]:
+    """列出当前租户的 run（新→旧），供 UI 的流程列表用。
+
+    此前只有 ``GET /runs/{id}`` 单查 —— 前端拿不到「历史上跑过哪些 run」，
+    只能自己在内存里记 run_id，刷新即丢。
+
+    - ``status``：精确过滤（``running`` / ``waiting_approval`` / ``done`` …）
+    - **已知 N+1**：workflow 名逐个从 snapshot 取、token/cost 逐个 sum 节点。
+      ``limit`` 上限 200，控制面 UI 的用量下可接受；真要优化得加 run 级聚合列。
+    - **排序**：``created_at DESC, run_id DESC``。注意 ``created_at`` 只到**秒**
+      （sqlite 的 ``CURRENT_TIMESTAMP`` 无小数位），同一秒内创建的 run 只能靠
+      run_id 定序，不代表真实先后。
+    """
+    service = _service()
+    store = await service.store_for(ctx.tenant_id)
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    rows = await store.list_runs(
+        ctx.tenant_id,
+        status=_db_run_status(status) if status is not None else None,
+        limit=limit,
+        offset=offset,
+    )
+
+    out: list[dict] = []
+    for run in rows:
+        rid = run["run_id"]
+        # workflow 名从原 snapshot 取（与 GET /runs/{id} 同源；workflow 被删也显示得出）
+        name = None
+        try:
+            snap = await store.get_snapshot(run["workflow_snapshot_id"])
+            if snap:
+                name = Workflow.load_yaml(snap["workflow_yaml"]).name
+        except (ValueError, yaml.YAMLError, WorkflowDAGError):
+            name = None
+
+        nodes_raw = await store.get_nodes(rid)
+        tokens = sum((cp.get("tokens") or 0) for cp in nodes_raw.values())
+        cost = sum((cp.get("cost") or 0.0) for cp in nodes_raw.values())
+
+        out.append({
+            "run_id": rid,
+            "workflow": name,
+            "status": _api_run_status(run["status"]),
+            "total_tokens": tokens,
+            "total_cost": cost,
+            "inputs": run.get("inputs") or {},
+            "created_at": run.get("created_at"),
+            "updated_at": run.get("updated_at"),
+        })
+    return out
+
+
 @app.get("/runs/{run_id}")
 async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
     """聚合 run 详情（UI 轮询契约，对齐 agentflow 后端）：图 + 节点状态 + 统计 + 待审批。
@@ -699,6 +775,13 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
         graph = {}
 
     nodes_raw = await store.get_nodes(run_id)
+    # 每节点的重试次数：node_attempts 里同 (run_id, node_id) 的行数（表本身无读取端点）
+    attempts_by_node: dict[str, int] = {}
+    for att in await store.list_attempts(run_id):
+        nid_a = att.get("node_id")
+        if nid_a:
+            attempts_by_node[nid_a] = attempts_by_node.get(nid_a, 0) + 1
+
     nodes: dict[str, dict] = {}
     total_tokens = 0
     total_cost = 0.0
@@ -711,6 +794,13 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
             "tokens": cp.get("tokens", 0),
             "cost": cp.get("cost", 0.0),
             "prompt": json.dumps(params, ensure_ascii=False),
+            # 失败原因：cp.error 一直存在，此前没映射出来 → 前端看不到失败原因
+            "error": cp.get("error"),
+            # 耗时：随 checkpoint 走（nodes 表无时间列，见 dag_executor._stamp_timing）
+            "started_at": cp.get("started_at"),
+            "ended_at": cp.get("ended_at"),
+            "duration_ms": cp.get("duration_ms"),
+            "attempts": attempts_by_node.get(nid, 0),
         }
         total_tokens += cp.get("tokens", 0)
         total_cost += cp.get("cost", 0.0)
@@ -729,22 +819,20 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
             "upstream": upstream_out,
         })
 
-    status_map = {
-        "done": "success",
-        "running": "running",
-        "failed": "failed",
-        "cancelled": "cancelled",
-        "waiting_approval": "waiting_approval",
-    }
     return {
         "run_id": run_id,
         "workflow": graph.get("name"),
         "graph": graph,
-        "status": status_map.get(run["status"], run["status"]),
+        "status": _api_run_status(run["status"]),
         "total_tokens": total_tokens,
         "total_cost": total_cost,
         "nodes": nodes,
         "pending_approvals": pending,
+        # 回显建 run 时的 inputs：此前完全不返回，导致连「诊断的是哪段时间窗」
+        # （window_start/end，v5.5 §7.1 要求由调用方下发）都查不回来
+        "inputs": run.get("inputs") or {},
+        "created_at": run.get("created_at"),
+        "updated_at": run.get("updated_at"),
     }
 
 

@@ -476,9 +476,23 @@ class DAGExecutor:
             current_run.reset(_run_token)
             current_tenant.reset(_tenant_token)
 
+    @staticmethod
+    def _stamp_timing(state: dict, started_at: datetime) -> None:
+        """补 ``ended_at`` / ``duration_ms``（原地改 state）。
+
+        ``nodes`` 表没有时间列，所以耗时随 checkpoint 走 —— ``GET /runs/{id}``
+        从 cp 里读出来给前端展示。``started_at`` 在节点置 RUNNING 时就写进去了。
+        """
+        ended_at = datetime.now(UTC)
+        state["started_at"] = started_at.isoformat()
+        state["ended_at"] = ended_at.isoformat()
+        state["duration_ms"] = int((ended_at - started_at).total_seconds() * 1000)
+
     async def _exec_node_inner(self, nid: str, node: Node) -> None:
 
+        started_at = datetime.now(UTC)
         self.node_states[nid]["status"] = RUNNING
+        self.node_states[nid]["started_at"] = started_at.isoformat()
         ctx = {"nodes": self.node_states, "inputs": self.inputs}
         params = resolve_params(node.params, ctx)
         # 节点开始即落 running：GET /runs/{id} 实时读库 → 前端能看到「执行中」（running 样式已就绪）。
@@ -500,13 +514,16 @@ class DAGExecutor:
             if usage:
                 state["tokens"] = usage.get("tokens", 0)
                 state["cost"] = usage.get("cost", 0.0)
+            self._stamp_timing(state, started_at)
             self.node_states[nid] = state
             await self._persist(nid)
             # 节点成功后才把明细落 node_traces + 派生审计（失败只记日志，不影响 run）
             await self._flush_node_trace(nid)
             log.info("[%s] done %s", self.run_id, nid)
         except WorkflowNodeFailed as exc:
-            self.node_states[nid] = {"status": "failed", "output": None, "error": str(exc)}
+            state = {"status": "failed", "output": None, "error": str(exc)}
+            self._stamp_timing(state, started_at)
+            self.node_states[nid] = state
             await self._persist(nid)
             self.failed.append(nid)
             raise
