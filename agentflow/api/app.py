@@ -46,6 +46,7 @@ from .agent_store import (
 from .auth import TenantContext, get_tenant_context
 from .management_store import build_management_store
 from .mcp_store import MCPStore, build_mcp_store
+from .ticket_store import TICKET_NEW, TICKET_RUNNING, TicketStore, build_ticket_store
 from .workflow_store import WorkflowStore, build_workflow_store
 
 settings: Settings = get_settings()
@@ -66,6 +67,7 @@ async def lifespan(_: FastAPI):
     await init()
     yield
     await mcp_manager.close_all()
+    await ticket_store.close()
 
 
 app = FastAPI(title="agentflow 控制面", version="0.1.0", lifespan=lifespan)
@@ -76,6 +78,9 @@ _worker_task: asyncio.Task | None = None
 # 控制面配置存储（workflows/mcp_servers/agent_configs）：state_store=postgres 时落 PG，
 # 否则沿用本地 sqlite（构造不做 DB/I/O，惰性 connect；测试可 monkeypatch 模块全局）。
 workflow_store = build_workflow_store(settings)
+# 工单存储：此前 ticket 只作为 run 的 inputs 存一次、再也读不回来，
+# 导致「这条 run 来自哪个工单」不可查（见 ticket_store 模块 docstring）
+ticket_store = build_ticket_store(settings)
 mcp_store = build_mcp_store(settings)
 agent_config_store = build_agent_config_store(settings)
 # 运行时 MCP client 管理器（持有同一个 store 引用，读取 enabled=1 配置）
@@ -566,6 +571,135 @@ async def _mcp_snapshot(data: dict, tenant_id: str | None = None) -> list[dict[s
     except Exception:  # noqa: BLE001 —— 任何异常都降级为 None
         return None
     return res.get("tools") if res.get("ok") else None
+
+
+# ── Ticket Inbox（工单入口：从抓到 ticket 到发起诊断）──
+# 工单存在控制面库的 tickets 表，**每行带 tenant_id 且每个方法强制过滤**
+# （与 workflow_store 不同 —— 那个没有 tenant 列，是历史遗留）。
+# 若将来迁到「配置表随租户库走」（v5.3 P5），tenant_id 列让迁移直接可做。
+
+class TicketRequest(BaseModel):
+    """建工单。字段对齐测试数据里的 ServiceNow 事件形状（DIAGNOSE_TEST_GUIDE §BUG）。"""
+
+    title: str
+    bug_report: dict | None = None
+    window_start: str | None = None
+    window_end: str | None = None
+    # 以下若不传，从 bug_report 里兜底取（number / cmdb_ci.name / cmdb_ci.namespace）
+    number: str | None = None
+    service: str | None = None
+    namespace: str | None = None
+    severity: str | None = None
+
+
+class TicketRunRequest(BaseModel):
+    """从工单发起一次 run。``workflow_id`` 不传则用库里第一个已保存流程。"""
+
+    workflow_id: str | None = None
+
+
+def _ticket_inputs(req: TicketRequest) -> dict:
+    """TicketRequest → workflow 的 ``inputs``（bug_report + 时间窗）。
+
+    None 的键**不写入**：workflow YAML 里 window_start/end 声明为 required，
+    缺键与传 null 都不满足，但缺键的报错更直白（v5.5 §7.1 要求窗口由调用方下发）。
+    """
+    inputs: dict = {"bug_report": req.bug_report or {}}
+    if req.window_start:
+        inputs["window_start"] = req.window_start
+    if req.window_end:
+        inputs["window_end"] = req.window_end
+    return inputs
+
+
+@app.post("/tickets", status_code=201)
+async def create_ticket(
+    req: TicketRequest, ctx: TenantContext = Depends(get_tenant_context)
+) -> dict:
+    """建工单。返回完整记录（含 inputs 与空的 run_ids）。"""
+    br = req.bug_report or {}
+    ci = br.get("cmdb_ci") or {}
+    tid = await ticket_store.create(
+        ctx.tenant_id,
+        title=req.title,
+        inputs=_ticket_inputs(req),
+        number=req.number or br.get("number"),
+        service=req.service or ci.get("name"),
+        namespace=req.namespace or ci.get("namespace"),
+        severity=req.severity,
+    )
+    created = await ticket_store.get(ctx.tenant_id, tid)
+    assert created is not None
+    return created
+
+
+@app.get("/tickets")
+async def list_tickets(
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    ctx: TenantContext = Depends(get_tenant_context),
+) -> list[dict]:
+    """列出该租户的工单（新→旧）。"""
+    return await ticket_store.list(
+        ctx.tenant_id, status=status, limit=max(1, min(limit, 200)), offset=max(0, offset)
+    )
+
+
+@app.get("/tickets/{tid}")
+async def get_ticket(tid: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
+    """取单条工单。跨租户一律 404（不泄漏存在性，§9.2）。"""
+    ticket = await ticket_store.get(ctx.tenant_id, tid)
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="ticket 不存在")
+    return ticket
+
+
+@app.post("/tickets/{tid}/run")
+async def run_ticket(
+    tid: str,
+    req: TicketRunRequest | None = None,
+    ctx: TenantContext = Depends(get_tenant_context),
+) -> dict:
+    """从工单发起一次 run：取工单的 inputs → 建 run → 把 run 挂回工单。
+
+    组合端点，省掉前端「读工单 → 拼 inputs → POST /run → 回写关联」的往返。
+    底层与 ``POST /run`` 共用 ``start_run``（配额/校验/租户语义一致）。
+    """
+    ticket = await ticket_store.get(ctx.tenant_id, tid)
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="ticket 不存在")
+
+    cs = await _control_stores(ctx)
+    workflow_id = (req.workflow_id if req else None) or None
+    if workflow_id is None:
+        # 未指定则用第一个已保存流程 —— 让「发起诊断」按钮无需先选流程
+        saved = await cs.workflow.list()
+        if not saved:
+            raise HTTPException(
+                status_code=400, detail="库里没有已保存的 workflow，无法发起诊断"
+            )
+        workflow_id = saved[0]["id"]
+
+    wf_row = await cs.workflow.get(workflow_id)
+    if wf_row is None:
+        raise HTTPException(status_code=404, detail="workflow 不存在")
+    try:
+        workflow = Workflow.load_yaml(wf_row["yaml"])
+    except (ValueError, yaml.YAMLError, WorkflowDAGError) as exc:
+        raise HTTPException(status_code=400, detail=f"Workflow 解析失败: {exc}") from exc
+
+    try:
+        out = await _service().start_run(ctx.tenant_id, workflow, ticket["inputs"])
+    except TenantQuotaExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except InputsValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    run_id = out["run_id"]
+    await ticket_store.attach_run(ctx.tenant_id, tid, run_id)
+    await ticket_store.set_status(ctx.tenant_id, tid, TICKET_RUNNING)
+    return {"ticket_id": tid, "run_id": run_id, "workflow_id": workflow_id, "status": "started"}
 
 
 @app.post("/mcp-servers", status_code=201)
