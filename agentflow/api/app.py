@@ -201,6 +201,28 @@ def _effective_agent_resolver() -> AgentConfigResolver:
     return _agent_config_resolver if _agent_config_resolver is not None else AgentConfigResolver([])
 
 
+async def _agent_config_provider(tenant_id: str | None) -> AgentConfigResolver:
+    """per-tenant AgentSpec 解析器（代际缓存：CRUD 后 ``_resolver_generation`` 递增 → 失效重建）。
+
+    **必须在模块作用域**：``_reload_agent_config_resolver`` 里注册给 mcp_manager 的
+    ``_tenant_server_ids_for`` 闭包会调它，而那个闭包的外层是模块而非 ``init()``。
+    早期把它定义在 ``init()`` 内部（作为局部函数），于是运行时每次解析 MCP 绑定都抛
+    ``NameError: name '_agent_config_provider' is not defined`` —— 表现为**任何 agent 节点
+    执行失败**（"重试耗尽"）。单测发现不了：它们 monkeypatch 掉 service/mcp_manager，
+    不走这条路径；只有起真服务跑一次 run 才暴露。
+    """
+    key = tenant_id or "local"
+    hit = _resolver_cache.get(key)
+    if hit is not None and hit[0] == _resolver_generation:
+        return hit[1]
+    if stores_router is None:  # 未 init（测试）：退化为全局单例
+        return _effective_agent_resolver()
+    bundle = await stores_router.get(key)
+    resolver = AgentConfigResolver(await bundle.agent_config.list())
+    _resolver_cache[key] = (_resolver_generation, resolver)
+    return resolver
+
+
 async def _migrate_sqlite_config_to_pg() -> None:
     """本地 SQLite → PostgreSQL 一次性迁移（仅 state_store=postgres、源库存在时执行）。
 
@@ -264,16 +286,7 @@ async def init() -> RunService:
     # ── 租户库路由（P4）：tenant_id → TenantStores（state+workflow+mcp+agent_config）──
     stores_router = TenantStoresRouter(settings, management_store)
 
-    # per-tenant AgentSpec 解析器（代际缓存：CRUD 后 _reload 递增 → 失效重建）
-    async def _agent_config_provider(tenant_id: str | None) -> AgentConfigResolver:
-        key = tenant_id or "local"
-        hit = _resolver_cache.get(key)
-        if hit is not None and hit[0] == _resolver_generation:
-            return hit[1]
-        bundle = await stores_router.get(key)
-        resolver = AgentConfigResolver(await bundle.agent_config.list())
-        _resolver_cache[key] = (_resolver_generation, resolver)
-        return resolver
+    # per-tenant AgentSpec 解析器见模块级 _agent_config_provider（作用域原因，见其 docstring）
 
     # per-tenant mcp store 路由（§7：租户的 mcp_servers 表在租户自己的库）
     async def _mcp_store_provider(tenant_id: str | None):
