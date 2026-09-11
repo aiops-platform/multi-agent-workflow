@@ -27,6 +27,8 @@ from typing import Any
 
 from agentscope.mcp import HttpMCPConfig, MCPClient, StdioMCPConfig
 
+from .mcp_tool_cache import CachingMCPClient
+
 log = logging.getLogger("agentflow.mcp_manager")
 
 # 一次「测试连接」的整体超时（秒）。mcp/anyio 在 wait_for 超时取消时可能打噪音日志，可接受。
@@ -140,7 +142,9 @@ class MCPClientManager:
             stateful = bool(row.get("is_stateful"))
         else:
             raise ValueError(f"不支持的 transport: {transport!r}")
-        return MCPClient(
+        # CachingMCPClient：给工具列举加 TTL 记忆化（见 agents/mcp_tool_cache.py 的由来与
+        # 实测收益）。行为与上游一致，仅省掉重复的列举握手。
+        return CachingMCPClient(
             name=row["name"],
             is_stateful=stateful,
             mcp_config=mcp_config,
@@ -150,9 +154,15 @@ class MCPClientManager:
 
     @staticmethod
     async def _connect(client: MCPClient) -> None:
-        """stateful client 若未连接则连接（stateless 是 no-op）。"""
+        """stateful client 若未连接则连接（stateless 是 no-op）。
+
+        连接（重）建立后使工具缓存失效：重连后面可能是**另一个版本**的 server
+        （工具清单变了），不必等 TTL 到期。stateless 无连接概念，不涉及。
+        """
         if client.is_stateful and not client.is_connected:
             await client.connect()
+            if isinstance(client, CachingMCPClient):
+                client.invalidate_tools()
 
     async def _describe_tools(self, client: MCPClient) -> list[dict[str, Any]]:
         """列出 client 的可用工具：原始名 + 描述 + 只读标注 + AgentScope LLM 侧精确名。"""

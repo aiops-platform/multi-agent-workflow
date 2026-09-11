@@ -45,6 +45,57 @@
 
 ## 4. 清预置 lint / 测试债
 
-- `make lint` 目前有 ~140 个预置 ruff 错误（改动前后不变，非本次引入）
-- `tests/test_workspace.py`、`tests/test_agents.py::test_code_locator_cmdb_driven` 引用不存在的 `agentflow.workspace`（M3 模块未落树）→ 收集报错中断全量测试
-- `tests/test_sandbox.py` 5 个用例依赖本机 `~/.kube/config`
+- `make lint` 目前有 ~37 个预置 ruff 错误（改动前后不变，非本次引入）
+- ~~`tests/test_workspace.py` 引用不存在的 `agentflow.workspace`（M3 模块未落树）~~
+  → **已查明并修复**（commit `67c9549`）：不是"模块未落树"，而是 `.gitignore` 里裸写的
+  `workspace/` 匹配了任意深度同名目录，把源码包 `agentflow/workspace/` 整个吞掉、从未入库
+- `tests/test_sandbox.py` 5 个用例依赖本机 `~/.kube/config`（本机有 kube 时会因
+  incluster 配置缺失而失败；CI 无 kube 时被 skip）
+
+---
+
+## 5. ⭐ 评估 AgentScope 2.0.3 → 2.0.8 升级
+
+> 2026-09-11 记录。**不是**为了追新，而是因为落后版本已经卡住了两处设计空间。
+
+### 现状
+
+- 项目锁定 **2.0.3**（`pyproject.toml`，CLAUDE.md 约束 1）。
+- 上游最新 **2.0.8**（2026-09-08），**落后 5 个版本**。
+
+### 为什么值得评估（两处卡点）
+
+**① MCP 连接生命周期**：我们实测发现 stateful MCP 连接**跨 task 关闭会失败**
+（`Attempted to exit cancel scope in a different task than it was entered in`
+—— anyio TaskGroup 绑定创建它的 task）。而 DAGExecutor 的并行波是独立 task，
+`revalidate()` 也在节点 task 内 → 一旦开 `is_stateful=true`，连接就关不掉、泄漏资源。
+（同一个坎也让 **stdio MCP 的子进程泄漏**——stdio 强制 stateful。）
+
+上游 2.0.7/2.0.8 各有一个可能相关的修复，**需确认是否解决了这个问题**：
+- `fix(mcp) allow reconnecting stateful clients`（#2308，2.0.7）
+- `fix(mcp) cleanup of cancelled MCP connections`（#2499，2.0.8）
+
+**② 连接池化**：若 #2499 真解决了 task-affinity，则自建连接池可能**没必要**
+（可降级为"升级 + 开 stateful"）。另注意上游 PR #1951 已在 **workspace 层**做了
+`max_live_stateful_mcps`（默认 40）+ LRU 回收——说明上游认可 stateful 需要**有界管理**，
+但那是在 workspace 层，不是裸 `MCPClient`。
+
+### 已知会受影响的本仓补丁
+
+- `agents/mcp_tool_cache.py`（`CachingMCPClient`）：读上游 `PrivateAttr` `_cached_tools`。
+  升级后须复查上游是否已自行缓存列举（若已修，本补丁可删）。
+  > 注：这不是"上游 bug"——其 docstring 说明该缓存是为 `get_tool` 反查被过滤的工具名，
+  > 不是为省网络调用。我们打补丁是**本地取舍**（实测省 80% 会话）。
+
+### 升级成本与验收
+
+- **CLAUDE.md 约束 1：升级前必须重跑 S-001 / S-011 冒烟**（锁 2.0.3 的原因就是这两个）
+- streaming 事件 API 可能变化（约束 1 原文）
+- 回归：`make test` 全绿；testbed 两场景 E2E 复跑
+- 收益确认：MCP 会话数、stateful 跨 task 关闭、stdio 子进程回收 三项前后对比
+
+### 涉及文件
+
+`pyproject.toml`（版本 pin）、`agents/scopes.py`（AgentScope 适配层）、
+`agents/mcp_manager.py`、`agents/mcp_tool_cache.py`（可能可删）、
+`agents/transcript.py`（streaming 事件）

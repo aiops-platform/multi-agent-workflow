@@ -236,8 +236,10 @@ workflow `inputs.window_start` / `window_end` 传入；workflow 以 `$.inputs.*`
 | 6 | **无 metrics/限流/Origin 校验** | 对齐 applog 的 v1 取舍；生产部署需由网关承担 | 低 |
 | 7 | **dev 端口 8300 硬编码约定** | 四处需同步（config.py / .env.example / README / 本地 .env） | 低 |
 | 8 | **Worker 不热载 agent 配置** | worker 进程内 `_agent_config_provider` 为**永久缓存**（无代际失效），API 侧 CRUD 后 worker 必须**重启**才生效——绑定新 MCP server 在 queue 模式下需重启 worker。生产需改为 TTL 或订阅变更 | 中 |
-| 9 | **无状态 HTTP 的会话开销** | `HttpMCPConfig` 默认 `is_stateful=False`，**每次工具调用建一个新 MCP session**（实测单 run 数百次握手）。功能正确但开销可观，后续可评估 stateful 或连接复用 | 中 |
+| 9 | **无状态 HTTP 的会话开销** | 已定位并**大幅缓解**（2026-09-11）。根因不是"每次调用建会话"这么简单：**上游 `list_raw_tools()` 写 `_cached_tools` 却从不读它**，而 Toolkit 每轮 LLM 调用 + 每次工具执行前都会触发列举 → 实测单次节点执行 56 个会话里 **44 个是重复列举**（3.7 次/工具调用）。已加 TTL 记忆化（`agents/mcp_tool_cache.py`）：**56 → 13，降 80%**。<br>**残余**：1 次/调用的执行会话仍是 stateless 固有；彻底消除需连接池（见本表新增项） | 中 |
 | 10 | **agent 偶发无谓调用** | 实测 `query_metrics` 被调用 20 次（5 个指标各一次即够）；`check_infra(namespace="default")` 传了错误 namespace（应省略以走服务端默认 `order`）而返回 0 pod。prompt 已加约束，仍属**模型行为**范畴，需持续观察 | 中 |
+| 12 | **MCP 连接池化（设计已定，未实施）** | 提议在 tenant 粒度池化 MCP 连接（池持有连接、任意 task 借用/归还）。**已用原型验证可行**：owner task 独占持有，enter/use/exit 都在其内 → 消除 anyio 跨 task 取消域问题（实测任意 task 借用、并发复用、跨 task 关闭均通过）。收益：执行会话 1/调用 → 0、修好 **stdio 子进程泄漏**（既存缺陷：stdio 强制 stateful，evict 时跨 task close 失败只打警告）。成本 ~150-250 行 + 与 revalidate/evict 的交互设计。<br>**前置**：先评估上游 2.0.8（见 docs/TODO.md 第 5 项）—— 若上游已解决，可降级为"升级 + 开 stateful" | 中 |
+| 13 | **AgentScope 落后 5 个版本** | 锁 2.0.3，最新 2.0.8。升级前须重跑 S-001/S-011 冒烟（CLAUDE.md 约束 1）。详见 `docs/TODO.md` 第 5 项 | 中 |
 | 11 | ~~本地直连实现暂留~~ | **已解决**：批 3 已删除 `datasources.py` / `build_datasource()` 及相关脚本，`AGENTFLOW_SHARED_DATASOURCES` 语义收窄为「repos 直传开关」（名称保留以免破坏既有 .env） | — |
 
 ## 9. 版本记录

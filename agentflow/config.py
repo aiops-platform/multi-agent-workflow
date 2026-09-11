@@ -79,6 +79,12 @@ class Settings(BaseSettings):
     # 会增加 DB 往返）。
     config_refresh_sec: float = 5.0
 
+    # MCP 工具清单的本地记忆化 TTL（秒）。上游 `list_raw_tools` 每次调用都真的打服务端
+    # （写缓存但不读），而 Toolkit 每轮 LLM 调用 + 每次工具执行前都会触发一次——实测
+    # 单次节点执行 56 个会话里 44 个来自这种重复列举。TTL 内复用缓存，把握手降到 1 次。
+    # 0 = 禁用记忆化（退回上游行为）；负值同 0。详见 agents/mcp_tool_cache.py。
+    mcp_tools_cache_ttl: float = 60.0
+
     # ---- 沙箱（M4）----
     open_sandbox_domain: str = "localhost:8080"
     open_sandbox_api_key: str = ""
