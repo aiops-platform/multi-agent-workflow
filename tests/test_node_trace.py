@@ -59,7 +59,7 @@ def _one(content_block):
 
 
 class _FirstToolModel(ScriptedJsonModel):
-    """第 1 次喂入工具请求 locate_code（本地工具 → 真实走 on_acting），之后输出 JSON。
+    """第 1 次喂入工具请求 search_knowledge（本地工具 → 真实走 on_acting），之后输出 JSON。
 
     数据源工具（get_trace 等）已迁 MCP（design-v5.5），不在本地 toolkit。
     """
@@ -69,7 +69,7 @@ class _FirstToolModel(ScriptedJsonModel):
 
         self._call_count += 1
         if self._call_count == 1 and tools:
-            return _one(ToolCallBlock(id="c1", name="locate_code", input='{"service": "warranty-service"}'))
+            return _one(ToolCallBlock(id="c1", name="search_knowledge", input='{"query": "磁盘写满"}'))
         return _one(TextBlock(text=json.dumps(self._output_json, ensure_ascii=False)))
 
 
@@ -121,11 +121,11 @@ async def test_scan_denied_catches_real_deny() -> None:
     """真实 DONT_ASK + 空 allow 规则 → toolkit 里的本地工具被 DENY，跑后能补扫配对。"""
     from agentscope.permission import PermissionContext, PermissionMode
 
-    toolkit = build_toolkit("code-locator")
+    toolkit = build_toolkit("knowledge-lookup")
     model = UsageTrackingModel(_FirstToolModel({"ok": True}))
-    recorder = TraceRecorder("code-locator", "code-locator")
+    recorder = TraceRecorder("knowledge-lookup", "knowledge-lookup")
     agent = build_agent(
-        "code-locator", toolkit, model,
+        "knowledge-lookup", toolkit, model,
         permission_context=PermissionContext(mode=PermissionMode.DONT_ASK),
         middlewares=[recorder],
     )
@@ -133,8 +133,8 @@ async def test_scan_denied_catches_real_deny() -> None:
     # DENY 不进 on_acting → recorder 只记 llm_call；denied 由补扫获得
     assert all(r["kind"] != K_TOOL_CALL for r in recorder.rows)
     denied = scan_denied_blocks(agent.state.context)
-    hit = [r for r in denied if r["name"] == "locate_code"]
-    assert hit and hit[0]["payload"]["input"] == {"service": "warranty-service"}
+    hit = [r for r in denied if r["name"] == "search_knowledge"]
+    assert hit and hit[0]["payload"]["input"] == {"query": "磁盘写满"}
     assert "Permission denied" in hit[0]["payload"]["reason"]
 
 
@@ -143,7 +143,7 @@ async def test_scan_denied_catches_real_deny() -> None:
 # ======================================================================
 async def test_runner_records_allowed_tool_and_node_summary() -> None:
     runner = AgentNodeRunner(_FirstToolModel({"summary": "ok"}))
-    node = Node(id="n1", agent="code-locator")
+    node = Node(id="n1", agent="knowledge-lookup")
     await runner(node, {"bug": {"title": "x"}})
     rows = runner.take_trace(node)
     assert rows and rows[0]["kind"] == K_NODE  # 汇总行在最前
@@ -151,23 +151,23 @@ async def test_runner_records_allowed_tool_and_node_summary() -> None:
     assert K_TOOL_CALL in kinds and K_LLM_CALL in kinds
 
     node_row = rows[0]["payload"]
-    assert node_row["agent"] == "code-locator"
+    assert node_row["agent"] == "knowledge-lookup"
     assert node_row["input"] == {"bug": {"title": "x"}}
     assert node_row["output"] == {"summary": "ok"}
     assert node_row["tool_steps"] == 1 and node_row["llm_steps"] >= 1
     assert {"tokens", "cost", "enabled"} <= set(node_row)
 
     tool = next(r for r in rows if r["kind"] == K_TOOL_CALL)
-    assert tool["name"] == "locate_code"
+    assert tool["name"] == "search_knowledge"
     p = tool["payload"]
     assert p["server"] is None and p["is_mcp"] is False  # 本地工具（非 MCP）
-    assert p["input"] == {"service": "warranty-service"}
+    assert p["input"] == {"query": "磁盘写满"}
     assert p["result_state"] == "success"
 
     llm = next(r for r in rows if r["kind"] == K_LLM_CALL)
     assert {"messages", "tools", "usage"} <= set(llm["payload"])
-    # code-locator 的本地工具：CMDB 映射 + 工作区文件浏览（数据源工具已迁 MCP）
-    assert llm["payload"]["tools"] == ["locate_code", "ws_read_file", "ws_list_files"]
+    # knowledge-lookup 的本地工具：仅知识检索（数据查询与 CMDB 均已迁 MCP）
+    assert llm["payload"]["tools"] == ["search_knowledge"]
 
 
 # ======================================================================

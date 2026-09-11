@@ -3,8 +3,8 @@
 验证 build_toolkit（FunctionTool 包装**本地**工具）+ build_agent + run_agent 的
 严格 JSON 解析（§7 输出契约）。真实 DeepSeek 路径由 S-011 冒烟覆盖（spike）。
 
-**数据源查询已迁至 MCP**（design-v5.5），故此处用 `code-locator` / `knowledge-lookup`
-——它们持有仅存的本地工具（locate_code / search_knowledge）。
+**数据查询与 CMDB 均已迁至 MCP**（design-v5.5），本地只剩 `knowledge-lookup`
+持有的 `search_knowledge`（占位）——故测试一律用它。
 """
 from __future__ import annotations
 
@@ -14,11 +14,12 @@ from agentflow.agents.scopes import ScriptedJsonModel, build_agent, run_agent
 
 async def test_toolkit_local_function_registered() -> None:
     """本地工具（CMDB 映射）仍进 toolkit；数据源工具已不在本地注册表。"""
-    toolkit = build_toolkit("code-locator")
+    toolkit = build_toolkit("knowledge-lookup")
     schemas = await toolkit.get_tool_schemas()
     names = [s["function"]["name"] for s in schemas]
-    assert "locate_code" in names          # 本地工具
-    assert "query_logs" not in names       # 数据源工具已迁 MCP，不在本地
+    assert "search_knowledge" in names     # 仅存的本地只读工具
+    assert "query_logs" not in names       # 数据源工具已迁 MCP
+    assert "locate_code" not in names      # CMDB 也已迁 MCP
 
 
 def test_permission_context_allow_rules_for_agent_tools() -> None:
@@ -27,10 +28,10 @@ def test_permission_context_allow_rules_for_agent_tools() -> None:
 
     from agentflow.agents.scopes import build_permission_context
 
-    ctx = build_permission_context("code-locator", tenant_id="team-alpha")
+    ctx = build_permission_context("knowledge-lookup", tenant_id="team-alpha")
     assert ctx.mode == PermissionMode.DONT_ASK
     allowed = set(ctx.allow_rules.keys())
-    assert "locate_code" in allowed  # code-locator 注册的本地工具已入 allow
+    assert "search_knowledge" in allowed  # 该 agent 注册的本地工具已入 allow
     # 未授权工具（如写类）不应在 allow 里
     assert "sandbox_run_shell" not in allowed
 
@@ -47,23 +48,26 @@ async def test_agent_scripted_json_roundtrip() -> None:
     assert out.get("summary") == "无相似历史故障"
 
 
-async def test_code_locator_cmdb_driven() -> None:
-    """§9.4：code-locator 的 locate_code 走 CMDB（service → RepoSpec）。"""
-    from agentflow.agents.tools import build_local_tools
-    from agentflow.workspace.cmdb import MockCmdbProvider
+async def test_code_locator_has_no_local_cmdb_tool() -> None:
+    """CMDB 查询已迁 MCP（`locate_repo` / `get_service_topology`）——本地不再有。
 
-    cmdb = MockCmdbProvider(
-        {"team-alpha": {"warranty-service": "https://github.com/company/warranty-service"}}
-    )
-    tools = build_local_tools("code-locator", cmdb=cmdb)
-    locate = next(t for t in tools if t["name"] == "locate_code")
-    out = await locate["func"](service="warranty-service")
-    assert out["found"] is True
-    assert out["repo_url"] == "https://github.com/company/warranty-service"
+    本测试是**防回退锚点**：若有人把 CMDB 又塞回本地工具，这里会失败。
+    """
+    from agentflow.agents.tools import build_local_tools, tools_for_agent
 
-    # CMDB 未纳管的 service → found=False（负证据）
-    out2 = await locate["func"](service="unknown-service")
-    assert out2["found"] is False
+    # 本地工具只剩 search_knowledge（占位）
+    assert {t["name"] for t in build_local_tools("code-locator")} == set()
+
+    # 注册表里也不该再有 locate_code（它现在由 MCP server 提供）
+    assert "locate_code" not in {s.name for s in tools_for_agent("code-locator")}
+
+
+async def test_no_local_cmdb_provider_module() -> None:
+    """§9.4 的本地 CMDB 实现已删除：agent 进程不持有服务目录数据。"""
+    from agentflow.workspace.prepare import configured_repos
+
+    # 仓库映射改由部署配置驱动（无 root 即空），不再有硬编码路径或 Mock 提供者
+    assert configured_repos() == {}
 
 
 # ======================================================================

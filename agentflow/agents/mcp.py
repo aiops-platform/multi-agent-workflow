@@ -3,8 +3,7 @@
 集成模式已在 spike 验证：
 - ``spike/s-002-agent-scope-mcp/mcp_adapter_prototype.py``：真实模型自动发现并调用
   MCP 工具（Toolkit(tools=[], mcps=[client])，见 S-002 报告）。
-- ``spike/s-011-agent-smoke/mock_mcp_server.py``：mock MCP server（query_logs /
-  get_trace / query_metrics / check_infra / locate_code / search_knowledge）。
+- ``spike/s-011-agent-smoke/mock_mcp_server.py``：mock MCP server（供 spike 期验证）。
 - ``scripts/mock_mcp_server.py``：本仓库 MCP 配置页用的 mock server（mcp v1 FastMCP），
   三个工具覆盖「只读自动 ALLOW / 工具名 sanitize / 非只读需 allow」三种形态。
 
@@ -49,7 +48,6 @@ def _filter_connected_mcps(mcp_clients: list) -> list:
 def _build_function_tools(
     agent_name: str,
     *,
-    cmdb=None,
     sandbox_client=None,
     action_executor=None,
 ) -> list[FunctionTool]:
@@ -58,12 +56,12 @@ def _build_function_tools(
     **数据源查询不在此列**——日志/指标/K8s 已迁至 `aiops-datasource-mcp-server`
     （design-v5.5），经 ``mcp_clients`` 注入，不再有进程内直连实现。
 
-    - 本地只读：``locate_code``（传 ``cmdb``→真实 CMDB 查询）、``search_knowledge``（占位）
+    - 本地只读：``search_knowledge``（占位；CMDB 已随 ``locate_repo`` 迁至 MCP）
     - 工作区：读写本次 run 的代码工作区（§8.7）
     - L2：传 ``sandbox_client``→沙箱 run/write；传 ``action_executor``→§10.3 白名单动作
     """
     tools: list[FunctionTool] = []
-    for t in build_local_tools(agent_name, cmdb=cmdb):
+    for t in build_local_tools(agent_name):
         tools.append(FunctionTool(
             func=t["func"], name=t["name"], description=t["description"],
             is_read_only=True,  # 本地只读工具
@@ -87,18 +85,16 @@ def build_toolkit(
     agent_name: str,
     *,
     mcp_clients: list | None = None,
-    cmdb=None,
     sandbox_client=None,
     action_executor=None,
 ) -> Toolkit:
     """为 agent 构建 hybrid Toolkit：本地 function tool 与绑定的 MCP 工具共存。
 
-    本地部分 = 只读（CMDB/知识）+ 工作区 + L2；**数据源查询全部来自 MCP**
+    本地部分 = 只读（知识）+ 工作区 + L2；**数据源查询与 CMDB 全部来自 MCP**
     （``mcp_clients``，由 agent_configs.mcp_server_ids 绑定决定）——design-v5.5。
     """
     func_tools = _build_function_tools(
         agent_name,
-        cmdb=cmdb,
         sandbox_client=sandbox_client,
         action_executor=action_executor,
     )

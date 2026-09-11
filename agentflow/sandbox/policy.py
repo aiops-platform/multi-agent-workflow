@@ -32,8 +32,9 @@ class ToolPolicy:
             # 默认：team-alpha 只允许诊断/沙箱只读，禁止高风险动作（写权限走审批）
             "team-alpha": TenantToolConfig(
                 tenant_id="team-alpha",
-                allow=["query_logs", "get_trace", "query_metrics", "check_infra", "describe_pod",
-                       "locate_code", "search_knowledge", "sandbox_run_python", "sandbox_run_shell",
+                # 数据源与 CMDB 工具已迁 MCP（design-v5.5）——其放行由 MCP 侧
+                # readOnlyHint + allow_extra 承担，不在此处枚举；这里只列**本地**工具。
+                allow=["search_knowledge", "sandbox_run_python", "sandbox_run_shell",
                        "sandbox_write_file"],
                 deny=["scale_deployment", "restart_pod", "patch_resources"],  # §10.3 写动作需审批
             ),

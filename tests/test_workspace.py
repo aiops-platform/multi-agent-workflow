@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from agentflow.workspace.cmdb import MockCmdbProvider
 from agentflow.workspace.manager import FrozenVersionMismatch, WorkspaceManager
 from agentflow.workspace.models import RepoSpec
 
@@ -137,18 +136,65 @@ async def test_concurrent_runs_branch_isolation(source_repos: dict[str, Path], t
 
 
 # ----------------------------------------------------------------------
-# 场景 4：CMDB 驱动（§9.4）
+# 场景 4：仓库映射来自**部署配置**（不再硬编码路径、不再走本地 CMDB）
 # ----------------------------------------------------------------------
-async def test_code_locator_cmdb_flow(source_repos: dict[str, Path], tmp_path: Path) -> None:
-    """code-locator 定位流程：service → CMDB → RepoSpec → prepare。"""
-    cmdb = MockCmdbProvider({"team-alpha": {"warranty-service": file_url(source_repos["warranty-service"])}})
-    spec = await cmdb.get_repo_for_service("warranty-service")
-    assert spec is not None and spec.service == "warranty-service"
+async def test_repo_map_from_config(source_repos: dict[str, Path], tmp_path: Path) -> None:
+    """service → repo URL 由 repo_map 提供 → prepare 到工作区。
 
+    背景：此前的 `MockCmdbProvider` / `default_cmdb()` 把**某台开发机的绝对路径**
+    硬编码在生产路径里（换机器即静默失效），已删除；CMDB 查询迁至 MCP
+    （`locate_repo` / `get_service_topology`），工作区准备改由部署配置驱动。
+    """
+    repo_map = {"warranty-service": file_url(source_repos["warranty-service"])}
     wm = WorkspaceManager("team-alpha", "run_c", workspace_root=tmp_path / "ws")
-    dest = await wm.prepare_one(spec)
+    dest = await wm.prepare_one(
+        RepoSpec(service="warranty-service", url=repo_map["warranty-service"])
+    )
     assert (dest / "src" / "Warranty.java").exists()
-    assert (await cmdb.get_services_for_tenant("team-alpha")) == ["warranty-service"]
+
+
+def test_configured_repos_empty_without_root() -> None:
+    """未配 repo_root → 空映射（宁可跳过，也不用错路径）。"""
+    from agentflow.workspace.prepare import configured_repos
+
+    assert configured_repos() == {}   # conftest 已把 repo_root 隔离为空
+
+
+def test_configured_repos_composes_file_urls(monkeypatch) -> None:
+    """配了 root + map → 由目录名拼出 file:// URL。"""
+    from agentflow.config import get_settings
+    from agentflow.workspace.prepare import configured_repos
+
+    s = get_settings()
+    monkeypatch.setattr(s, "repo_root", "/srv/repos")
+    monkeypatch.setattr(s, "repo_map", '{"order-service": "aiops-test-order-service"}')
+    assert configured_repos() == {
+        "order-service": "file:///srv/repos/aiops-test-order-service"
+    }
+
+
+def test_configured_repos_keeps_explicit_scheme(monkeypatch) -> None:
+    """root 已是 URL（https/file）→ 不再补 file:// 前缀。"""
+    from agentflow.config import get_settings
+    from agentflow.workspace.prepare import configured_repos
+
+    s = get_settings()
+    monkeypatch.setattr(s, "repo_root", "https://git.example.com/org")
+    monkeypatch.setattr(s, "repo_map", '{"order-service": "order-service"}')
+    assert configured_repos() == {
+        "order-service": "https://git.example.com/org/order-service"
+    }
+
+
+def test_configured_repos_rejects_bad_json(monkeypatch) -> None:
+    """repo_map 非法 JSON → 忽略覆盖而非崩溃（只打 warning）。"""
+    from agentflow.config import get_settings
+    from agentflow.workspace.prepare import configured_repos
+
+    s = get_settings()
+    monkeypatch.setattr(s, "repo_root", "/srv/repos")
+    monkeypatch.setattr(s, "repo_map", "{not json")
+    assert configured_repos() == {}
 
 
 # ----------------------------------------------------------------------

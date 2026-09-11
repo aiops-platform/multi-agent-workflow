@@ -111,12 +111,8 @@ class AgentNodeRunner:
         mcp_manager=None,
         agent_config=None,
         agent_config_provider=None,
-        cmdb=None,
     ) -> None:
         self.model = UsageTrackingModel(model)
-        # 租户 CMDB（§9.4 TenantMappingProvider）：code-locator 的 locate_code 经它
-        # 解析 service→repo（真实 repo_url，供诊断段与工作区准备共用同一映射）。
-        self.cmdb = cmdb
         self.mcp_manager = mcp_manager
         # AgentSpec DB 配置解析器（agent_config.AgentConfigResolver）：提供 system_prompt 覆盖 + enabled
         self.agent_config = agent_config
@@ -175,11 +171,7 @@ class AgentNodeRunner:
         if self.mcp_manager is not None:
             clients = await self.mcp_manager.clients_for_agent(agent, tenant_id=tenant_id)
             allow_extra = await self.mcp_manager.allow_names_for_agent(agent, tenant_id=tenant_id)
-        toolkit = build_toolkit(
-            agent,
-            mcp_clients=clients,
-            cmdb=self.cmdb,
-        )
+        toolkit = build_toolkit(agent, mcp_clients=clients)
         ctx = build_permission_context(agent, allow_extra=allow_extra)
         # 每节点独立 recorder：采集 llm_call / tool_call 明细；DENY 工具跑后补扫
         recorder = TraceRecorder(node.id, agent)

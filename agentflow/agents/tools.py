@@ -30,13 +30,8 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     # 绑定（agent 侧名为 mcp__<server>__<tool>），权限经 allow_extra 下发。
     # 见 design-v5.5 §3/§5 与 skill §批3。
     #
-    # ---- 本地只读工具（非数据源：CMDB 映射 / 知识检索）----
-    "locate_code": ToolSpec(
-        "locate_code",
-        ["code-locator", "root-cause"],
-        timeout=30,
-        level="L1", description="CMDB 查询 service→repo 映射",
-    ),
+    # ---- 本地只读工具（非数据源：知识检索）----
+    # locate_code 已迁至 MCP（locate_repo / get_service_topology）——design-v5.5。
     "search_knowledge": ToolSpec(
         "search_knowledge",
         ["knowledge-lookup", "root-cause"],
@@ -164,26 +159,6 @@ def build_l2_tools(agent_name: str, *, sandbox_client=None, action_executor=None
 # ======================================================================
 # 数据源查询（日志/指标/K8s）已迁至 MCP（design-v5.5），此处不再有对应 mock——
 # 留着会让人以为"还有一条能用的数据路径"，而它其实只返回编造的数据。
-async def _mock_locate_code(service: str, **_: Any) -> dict:
-    return {"service": service, "repo_url": f"https://github.com/company/{service}", "base_sha": "abc123"}
-
-
-async def _cmdb_locate_code(cmdb, service: str, **_: Any) -> dict:
-    """CMDB 驱动的 locate_code（design §9.4）：service → RepoSpec。"""
-    spec = await cmdb.get_repo_for_service(service)
-    if spec is None:
-        return {
-            "service": service, "found": False,
-            "summary": f"CMDB 未找到 {service} 对应的 repo（可能未纳管）",
-        }
-    return {
-        "service": service, "found": True,
-        "repo_url": spec.url, "base_sha": spec.base_sha,
-        "suspicious_files": [],
-        "summary": f"CMDB 定位 {service} → {spec.url}",
-    }
-
-
 async def _mock_search_knowledge(query: str, **_: Any) -> dict:
     """知识检索占位实现。
 
@@ -195,18 +170,17 @@ async def _mock_search_knowledge(query: str, **_: Any) -> dict:
 
 
 LOCAL_TOOLS: dict[str, Any] = {
-    "locate_code": _mock_locate_code,
     "search_knowledge": _mock_search_knowledge,
 }
 
 
-def build_local_tools(agent_name: str, *, cmdb=None) -> list[dict]:
+def build_local_tools(agent_name: str) -> list[dict]:
     """为 agent 生成**本地**只读工具（AgentScope FunctionTool 形态）。
 
-    仅剩两个非数据源工具：``locate_code``（CMDB 映射，传 ``cmdb`` 时走真实查询）
-    与 ``search_knowledge``（占位实现，见其 docstring）。
+    仅剩 ``search_knowledge``（占位实现，见其 docstring）。
 
-    数据源查询（日志/指标/K8s）已迁至 MCP——design-v5.5。
+    其余能力均已迁至 MCP——数据查询（日志/指标/K8s，design-v5.5 批 1-3）与
+    CMDB（``locate_repo`` / ``get_service_topology``）。
     """
     tools = []
     for spec in tools_for_agent(agent_name):
@@ -215,10 +189,6 @@ def build_local_tools(agent_name: str, *, cmdb=None) -> list[dict]:
         func = LOCAL_TOOLS.get(spec.name)
         if func is None:
             continue  # 注册表里的 L1 工具都应在此有实现；无实现的直接跳过
-        if spec.name == "locate_code" and cmdb is not None:
-            from functools import partial
-
-            func = partial(_cmdb_locate_code, cmdb)
         tools.append({
             "name": spec.name,
             "description": spec.description,

@@ -256,8 +256,8 @@ async def test_tool_policy_audit_flow() -> None:
     logger = AuditLogger(store)
 
     for tool, agent, expected in [
-        # 本地只读工具（数据源工具已迁 MCP，不在本地注册表 → 会被判 DENY）
-        ("locate_code", "code-locator", "ALLOW"),
+        # 本地只读工具（数据源/CMDB 工具已迁 MCP，不在本地注册表 → 会被判 DENY）
+        ("search_knowledge", "knowledge-lookup", "ALLOW"),
         ("scale_deployment", "infra-remediator", "DENY"),  # team-alpha deny
         ("unknown_tool", "triage", "DENY"),
     ]:

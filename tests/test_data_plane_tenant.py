@@ -55,8 +55,11 @@ def test_datasource_tools_never_in_local_toolkit() -> None:
                      "check_infra", "describe_pod"):
             assert gone not in names, f"{agent} 不应再有本地 {gone}"
 
-    # 仅存的本地只读工具是 CMDB 映射与知识检索（非数据源）
-    assert "locate_code" in _tool_names(build_toolkit("code-locator"))
+    # CMDB 也已迁 MCP：code-locator 本地只剩**工作区**工具（ws_*，设计如此），
+    # 不再有任何 CMDB / 数据源工具
+    locator_local = _tool_names(build_toolkit("code-locator"))
+    assert locator_local == {"ws_read_file", "ws_list_files"}, locator_local
+    # 仅存的本地**只读数据类**工具是知识检索（占位）
     assert "search_knowledge" in _tool_names(build_toolkit("knowledge-lookup"))
 
 

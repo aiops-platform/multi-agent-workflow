@@ -104,9 +104,14 @@ SYSTEM_PROMPTS: dict[str, str] = {
         f"输出 Schema：{_schema_hint(InfraEvidenceSchema)}"
     ),
     "code-locator": (
-        "你是「代码定位」Agent（code-locator）。任务：由服务名 + 拓扑定位对应仓库与可疑代码。\n"
+        "你是「代码定位」Agent（code-locator）。任务：由服务名定位对应仓库与可疑代码。\n"
         "规则：\n"
-        f"1. 先调用 MCP 工具 locate_code(service) 查询 CMDB 获取 repo 映射\n2. {_JSON_RULE}\n"
+        "1. 先调用 MCP 工具 `locate_repo(service)` 查 CMDB 得到 repo URL 与归属"
+        "（owner / tier / namespace）\n"
+        "2. 需要判断影响范围或排查方向时，可调用 `get_service_topology(service, hops=2)`：\n"
+        "   `upstream` = 谁调用我（爆炸半径）；`downstream` = 我调用谁（可能的上游根因）\n"
+        "3. `locate_repo` 返回 `found=false` 表示 CMDB 未收录该服务——**如实上报，不要编造仓库**\n"
+        f"4. {_JSON_RULE}\n"
         f"输出 Schema：{_schema_hint(CodeLocationSchema)}"
     ),
     "knowledge-lookup": (

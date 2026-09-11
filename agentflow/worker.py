@@ -317,7 +317,6 @@ async def main(argv: list[str] | None = None) -> None:
         from .agents.mcp_manager import MCPClientManager
         from .agents.runner import AgentNodeRunner
         from .agents.scopes import build_model
-        from .api.app import build_cmdb
 
         async def _mcp_store_provider(tenant_id: str | None):
             bundle = await router.get(tenant_id or "local")
@@ -347,7 +346,6 @@ async def main(argv: list[str] | None = None) -> None:
             build_model(settings),
             mcp_manager=mcp_manager,
             agent_config_provider=_agent_config_provider,
-            cmdb=build_cmdb(),
         )
         log.info("node_runner=agent（DeepSeek）数据源经 MCP")
     if args.tenant:

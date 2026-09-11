@@ -89,6 +89,17 @@ class Settings(BaseSettings):
     open_sandbox_domain: str = "localhost:8080"
     open_sandbox_api_key: str = ""
 
+    # ---- 仓库映射（工作区准备用，§8.7.2）----
+    # 工作区准备发生在 run 创建期（早于任何 agent 节点），此时还没有 MCP 调用，
+    # 故用**部署配置**驱动，不走 MCP 的 CMDB（agent 侧查 CMDB 走 locate_repo）。
+    # 仓库根目录；**空 = 不做工作区准备**（修复侧工具会明确报错，fail-closed）。
+    # 支持本地路径（自动补 file://）或 http(s)/file:// URL 前缀。
+    repo_root: str = ""
+    # service → 仓库目录名 的 JSON 覆盖，如
+    # {"order-service": "aiops-test-order-service"}
+    # 缺省（空）→ 目录名取服务名本身。**注意：这里没有默认个人路径。**
+    repo_map: str = ""
+
     # ---- 工作区（§8.7.2）----
     # Run 级代码工作区根目录；布局 {root}/{tenant}/{run}/repos/{service}。
     # 修复侧 agent 的工作区工具（agents/workspace_tools.py）按 current_run 在此定位。

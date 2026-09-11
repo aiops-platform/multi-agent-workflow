@@ -21,6 +21,9 @@ def _isolate_settings(monkeypatch):
     monkeypatch.setattr(s, "jwt_secret", "")
     monkeypatch.setattr(s, "secret_key", "")
     monkeypatch.setattr(s, "shared_datasources", False)
+    # 仓库映射：防止本机 .env 的 testbed 路径污染测试（个别测试再按需覆盖）
+    monkeypatch.setattr(s, "repo_root", "")
+    monkeypatch.setattr(s, "repo_map", "")
     monkeypatch.setattr(s, "state_db_path", __import__("pathlib").Path("data/agentflow.db"))
     monkeypatch.setattr(s, "postgres_dsn", "localhost:5432/agentflow?user=agentflow&password=agentflow")
 

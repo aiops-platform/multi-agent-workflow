@@ -248,19 +248,6 @@ async def _migrate_sqlite_config_to_pg() -> None:
     print("[agentflow] 已把本地 SQLite 的 workflows/mcp_servers/agent_configs 配置迁移到 PostgreSQL")
 
 
-def build_cmdb():
-    """构建租户 CMDB（§9.4 TenantMappingProvider）。
-
-    本地 testbed 用 ``MockCmdbProvider`` + ``workspace.prepare.default_cmdb()`` 的
-    service→repo 映射（file:// 本地源）。**诊断段与工作区准备共用同一映射**——
-    code-locator 输出的 repo_url 与工作区实际克隆的仓库必须一致。
-    """
-    from ..workspace.cmdb import MockCmdbProvider
-    from ..workspace.prepare import default_cmdb
-
-    return MockCmdbProvider(default_cmdb())
-
-
 async def init() -> RunService:
     """应用启动时调用：管理库/租户路由 + StateStore + Queue + 审批超时 Sweeper（§8.9）。"""
     global service, sweeper, worker, _worker_task, stores_router, tenant_registry
@@ -310,9 +297,7 @@ async def init() -> RunService:
             mcp_manager=mcp_manager,
             agent_config=resolver,
             agent_config_provider=_agent_config_provider,
-            # 数据源查询全部经 MCP（mcp_manager 注入的 client，design-v5.5）
-            # 租户 CMDB：code-locator 的 locate_code 走它解析 service→repo（§9.4）
-            cmdb=build_cmdb(),
+            # 数据查询与 CMDB 全部经 MCP（mcp_manager 注入的 client，design-v5.5）
         )
         print("[agentflow] node_runner=agent（DeepSeek）：Bug Solve 页将真实调用 agent")
     queue_mode = settings.run_mode == "queue"
