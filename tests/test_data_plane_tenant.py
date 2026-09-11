@@ -44,7 +44,7 @@ def _tool_names(toolkit) -> set[str]:
 
 
 def test_datasource_tools_never_in_local_toolkit() -> None:
-    """数据源工具**一律不在本地 toolkit**——它们由 MCP 提供（design-v5.5 批3）。
+    """数据源工具**一律不在本地 toolkit**——它们由 MCP 提供（design-v5.6 §3.6）。
 
     批 3 之前这里测的是 ``shared_datasources`` 开关能否关掉内置数据源工具；那个开关
     连同内置数据源实现一起删除了。现在无论配置如何，本地都不会再出现它们。

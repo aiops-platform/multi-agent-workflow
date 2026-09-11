@@ -37,7 +37,7 @@ async def test_agents_item_shape_and_real_tools() -> None:
         assert isinstance(item["tools"], list)
         assert all(isinstance(t, str) for t in item["tools"])
         assert isinstance(item["stage"], str) and item["stage"]
-    # 数据源工具已迁 MCP（design-v5.5），本地注册表仅剩 CMDB 映射与知识检索。
+    # 数据源工具已迁 MCP（design-v5.6），本地注册表仅剩 CMDB 映射与知识检索。
     # /agents 的 tools 反映的是**本地**注册表：数据查询与 CMDB 均已迁 MCP，
     # 本地只剩 knowledge-lookup 的 search_knowledge（占位）。
     triage = next(a for a in data if a["name"] == "triage")

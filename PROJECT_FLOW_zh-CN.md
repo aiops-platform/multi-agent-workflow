@@ -77,7 +77,7 @@ flowchart TB
 > **v5.5 变更**：原 ④ 层的「真实数据源适配 `agents/datasources.py`」**已删除**——
 > ES/Prometheus/K8s 查询一律经 ⑤ 层的 MCP server（进程内直连实现不再存在）。
 > 本地只剩两类非数据源工具：CMDB 映射 + 知识检索（`tools.py`）、代码工作区
-> （`workspace_tools.py`）。详见 `docs/design-v5.5.md`。
+> （`workspace_tools.py`）。详见 `docs/design-v5.6.md`。
 
 **层级说明（每层的职责 / 技术 / 为什么）**
 

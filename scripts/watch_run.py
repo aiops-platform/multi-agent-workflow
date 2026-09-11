@@ -10,7 +10,7 @@
 观测面（对齐 design §6 / v5.3）：
     1. ``GET /runs/{id}``        → 节点状态 / 输出 / token / cost / 待审批
     2. ``GET /runs/{id}/traces`` → 每次 LLM 调用的 messages、工具调用、被 DENY 的工具
-    3. 直查库取 run_id（无 ``GET /runs`` 列表端点，见 design-v5.4 §7.2）
+    3. 直查库取 run_id（无 ``GET /runs`` 列表端点，见 design-v5.6 §4.7.2）
 
 仅依赖标准库 + 本仓 config，不引入新依赖。
 """

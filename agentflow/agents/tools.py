@@ -24,14 +24,14 @@ class ToolSpec:
 
 
 TOOL_REGISTRY: dict[str, ToolSpec] = {
-    # ---- 数据源查询工具：**已迁至 MCP**（design-v5.5）----
+    # ---- 数据源查询工具：**已迁至 MCP**（design-v5.6）----
     # query_logs / get_trace / query_metrics / check_infra / describe_pod 不再在这里
     # 注册——它们由 `aiops-datasource-mcp-server` 提供，经 agent_configs.mcp_server_ids
     # 绑定（agent 侧名为 mcp__<server>__<tool>），权限经 allow_extra 下发。
-    # 见 design-v5.5 §3/§5 与 skill §批3。
+    # 见 design-v5.6 §3.2/§3.4 与 skill §批3。
     #
     # ---- 本地只读工具（非数据源：知识检索）----
-    # locate_code 已迁至 MCP（locate_repo / get_service_topology）——design-v5.5。
+    # locate_code 已迁至 MCP（locate_repo / get_service_topology）——design-v5.6。
     "search_knowledge": ToolSpec(
         "search_knowledge",
         ["knowledge-lookup", "root-cause"],
@@ -157,13 +157,13 @@ def build_l2_tools(agent_name: str, *, sandbox_client=None, action_executor=None
 # ======================================================================
 # 本地只读工具实现（非数据源：CMDB 映射 / 知识检索）
 # ======================================================================
-# 数据源查询（日志/指标/K8s）已迁至 MCP（design-v5.5），此处不再有对应 mock——
+# 数据源查询（日志/指标/K8s）已迁至 MCP（design-v5.6），此处不再有对应 mock——
 # 留着会让人以为"还有一条能用的数据路径"，而它其实只返回编造的数据。
 async def _mock_search_knowledge(query: str, **_: Any) -> dict:
     """知识检索占位实现。
 
     ⚠️ 恒返回同一批虚构条目（INC0001）——**不是真实检索结果**。真实后端按
-    design-v5.4 §7.3 应走租户 MCP（租户自建暴露 search_knowledge 的 server 并绑定）。
+    design-v5.6 §4.7.3 应走租户 MCP（租户自建暴露 search_knowledge 的 server 并绑定）。
     在此之前，agent 引用它的结论时应知道这是占位数据。
     """
     return {"found": True, "similar_incidents": ["INC0001"], "suggested_actions": []}
@@ -179,7 +179,7 @@ def build_local_tools(agent_name: str) -> list[dict]:
 
     仅剩 ``search_knowledge``（占位实现，见其 docstring）。
 
-    其余能力均已迁至 MCP——数据查询（日志/指标/K8s，design-v5.5 批 1-3）与
+    其余能力均已迁至 MCP——数据查询（日志/指标/K8s，design-v5.6 批 1-3）与
     CMDB（``locate_repo`` / ``get_service_topology``）。
     """
     tools = []

@@ -311,7 +311,7 @@ async def main(argv: list[str] | None = None) -> None:
 
     # node_runner 装配（需 router 已建：per-tenant MCP store + agent 配置路由）。
     # 此前 Worker 只传 model → 租户 MCP 绑定与 DB agent 配置全部丢失；此处补齐
-    # API 侧同款装配。数据源查询全部经 MCP（design-v5.5），无进程内直连。
+    # API 侧同款装配。数据源查询全部经 MCP（design-v5.6），无进程内直连。
     if settings.deepseek_api_key:
         from .agents.config_sync import TenantConfigSync
         from .agents.mcp_manager import MCPClientManager

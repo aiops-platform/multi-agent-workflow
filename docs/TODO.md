@@ -180,8 +180,9 @@ async def get_repo_for_service(self, service: str) -> RepoSpec | None:
 ### 影响
 
 审批挂起时**审批人不会收到任何通知**，只能靠人盯 UI 或等 sweeper 超时自动拒绝。
-在 v5.4「审批是稀缺资源、human-in-the-loop」的设计里这是硬伤——它让"人会及时批"
-这个前提不成立，实际会退化成"审批必然超时"。
+在 v5.6 §4.6「审批是稀缺资源、human-in-the-loop」的设计里这是硬伤——它让"人会及时批"
+这个前提不成立，实际会退化成"审批必然超时"。**注意**：v5.6 §4.6 属编排层（§12），
+**未实施**；本项对**现有节点级审批**（已实施）同样是硬伤，故独立于 §12 先行。
 
 ### 目标
 
@@ -241,12 +242,87 @@ stateful，evict 时跨 task `close()` 失败只打警告，子进程真泄漏�
 |---|---|
 | 端口约定同步 | `8300` 等端口在 config.py / .env.example / README / 本地 .env 四处需人工同步，易漂移 |
 | agent 无谓调用 | 实测 `query_metrics` 被调 20 次（5 个指标各一次即够）；`check_infra(namespace="default")` 传错 namespace 而返回 0 pod。prompt 已加约束，属模型行为，需持续观察 |
-| `search_knowledge` 真后端 | 恒返回 `INC0001`（**每次诊断都"命中"同一条假事故**）。按 design-v5.4 §7.3 走租户 MCP，等接缝 |
-| `get_trace` 启发式环境依赖 | 词表是测试床经验，换环境可能失效（design-v5.5 §8.1 已声明为设计边界） |
+| `search_knowledge` 真后端 | 恒返回 `INC0001`（**每次诊断都"命中"同一条假事故**）。按 design-v5.6 §4.7.3 走租户 MCP，等接缝。**也是 §12 批 A 的弱信号依赖**（不阻塞） |
+| `get_trace` 启发式环境依赖 | 词表是测试床经验，换环境可能失效（design-v5.6 §3.7.1 已声明为设计边界） |
 
 ---
 
-## 12. 已完成（留痕）
+## 12. ⭐⭐ 动态编排（编排层）—— **未实施**，设计见 `docs/design-v5.6.md` §4
+
+> 2026-09-11 记录。来源：`design-v5.4.md`（已并入 `docs/design-v5.6.md`）。
+> **不是缺陷，是有意未开工**：设计稿为 design-only，批次须**人工评审批准后**才实施。
+> 记在此处是为了让"没做完的部分"有个可查的落点，别让 v5.6 §4 读起来像已完成。
+
+### 现状（代码级核实，2026-09-11）
+
+- workflow **一律人工**在 `POST /run` 指定 `workflow_id` 或 `workflow_yaml`，
+  两者都缺直接 400（`api/app.py:362-393`）——**没有自然语言选路入口**；
+- catalog = 3 张手写 workflow（`bug-fix-pipeline` / `bug-fix-scenario2` / `git-search-approval`），
+  `workflows` 表 schema 仅 `id/name/yaml/created_at`（`api/workflow_store.py:16-21`），**无 meta 列**；
+- `triage` agent 输出 `symptom_type`，语义上正是漏斗层 1 的输入信号，但**不参与任何选路**；
+- 全仓无 `dispatch` / `planner` / `compiler` 模块，无 `DispatchDecisionSchema` / `PlanSpec` /
+  `applicability` / `max_risk` / `workflow_ref` 任何符号。
+
+> **同名干扰项（排查时别误判）**：`sandbox/exec_service.py:135` 的 `_dispatch` 是 HTTP
+> 路由分发；`agents/registry.py` 的 `fix-planner` 是**静态图内**产出修复计划的节点 agent。
+
+### 目标
+
+让"选哪个 workflow / 要不要现编一张"可自适应，同时把 AI 自由度关在安全闸门内。
+总原则：**规划期自由、执行期确定性**（动态产物 = 普通 workflow，照走冻结 DAG）。
+
+### 批次拆解（设计定稿，按 A→B→C 顺序，每批独立提交）
+
+**批 A —— 命中判定 + dispatch**（先做，是入口）
+
+| 子项 | 内容 | 涉及文件 |
+|---|---|---|
+| A1 | `workflows` 表补 **meta JSON 列**（`applicability`/`status`/`max_risk`/`approval_policy`/`success_rate`/`origin`），sqlite/PG 幂等 migration | `api/workflow_store.py` |
+| A2 | 新增 **`dispatch` agent** + `DispatchDecisionSchema`（注册进 `AGENT_SCHEMAS`） | `agents/schemas.py` / `prompts.py` / `registry.py` |
+| A3 | **JSON-Schema 运行时校验层**（仅对 dispatch/planner 强制，失败重试/降级，不静默放行）——**这是 §4.3.1 自认的现状缺口，批 A 的前置** | 新增校验 util + `agents/scopes.py` |
+| A4 | 5 层漏斗的**确定性层**（1 归一 / 2 结构化过滤 / 5 信任门槛）；层 3 语义召回可后置；层 4 接 dispatch | 新增 dispatch 模块 |
+| A5 | 信任门槛命中 `draft`/超 `max_risk` → **注入 approval 节点**（降权） | 同上 |
+
+> 批 A **不动 executor**。验收：单测覆盖"结构化过滤命中/漏判、schema 校验失败重试、
+> draft 追加审批、跨租户 ref → miss"；demo 走「已知故障 → 命中 L2 → 自治 run」。
+
+**批 B —— 动态合成 + compiler + 计划审批**
+
+| 子项 | 内容 | 涉及文件 |
+|---|---|---|
+| B1 | PlanSpec IR + **compiler**（capability→node / 依赖→edges / 自动插审批 / 静态校验） | 新增 `planner/compiler.py` |
+| B2 | 编译产物落库 `meta.origin=generated` + `planner_session` 溯源 | `api/workflow_store.py` |
+| B3 | **计划级审批**（run 先落 `waiting_approval` 展示计划预览，复用既有 approval + CAS） | `service.py` / approve 端点 |
+| B4 | 审批节点 id **稳定语义命名**约束（`approve-change`/`approve-pr`），否则 default-deny 403 | compiler |
+| B5 | 规划预算（planner ≤3 迭代 / compiler ≤3 重排 / ≤30 节点 ≤10 层）超限 escalate | compiler + dispatch |
+
+> **前置**：`docs/design-v5.6.md` §5.2 的 **4 项接缝开放问题**（capability 粒度 /
+> planner 是否需预知本租户工具可用性 / 生成图窗口来源 / CMDB 工具能否规划期调用）
+> 原两稿均未定，**批 B 前需评审**。
+> 验收：E2E 走「未见故障 → miss → planner → compiler 落库 → 计划审批 → 执行」；
+> 编译失败带错因回传重排；生成图审批节点被 default-deny 管住（403 断言）。
+
+**批 C —— 闭环收敛 + 观测**
+
+| 子项 | 内容 | 涉及文件 |
+|---|---|---|
+| C1 | **run 指标聚合**（按 `(tenant, workflow_name/meta.origin)` 维度：count / 成功率 / 平均节点数 / 审批通过率）——**§4.7.2 自认的现状缺口**，漏斗层 5 与晋升阈值都依赖它 | 新增聚合查询（需 join `workflow_snapshots`） |
+| C2 | playbook **晋升流程**（L3 → 人工 review → `status=validated` + `origin=catalog`） | 新增晋升动作 |
+| C3 | §4.8.3 监控项（分档占比 / 命中率 / 晋升率 / 计划审批超时数） | 观测层 |
+| C4 | 成功率**回灌** `meta.success_rate`，驱动漏斗层 5 与晋升 | 同 C1 |
+
+> 验收：晋升阈值 + 成功率回写后，同一事件二次命中走 L2 而非 L3。
+
+### 依赖 / 前置
+
+- **`search_knowledge` 真后端**（见 §11）：§4.2 复杂度判定的"知识命中"信号现为 mock，
+  只能当弱信号；真后端走租户 MCP，**独立排期**，不阻塞批 A；
+- **审批通知渠道**（见 §7）：`human-in-the-loop` 若审批人收不到通知，
+  「审批必然超时」会使计划审批退化成形式。
+
+---
+
+## 13. 已完成（留痕）
 
 - ~~Worker 不热载 agent 配置~~ → ✅ `911c7d3`：按库内指纹 TTL 热载，绑定 MCP server 无需重启
 - ~~本地直连数据源实现~~ → ✅ `578ea40`（批 3）：`datasources.py` 及脚本删除，取数 MCP-only

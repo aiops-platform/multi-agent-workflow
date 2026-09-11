@@ -3,7 +3,7 @@
 验证 build_toolkit（FunctionTool 包装**本地**工具）+ build_agent + run_agent 的
 严格 JSON 解析（§7 输出契约）。真实 DeepSeek 路径由 S-011 冒烟覆盖（spike）。
 
-**数据查询与 CMDB 均已迁至 MCP**（design-v5.5），本地只剩 `knowledge-lookup`
+**数据查询与 CMDB 均已迁至 MCP**（design-v5.6），本地只剩 `knowledge-lookup`
 持有的 `search_knowledge`（占位）——故测试一律用它。
 """
 from __future__ import annotations

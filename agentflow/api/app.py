@@ -297,7 +297,7 @@ async def init() -> RunService:
             mcp_manager=mcp_manager,
             agent_config=resolver,
             agent_config_provider=_agent_config_provider,
-            # 数据查询与 CMDB 全部经 MCP（mcp_manager 注入的 client，design-v5.5）
+            # 数据查询与 CMDB 全部经 MCP（mcp_manager 注入的 client，design-v5.6）
         )
         print("[agentflow] node_runner=agent（DeepSeek）：Bug Solve 页将真实调用 agent")
     queue_mode = settings.run_mode == "queue"

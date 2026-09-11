@@ -61,7 +61,7 @@ def _one(content_block):
 class _FirstToolModel(ScriptedJsonModel):
     """第 1 次喂入工具请求 search_knowledge（本地工具 → 真实走 on_acting），之后输出 JSON。
 
-    数据源工具（get_trace 等）已迁 MCP（design-v5.5），不在本地 toolkit。
+    数据源工具（get_trace 等）已迁 MCP（design-v5.6），不在本地 toolkit。
     """
 
     async def _call_api(self, model_name, messages, tools=None, tool_choice=None, **kwargs):

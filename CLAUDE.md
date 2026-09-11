@@ -63,15 +63,17 @@ make lint      # ruff 检查
      `aiops-datasource-mcp-server` 提供（`POST /mcp-servers` 注册 →
      `PUT /agent-configs/{name}` 的 `mcp_server_ids` 绑定），**进程内直连实现已删除**
      （原 `agents/datasources.py`）。本地只读工具仅剩 `locate_code`（CMDB 映射）
-     与 `search_knowledge`（占位）。详见 `docs/design-v5.5.md`。
+     与 `search_knowledge`（占位）。详见 `docs/design-v5.6.md` §3。
    - **`AGENTFLOW_SHARED_DATASOURCES` 语义已收窄**：内置共享数据源工具没了，此开关
      如今**只剩一个作用**——是否放行 `inputs.repos` 直传（默认 0=封堵）。名称保留是
      为了不破坏既有 .env，新代码请按「repos 直传开关」理解。
    - runner 经 `exec_context.current_tenant`（executor 置位）做 per-tenant MCP
      （mcp_manager 缓存键 (tenant, server_id)，租户间物理不可见）与 per-tenant agent
      配置（agent_config_provider 代际缓存，CRUD 后失效）。
-     **注意：Worker 进程的 `_agent_config_provider` 是永久缓存**——绑定新 MCP server
-     后需重启 worker 才生效（design-v5.5 §8 第 8 项）。
+     **注意**：Worker 是独立进程，看不到 API 侧的内存代际计数器，改按**库内指纹**
+     判定配置是否变过并热载（`agents/config_sync.py`，`AGENTFLOW_CONFIG_REFRESH_SEC`
+     默认 5s）——**绑定新 MCP server 无需重启 worker**（`911c7d3` 修复；早期版本才是
+     永久缓存。曾误留作现状描述，2026-09-11 更正）。
    - **生命周期**：`python -m agentflow.tenantctl provision|deploy|upgrade|migrate|
      deprovision`（幂等 saga）；standard 租户专属分支被拒（§9.2 规则 4）；部署记录
      pin SHA 不 pin 分支名。

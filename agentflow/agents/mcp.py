@@ -54,7 +54,7 @@ def _build_function_tools(
     """本地 function tool 包装：只读（CMDB/知识）+ 工作区 + L2 执行。
 
     **数据源查询不在此列**——日志/指标/K8s 已迁至 `aiops-datasource-mcp-server`
-    （design-v5.5），经 ``mcp_clients`` 注入，不再有进程内直连实现。
+    （design-v5.6），经 ``mcp_clients`` 注入，不再有进程内直连实现。
 
     - 本地只读：``search_knowledge``（占位；CMDB 已随 ``locate_repo`` 迁至 MCP）
     - 工作区：读写本次 run 的代码工作区（§8.7）
@@ -91,7 +91,7 @@ def build_toolkit(
     """为 agent 构建 hybrid Toolkit：本地 function tool 与绑定的 MCP 工具共存。
 
     本地部分 = 只读（知识）+ 工作区 + L2；**数据源查询与 CMDB 全部来自 MCP**
-    （``mcp_clients``，由 agent_configs.mcp_server_ids 绑定决定）——design-v5.5。
+    （``mcp_clients``，由 agent_configs.mcp_server_ids 绑定决定）——design-v5.6。
     """
     func_tools = _build_function_tools(
         agent_name,

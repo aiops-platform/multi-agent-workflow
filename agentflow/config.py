@@ -66,7 +66,7 @@ class Settings(BaseSettings):
 
     # ---- 数据面姿态（v5.3 §7/P1，v5.5 批3 起语义收窄）----
     # 原名"共享数据源开关"：**内置共享数据源工具已删除**（数据查询全部走租户 MCP，
-    # design-v5.5），本开关如今**只剩一个作用**——是否放行 `inputs.repos` 直传。
+    # design-v5.6），本开关如今**只剩一个作用**——是否放行 `inputs.repos` 直传。
     #   False（默认，生产加固）：封堵 inputs.repos——堵"用平台身份操作任意 repo"
     #   True（dev/testbed 联调）：放行 inputs.repos（repo 由调用方显式指定）
     # 名称保留是为了不破坏既有 .env；新代码请按"repos 直传开关"理解。

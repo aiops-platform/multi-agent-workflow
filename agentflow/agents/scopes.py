@@ -130,7 +130,7 @@ class AgentOutputError(RuntimeError):
 
     此前 ``extract_json`` 静默返回 ``{}``，使「做了但没汇报」与「完全没做」不可区分：
     实测 committer 已成功 add+commit，却因轮次耗尽返回 ``{}``，run 照常显示 success，
-    副作用是否真的发生无从判断（design-v5.4 §3.1 标注的缺口）。
+    副作用是否真的发生无从判断（design-v5.6 §4.3.1 标注的缺口）。
     """
 
     def __init__(self, agent_name: str, text: str) -> None:

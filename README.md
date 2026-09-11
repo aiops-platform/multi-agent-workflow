@@ -189,7 +189,7 @@ agent 不知道"当前时间"，不能让它在运行期猜（猜错会得到错
 **故障 span 判定**住在 MCP server 侧：ES 按 traceId 重建调用链，优先「业务根因」而非
 「feign 下游调用症状」。该启发式是**测试床特定经验**，非通用算法。
 
-详见 `docs/design-v5.5.md`。
+详见 `docs/design-v5.6.md`。
 
 ## 控制面 API（27 端点）
 
