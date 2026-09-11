@@ -1,174 +1,28 @@
 # TODO（待办清单）
 
-> 目标：把 agentflow 从"单项目写死"演进成"可配置平台"。优先做高优先级项。
+> 目标：把 agentflow 从"单项目写死"演进成"可配置平台"。
 > 每项带「现状 / 问题 / 目标 / 涉及文件」，方便接手。
-
----
-
-## 1. ⭐ Agent 配置可配置化（平台化关键）—— ✅ 主体落地 v1.12（2026-09-03）
-
-> **落地情况（v1.12）**：DB 驱动 agent 配置（`agent_configs` 表 sqlite+PG）+ `AgentConfigResolver` 合并解析 +
-> 控制面 `/agent-configs` CRUD + agent→MCP server 绑定（server 粒度）+ SIP「Agent 配置」页。
-> 见 `docs/AGENT_CONFIG_DB_zh-CN.md`。**尚未覆盖**：tools 可见性 / 超时 / 限流、按租户模型参数（下表第 4 行起）。
 >
-> **现状**（v1.12 前的硬编码基线）：15 个 agent 的全部配置**硬编码**在项目代码里：
+> **排序原则（降序）**：① 是否阻塞上生产 / 安全 → ② 是否卡住别的活（前置关系）→ ③ 产品价值。
+> **已完成主体的项不再保留正文**，只在 §11 留一行痕迹；但仍未做完的尾巴统一收在 §7。
 
-| 配置 | 位置 |
-|---|---|
-| 名字 / 角色 / 描述 | `agentflow/agents/registry.py`（`DIAGNOSE_AGENTS` / `FIX_AGENTS` 列表 + `AGENT_DESCRIPTIONS`） |
-| 提示词 / 输出契约 | `agentflow/agents/prompts.py`（`SYSTEM_PROMPTS` / `AGENT_SCHEMAS`） |
-| 工具可见性 / 超时 / 限流 | `agentflow/agents/tools.py`（`TOOL_REGISTRY` 每个 `ToolSpec.agents` 列表） |
-
-**问题**：做平台必须支持租户/运营侧**配置**，而非改代码发布。典型需求：
-
-- 新增 / 停用 / 修改 agent
-- 自定义 system prompt / 输出 schema
-- 调整某个 agent 可见的工具（授权矩阵）
-- 按租户覆盖模型参数（model / max_iters / 是否真实 LLM）
-
-**目标**：仿照 `workflows/*.yaml` 的声明式模式，提供 `agents/*.yaml`（或 DB 驱动）配置，注册表**从配置构建**；`AGENT_REGISTRY` 从"import 时写死"变为"运行时装配"。
-
-**涉及**：`agentflow/agents/registry.py`、`prompts.py`、`tools.py`、（新增）配置加载层。
+| # | 项 | 为什么排这个位置 |
+|---|---|---|
+| 1 | 审批通知渠道 | 生产阻塞。human-in-the-loop **断链**，且拖垮的是**已实施**的节点级审批 |
+| 2 | MCP server 部署与安全 | 生产阻塞。无镜像/无认证/凭证明文，**上不了生产环境** |
+| 3 | 沙箱安全加固 | 生产阻塞（安全）。无认证无 egress，**谁能连上就能执行代码** |
+| 4 | 动态编排（编排层） | 产品主方向，但**须人工评审批准**才能开工，故不高于上面三项 |
+| 5 | AgentScope 升级评估 | **前置项**：解锁 §6，并决定 stateful 能不能开 |
+| 6 | MCP 连接复用 | 修既存缺陷（stdio 子进程泄漏），前置是 §5；**经查证不做完整池** |
+| 7 | 已完成主体的遗留尾巴 | 真活但零散、不阻塞，容易被忘 |
+| 8 | 清预置 lint / 测试债 | 不阻塞，但债会让回归信号不可信 |
+| 9 | `/agents` 端点增强 | 体验项 |
+| 10 | 其余小项 | 观察项 / 长期项 |
+| 11 | 已完成（留痕） | 无正文，只记 commit 与结论 |
 
 ---
 
-## 2. 真实 node_runner 接入 executor —— ✅ 已完成（383b6b7 + v5.3 批C）
-
-`agents/runner.py:AgentNodeRunner` 经 `RunService(node_runner=...)` 注入 executor/API；有 `DEEPSEEK_API_KEY` 即真实 LLM（无 Key 回退 mock）。v5.3 批 C 进一步：按 `current_tenant` 路由 per-tenant MCP / agent 配置；`AGENTFLOW_SHARED_DATASOURCES=0`（默认加固）时不注入内置共享数据源工具。剩余：L2 沙箱工具接入真实 run。
-
-## 3. `/agents` 端点增强
-
-- 可选 `?role=diagnose|fix` 过滤
-- 工具返回元数据（`level` L1/L2、`needs_approval`）而非只有工具名
-
----
-
-## 4. 清预置 lint / 测试债
-
-- `make lint` 目前有 ~37 个预置 ruff 错误（改动前后不变，非本次引入）
-- ~~`tests/test_workspace.py` 引用不存在的 `agentflow.workspace`（M3 模块未落树）~~
-  → **已查明并修复**（commit `67c9549`）：不是"模块未落树"，而是 `.gitignore` 里裸写的
-  `workspace/` 匹配了任意深度同名目录，把源码包 `agentflow/workspace/` 整个吞掉、从未入库
-- `tests/test_sandbox.py` 5 个用例依赖本机 `~/.kube/config`（本机有 kube 时会因
-  incluster 配置缺失而失败；CI 无 kube 时被 skip）
-
----
-
-## 5. ⭐ 评估 AgentScope 2.0.3 → 2.0.8 升级
-
-> 2026-09-11 记录。**不是**为了追新，而是因为落后版本已经卡住了两处设计空间。
-
-### 现状
-
-- 项目锁定 **2.0.3**（`pyproject.toml`，CLAUDE.md 约束 1）。
-- 上游最新 **2.0.8**（2026-09-08），**落后 5 个版本**。
-
-### 为什么值得评估（两处卡点）
-
-**① MCP 连接生命周期**：我们实测发现 stateful MCP 连接**跨 task 关闭会失败**
-（`Attempted to exit cancel scope in a different task than it was entered in`
-—— anyio TaskGroup 绑定创建它的 task）。而 DAGExecutor 的并行波是独立 task，
-`revalidate()` 也在节点 task 内 → 一旦开 `is_stateful=true`，连接就关不掉、泄漏资源。
-（同一个坎也让 **stdio MCP 的子进程泄漏**——stdio 强制 stateful。）
-
-上游 2.0.7/2.0.8 各有一个可能相关的修复，**需确认是否解决了这个问题**：
-- `fix(mcp) allow reconnecting stateful clients`（#2308，2.0.7）
-- `fix(mcp) cleanup of cancelled MCP connections`（#2499，2.0.8）
-
-**② 连接池化**：若 #2499 真解决了 task-affinity，则自建连接池可能**没必要**
-（可降级为"升级 + 开 stateful"）。另注意上游 PR #1951 已在 **workspace 层**做了
-`max_live_stateful_mcps`（默认 40）+ LRU 回收——说明上游认可 stateful 需要**有界管理**，
-但那是在 workspace 层，不是裸 `MCPClient`。
-
-### 已知会受影响的本仓补丁
-
-- `agents/mcp_tool_cache.py`（`CachingMCPClient`）：读上游 `PrivateAttr` `_cached_tools`。
-  升级后须复查上游是否已自行缓存列举（若已修，本补丁可删）。
-  > 注：这不是"上游 bug"——其 docstring 说明该缓存是为 `get_tool` 反查被过滤的工具名，
-  > 不是为省网络调用。我们打补丁是**本地取舍**（实测省 80% 会话）。
-
-### 升级成本与验收
-
-- **CLAUDE.md 约束 1：升级前必须重跑 S-001 / S-011 冒烟**（锁 2.0.3 的原因就是这两个）
-- streaming 事件 API 可能变化（约束 1 原文）
-- 回归：`make test` 全绿；testbed 两场景 E2E 复跑
-- 收益确认：MCP 会话数、stateful 跨 task 关闭、stdio 子进程回收 三项前后对比
-
-### 涉及文件
-
-`pyproject.toml`（版本 pin）、`agents/scopes.py`（AgentScope 适配层）、
-`agents/mcp_manager.py`、`agents/mcp_tool_cache.py`（可能可删）、
-`agents/transcript.py`（streaming 事件）
-
----
-
-## 6. CMDB 生产化 —— ✅ 主体已完成（2026-09-11，`b25dc4b` + `9b37cbe`）
-
-> 2026-09-11 审计发现。**生产路径依赖一个 mock，且硬编码了个人绝对路径，还违反多租户隔离。**
-
-### 现状（三处叠加）
-
-**① 硬编码个人路径** —— `workspace/prepare.py:27`
-
-```python
-DEFAULT_REPO_ROOT = Path("/Users/bo.gong/Documents/accenture/workspace/agentflow-testbed/services")
-```
-
-**② 走的是 mock，且在 API/Worker 的生产装配里** —— `api/app.py:251` `build_cmdb()`
-→ `MockCmdbProvider(default_cmdb())`，被 `app.py:315` 与 `worker.py:350` 注入
-`AgentNodeRunner`。`default_cmdb()` 只映射 `local` / `team-alpha` **两个租户**。
-
-**③ 接口本身不支持多租户** —— `workspace/cmdb.py:31`
-
-```python
-async def get_repo_for_service(self, service: str) -> RepoSpec | None:
-    for services in self._mapping.values():     # ← 遍历所有租户的映射
-        if service in services: ...
-```
-
-`TenantMappingProvider.get_repo_for_service(service)` **签名里没有 tenant_id**，
-无法做租户隔离；实现遍历全部租户 → **跨租户返回同一个 repo**（违反 v5.3 P1）。
-
-### 影响
-
-- 换台机器 / 换个人跑 → 路径不存在 → 工作区准备全失败 → 修复侧 agent 拿不到工作区
-- 非 `local`/`team-alpha` 的租户 → CMDB 全空 → `locate_code` 返回 `found=false`
-  → code-locator 定位不到仓库
-
-### 目标
-
-1. **接口加 tenant**：`get_repo_for_service(tenant_id, service)`（调用方与两处实现同步改）
-2. **repo 根配置化**：`AGENTFLOW_REPO_ROOT`（或直接由 CMDB 给出绝对 URL），去掉个人路径
-3. **真实 CMDB 适配器**：接 v5.3 §9.4 的 `TenantMappingProvider` 生产实现（CMDB + 拓扑查询）
-4. 或（v5.3 P1 方向）改为**由租户 MCP 提供 repo 映射**，与数据面统一
-
-### ✅ 落地情况（2026-09-11）
-
-**方案**：CMDB 纳入数据面 MCP（与 v5.3「数据面 = 租户自有 MCP」同向）。
-服务目录/拓扑是**静态数据**，放 server 侧后：**租户隔离随部署走**，agent 进程不再
-持有服务目录——上面第 ③ 条（接口无 tenant）**由架构消除**，不必再改签名。
-
-| 原目标 | 结果 |
-|---|---|
-| ① 接口加 tenant | ✅ **架构消除**：每租户部署自己的 server，跨租户物理不可见（v5.3 P1） |
-| ② repo 根配置化 | ✅ `AGENTFLOW_REPO_ROOT` + `AGENTFLOW_REPO_MAP`（agentflow 侧）；`DATASOURCE_REPO_ROOT`（server 侧）。**无默认个人路径** |
-| ③ 真实 CMDB 适配器 | ⏳ 数据仍 mock（按你的要求）；**接口已是生产形态**——换真实 CMDB 只需替换 `backends/cmdb.py` 取数实现 |
-| ④ 由租户 MCP 提供 | ✅ **本方案即此路** |
-
-**新增能力**：`get_service_topology(service, hops=2)` —— N 跳依赖拓扑，方向相对起点
-（`upstream`=爆炸半径 / `downstream`=可能的上游根因）。mock 目录扩到 10 服务三层。
-
-**删除**：`workspace/cmdb.py`、`prepare.py` 硬编码路径、本地 `locate_code` 工具、
-`cmdb=` 注入链（`build_local_tools`→`build_toolkit`→`AgentNodeRunner`→app/worker）。
-
-### 剩余（可选）
-
-- 真实 CMDB 适配：替换 `backends/cmdb.py` 的 `_SERVICES` / `_DEPENDS_ON` 为真实查询
-- 拓扑可考虑加环检测提示（当前 `direction=both` 已能反映环，但没有显式告警）
-
----
-
-## 7. ⭐⭐ 审批通知渠道（human-in-the-loop 断链）
+## 1. ⭐⭐ 审批通知渠道（human-in-the-loop 断链）
 
 > `approval/notifier.py:3` 自述：「本地 MVP：日志通知（通知渠道为占位接口，**M6 接邮件/Slack/webhook**）」——
 > **M6 已交付，但这部分没做**。
@@ -180,9 +34,9 @@ async def get_repo_for_service(self, service: str) -> RepoSpec | None:
 ### 影响
 
 审批挂起时**审批人不会收到任何通知**，只能靠人盯 UI 或等 sweeper 超时自动拒绝。
-在 v5.6 §4.6「审批是稀缺资源、human-in-the-loop」的设计里这是硬伤——它让"人会及时批"
-这个前提不成立，实际会退化成"审批必然超时"。**注意**：v5.6 §4.6 属编排层（§12），
-**未实施**；本项对**现有节点级审批**（已实施）同样是硬伤，故独立于 §12 先行。
+在 design-v5.6 §4.6「审批是稀缺资源、human-in-the-loop」的设计里这是硬伤——它让"人会及时批"
+这个前提不成立，实际会退化成"审批必然超时"。**注意**：v5.6 §4.6 属编排层（§4），
+**未实施**；本项对**现有节点级审批**（已实施）同样是硬伤，故独立于 §4 先行。
 
 ### 目标
 
@@ -197,7 +51,7 @@ async def get_repo_for_service(self, service: str) -> RepoSpec | None:
 
 ---
 
-## 8. MCP server 部署与安全
+## 2. ⭐⭐ MCP server 部署与安全
 
 `aiops-mcp-servers/servers/aiops-datasource-mcp-server/`
 
@@ -210,25 +64,7 @@ async def get_repo_for_service(self, service: str) -> RepoSpec | None:
 
 ---
 
-## 9. MCP 连接池化（设计已定，前置见第 5 项）
-
-**收益**：执行会话 1/调用 → 0；**修好 stdio 子进程泄漏**（既存缺陷——stdio 强制
-stateful，evict 时跨 task `close()` 失败只打警告，子进程真泄漏）。
-
-**已用原型验证可行**（2026-09-11）：owner task 独占持有连接，enter/use/exit 都在其内
-→ 消除 anyio 跨 task 取消域问题。实测任意 task 借用、5 路并发复用、跨 task 关闭**全部通过**。
-
-**前置**：先做第 5 项（AgentScope 升级评估）——若上游 2.0.8 的
-`fix(mcp) cleanup of cancelled MCP connections`（#2499）已解决 task-affinity，
-本项可降级为「升级 + 开 stateful」，不必自建池。
-
-**设计要点**：池键必须含 tenant（否则跨租户复用）；借用超时；故障重建；优雅关闭顺序。
-
-**涉及**：新增池模块 + `agents/mcp_manager.py`（revalidate/evict 交互）
-
----
-
-## 10. 沙箱安全加固
+## 3. ⭐⭐ 沙箱安全加固
 
 - `sandbox/exec_service.py` 只有**路径白名单**，**无请求认证**（谁能连上就能执行代码）
 - 无 egress 控制（沙箱可外联）
@@ -236,18 +72,7 @@ stateful，evict 时跨 task `close()` 失败只打警告，子进程真泄漏�
 
 ---
 
-## 11. 其余小项
-
-| 项 | 说明 |
-|---|---|
-| 端口约定同步 | `8300` 等端口在 config.py / .env.example / README / 本地 .env 四处需人工同步，易漂移 |
-| agent 无谓调用 | 实测 `query_metrics` 被调 20 次（5 个指标各一次即够）；`check_infra(namespace="default")` 传错 namespace 而返回 0 pod。prompt 已加约束，属模型行为，需持续观察 |
-| `search_knowledge` 真后端 | 恒返回 `INC0001`（**每次诊断都"命中"同一条假事故**）。按 design-v5.6 §4.7.3 走租户 MCP，等接缝。**也是 §12 批 A 的弱信号依赖**（不阻塞） |
-| `get_trace` 启发式环境依赖 | 词表是测试床经验，换环境可能失效（design-v5.6 §3.7.1 已声明为设计边界） |
-
----
-
-## 12. ⭐⭐ 动态编排（编排层）—— **未实施**，设计见 `docs/design-v5.6.md` §4
+## 4. ⭐⭐ 动态编排（编排层）—— **未实施**，设计见 `docs/design-v5.6.md` §4
 
 > 2026-09-11 记录。来源：`design-v5.4.md`（已并入 `docs/design-v5.6.md`）。
 > **不是缺陷，是有意未开工**：设计稿为 design-only，批次须**人工评审批准后**才实施。
@@ -315,17 +140,172 @@ stateful，evict 时跨 task `close()` 失败只打警告，子进程真泄漏�
 
 ### 依赖 / 前置
 
-- **`search_knowledge` 真后端**（见 §11）：§4.2 复杂度判定的"知识命中"信号现为 mock，
+- **`search_knowledge` 真后端**（见 §10）：§4.2 复杂度判定的"知识命中"信号现为 mock，
   只能当弱信号；真后端走租户 MCP，**独立排期**，不阻塞批 A；
-- **审批通知渠道**（见 §7）：`human-in-the-loop` 若审批人收不到通知，
+- **审批通知渠道**（见 §1）：`human-in-the-loop` 若审批人收不到通知，
   「审批必然超时」会使计划审批退化成形式。
 
 ---
 
-## 13. 已完成（留痕）
+## 5. ⭐ 评估 AgentScope 2.0.3 → 2.0.8 升级
 
+> 2026-09-11 记录。**不是**为了追新，而是因为落后版本已经卡住了两处设计空间。
+> **排在第 5 位是因为它是 §6 的前置**——先看上游修没修，再决定 §6 要不要自建。
+
+### 现状
+
+- 项目锁定 **2.0.3**（`pyproject.toml`，CLAUDE.md 约束 1）。
+- 上游最新 **2.0.8**（2026-09-08），**落后 5 个版本**。
+
+### 为什么值得评估（两处卡点）
+
+**① MCP 连接生命周期**：我们实测发现 stateful MCP 连接**跨 task 关闭会失败**
+（`Attempted to exit cancel scope in a different task than it was entered in`
+—— anyio TaskGroup 绑定创建它的 task）。而 DAGExecutor 的并行波是独立 task，
+`revalidate()` 也在节点 task 内 → 一旦开 `is_stateful=true`，连接就关不掉、泄漏资源。
+（同一个坎也让 **stdio MCP 的子进程泄漏**——stdio 强制 stateful。）
+
+上游 2.0.7/2.0.8 各有一个可能相关的修复，**需确认是否解决了这个问题**：
+- `fix(mcp) allow reconnecting stateful clients`（#2308，2.0.7）
+- `fix(mcp) cleanup of cancelled MCP connections`（#2499，2.0.8）
+
+**② 连接池化**：若 #2499 真解决了 task-affinity，则自建连接池可能**没必要**
+（可降级为"升级 + 开 stateful"）。另注意上游 PR #1951 已在 **workspace 层**做了
+`max_live_stateful_mcps`（默认 40）+ LRU 回收——说明上游认可 stateful 需要**有界管理**，
+但那是在 workspace 层，不是裸 `MCPClient`。
+
+### 已知会受影响的本仓补丁
+
+- `agents/mcp_tool_cache.py`（`CachingMCPClient`）：读上游 `PrivateAttr` `_cached_tools`。
+  升级后须复查上游是否已自行缓存列举（若已修，本补丁可删）。
+  > 注：这不是"上游 bug"——其 docstring 说明该缓存是为 `get_tool` 反查被过滤的工具名，
+  > 不是为省网络调用。我们打补丁是**本地取舍**（实测省 80% 会话）。
+
+### 升级成本与验收
+
+- **CLAUDE.md 约束 1：升级前必须重跑 S-001 / S-011 冒烟**（锁 2.0.3 的原因就是这两个）
+- streaming 事件 API 可能变化（约束 1 原文）
+- 回归：`make test` 全绿；testbed 两场景 E2E 复跑
+- 收益确认：MCP 会话数、stateful 跨 task 关闭、stdio 子进程回收 三项前后对比
+
+### 涉及文件
+
+`pyproject.toml`（版本 pin）、`agents/scopes.py`（AgentScope 适配层）、
+`agents/mcp_manager.py`、`agents/mcp_tool_cache.py`（可能可删）、
+`agents/transcript.py`（streaming 事件）
+
+---
+
+## 6. MCP 连接复用（先验 #2499，再决定要不要自建）
+
+> 2026-09-11 修订。原题「MCP 连接池化」按"自建池"排期；**查证上游后降级**——
+> 上游的池不在我们的技术栈里，且它解决的问题与我们真正的问题不是一回事。
+
+### 真正要解决的两件事（都还没解决）
+
+| # | 问题 | 根因 |
+|---|---|---|
+| (a) | 执行会话 **1/调用** | HTTP 绑定默认 **stateless**（`api/mcp_store.py:30`、`api/app.py:526`）→ 每次工具调用新建 session |
+| (b) | **stdio 子进程泄漏** / 跨 task 关闭失败 | **连接所有权**问题：stateful 连接由**节点 task** 持有，而 DAGExecutor 的并行波是独立 task → 关闭时 anyio 报 `Attempted to exit cancel scope in a different task than it was entered in` |
+
+(a) 的解法就是设 `is_stateful=true`，但那会立刻撞上 (b)。**所以 (b) 是前置。**
+
+### 为什么"自建连接池"被降级掉（2026-09-11 查证）
+
+**上游的池不在 `MCPClient` 里，也不在我们的栈里。**
+
+- `MCPClient` 仍是**一实例一 session**，无池、无跨调用复用；唯一缓存 `_cached_tools` 存的是工具描述（核过本地 2.0.3 与上游 main）。
+- 池在 **`workspace/_base.py`**（上游 PR #1951）：`max_live_stateful_mcps`（默认 `max(40, 2×stateful)`）+ LRU 淘汰，**键 = `(agent_id, session_id)`**，淘汰粒度 turn 级。
+- 我们**只 import 了** `agentscope.{agent,message,model,permission,middleware,state,tool,mcp}`，**没有 `agentscope.workspace`** → 那个池对我们**零作用**。
+- 键控模型也不兼容：上游按 session 隔离，我们按 **tenant**（v5.3 P4 物理不可见），且 client **跨 agent 共享**（一个 server 绑 6 个 agent = 1 个 client）。
+- **它解决的问题我们本来就没有**：容量上限 + LRU 防的是"stateful 连接数无界"，而我们的连接数 = 每租户配置的 server 数（**个位数**）。
+
+**因此 (b) 不是池化问题，是连接所有权问题**；上游做法反而印证了原型方向——把连接交给一个**长命 owner** 持有，而不是每个节点 task 各自持有。
+
+### 要做的事（按顺序）
+
+1. **先验 §5**：2.0.8 的 #2499 `fix(mcp) cleanup of cancelled MCP connections` 是否真解决了 task-affinity。
+   > ⚠️ **存疑，需实测**：上游 main 的 `connect()` 现在用 `asyncio.shield(stack.aclose())`
+   > 兜底，描述为 "preventing an abandoned stdio subprocess"——修的是**连接过程中被取消**，
+   > **不是**"从另一个 task 关闭"。`shield` 挡不住"退出 cancel scope 的 task 不是进入它的那个"。
+   > 不能按源码描述推断。
+2. **若仍不解决** → 做 **"owner task 持有连接"的薄封装**（**不是**完整池）：
+   owner task 独占持有，enter/use/exit 都在其内。
+   **已用原型验证**（2026-09-11）：任意 task 借用、5 路并发复用、跨 task 关闭**全部通过**。
+3. **不需要**：池键 / 借用超时 / 故障重建 / 优雅关闭顺序那套淘汰机制——连接数是个位数。
+
+**涉及**：`agents/mcp_manager.py`（连接所有权改为 owner task）+ 可能新增薄的 owner 封装模块。
+
+> 若走第 2 步，`agents/mcp_manager.py` 的 `_evict` / `close_all`（现按调用方 task 直接
+> `client.close()`）须一并改——**那正是泄漏点**。
+
+---
+
+## 7. 已完成主体的遗留尾巴
+
+> 三处「主体已完成、确有剩余」的项，正文已移入 §11 留痕，**只把真正还没做的部分留在这里**
+> ——否则任务在"已完成"里悄悄沉掉。
+
+| 源项 | 仍未做 | 涉及文件 |
+|---|---|---|
+| **Agent 配置可配置化**（v1.12 主体完成） | **tools 可见性 / 超时 / 限流**尚未纳入 DB 配置（仍硬编码在 `TOOL_REGISTRY` 的 `ToolSpec.agents`）；**按租户覆盖模型参数**（model / max_iters / 是否真实 LLM）未做 | `agents/tools.py`、`agents/registry.py`、配置加载层 |
+| **真实 node_runner 接入 executor**（`383b6b7` + v5.3 批C 完成） | **L2 沙箱工具接入真实 run**——`SandboxClient` 已可用，但 runner 在真实诊断链路中尚未调用 | `agents/runner.py`、`sandbox/orchestrator.py`、`workflows/*.yaml` |
+| **CMDB 生产化**（`b25dc4b` + `9b37cbe` 完成） | 数据仍是 mock：替换 `backends/cmdb.py` 的 `_SERVICES` / `_DEPENDS_ON` 为真实查询；<br>（可选）拓扑加显式环检测告警——当前 `direction=both` 能反映环但**不告警** | `aiops-datasource-mcp-server/backends/cmdb.py` |
+
+---
+
+## 8. 清预置 lint / 测试债
+
+- `make lint` 目前有 ~37 个预置 ruff 错误（改动前后不变，非本次引入）
+- `tests/test_sandbox.py` 5 个用例依赖本机 `~/.kube/config`（本机有 kube 时会因
+  incluster 配置缺失而失败；CI 无 kube 时被 skip）
+- **`tests/test_sandbox.py` 有陈旧用例**：`build_toolkit() got an unexpected keyword
+  argument 'use_mock'` ——批 3 删掉该参数后测试未同步
+
+> **实测（2026-09-11）**：本机 `pytest tests/` = **6 failed / 281 passed / 4 errors**。
+> 4 errors 全为缺可选依赖（`fakeredis` / `kafka`，本机未 `make install`）；6 failed 为
+> kube 依赖 + 上述陈旧用例 + `test_agent_runner` 需真实 DeepSeek key。
+> **与本次改动无关**（`git stash` 前后结果完全一致）。
+> **后果：回归信号目前不可信**——这是本项最该先清的理由。
+
+---
+
+## 9. `/agents` 端点增强
+
+- 可选 `?role=diagnose|fix` 过滤
+- 工具返回元数据（`level` L1/L2、`needs_approval`）而非只有工具名
+
+---
+
+## 10. 其余小项
+
+| 项 | 说明 |
+|---|---|
+| 端口约定同步 | `8300` 等端口在 config.py / .env.example / README / 本地 .env 四处需人工同步，易漂移 |
+| agent 无谓调用 | 实测 `query_metrics` 被调 20 次（5 个指标各一次即够）；`check_infra(namespace="default")` 传错 namespace 而返回 0 pod。prompt 已加约束，属模型行为，需持续观察 |
+| `search_knowledge` 真后端 | 恒返回 `INC0001`（**每次诊断都"命中"同一条假事故**）。按 design-v5.6 §4.7.3 走租户 MCP，等接缝。**也是 §4 批 A 的弱信号依赖**（不阻塞） |
+| `get_trace` 启发式环境依赖 | 词表是测试床经验，换环境可能失效（design-v5.6 §3.7.1 已声明为设计边界） |
+
+---
+
+## 11. 已完成（留痕）
+
+> 只记 commit 与结论，**不保留正文**。确有余留的直接指向 §7。
+
+- ~~Agent 配置可配置化（平台化关键）~~ → ✅ `v1.12`（2026-09-03）：DB 驱动 `agent_configs`
+  + `AgentConfigResolver` 合并解析 + `/agent-configs` CRUD + agent→MCP server 绑定 + SIP
+  「Agent 配置」页；见 `docs/AGENT_CONFIG_DB_zh-CN.md`。**尾巴见 §7**
+- ~~真实 node_runner 接入 executor~~ → ✅ `383b6b7` + v5.3 批 C：`AgentNodeRunner` 经
+  `RunService(node_runner=...)` 注入 executor/API，按 `current_tenant` 路由 per-tenant
+  MCP / agent 配置；有 `DEEPSEEK_API_KEY` 即真实 LLM。**尾巴见 §7**
+- ~~CMDB 生产化~~ → ✅ `b25dc4b` + `9b37cbe`（2026-09-11）：CMDB 迁至数据面 MCP
+  （`locate_repo` / `get_service_topology`），删硬编码个人路径、本地 `locate_code` 与
+  `cmdb=` 注入链；**租户隔离改由部署承载**，接口无 tenant 的问题由架构消除。**尾巴见 §7**
+- ~~`tests/test_workspace.py` 引用不存在的 `agentflow.workspace`~~ → ✅ `67c9549`：
+  不是"模块未落树"，而是 `.gitignore` 里裸写的 `workspace/` 匹配任意深度同名目录，
+  把源码包整个吞掉、从未入库
 - ~~Worker 不热载 agent 配置~~ → ✅ `911c7d3`：按库内指纹 TTL 热载，绑定 MCP server 无需重启
 - ~~本地直连数据源实现~~ → ✅ `578ea40`（批 3）：`datasources.py` 及脚本删除，取数 MCP-only
 - ~~MCP 工具列举重复握手~~ → ✅ `b8e1c88`：TTL 记忆化，单次节点执行会话 56 → 13（-80%）
-- ~~`agentflow.workspace` 未入库~~ → ✅ `67c9549`：`.gitignore` 裸 `workspace/` 吞源码
 - ~~审批超时 Resume 卡死 / 幂等未接线 / JWT 多租户~~ → ✅ `bb7b8ce` / `383b6b7`
+
