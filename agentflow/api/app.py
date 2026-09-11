@@ -1332,22 +1332,226 @@ async def delete_agent_config(
     return {"ok": True}
 
 
-@app.get("/agents")
-async def agents() -> list[dict]:
-    """Agent 编队列表（DB AgentSpec 配置 + 内置静态默认的合并视图；与 /health 同级无鉴权）。
+def _local_tool_views(agent_name: str) -> list[dict]:
+    """该 agent 在**本地** Tool Registry 里可见的工具（含 L1/L2 与是否需审批）。
 
-    来源 ``_effective_agent_resolver().all()``：内置 15（DB 覆盖或静态默认）∪ 自定义 agent。
-    返回 [{name, description, tools, stage}]，tools 为该 agent 在 Tool Registry 中可见的函数
-    工具名（L1 数据源，与 MCP 绑定无关），stage 为流水线阶段（detect/diagnose/fix/verify/
-    deliver/learn），供前端舰队分组展示。store 为空（未 init）时 == 纯内置 15，形状/顺序与
-    既有静态注册表一致。
+    ``level``/``needs_approval`` 是前端推导「自治 tier」的唯一依据（T1 只读 / T3 受限执行 /
+    T3+ 半自动），**不能只返回名字**。
     """
     return [
-        {"name": spec.name, "description": spec.description,
-         "tools": [t.name for t in tools_for_agent(spec.name)],
-         "stage": spec.stage}
-        for spec in _effective_agent_resolver().all()
+        {
+            "name": t.name,
+            "level": t.level,
+            "needs_approval": t.needs_approval,
+            "description": t.description,
+        }
+        for t in tools_for_agent(agent_name)
     ]
+
+
+async def _mcp_tool_views(server_ids, cs) -> list[dict]:
+    """绑定 server 提供的 MCP 工具（套 enable/disable 过滤），按 ``mcp__{server}__{tool}`` 拼。
+
+    改造前 ``/agents`` 的 ``tools`` **只含本地注册表**（端点注释明说"与 MCP 绑定无关"），
+    于是 15 个 agent 里 7 个显示 "no tools" —— 恰恰是最依赖取数的那 7 个（triage /
+    log-analyst / trace-analyst / metrics-analyst / infra-locator / fix-planner /
+    postmortem）。它们的工具经 MCP 下发，端点看不见，页面上的 "Total Tools" 与
+    "Ready" 两个 KPI 因此是误导的。
+
+    工具名取自 server 记录里的 **tools 快照**（最近一次 tools/list 的结果）；从未探测过
+    的 server 快照为 None → 该 server 贡献 0 个工具（前端应显示"未探测"而不是"无工具"）。
+    """
+    out: list[dict] = []
+    for mid in sorted(server_ids or ()):
+        row = await cs.mcp.get(mid)
+        if row is None or not row.get("enabled", 1):
+            continue
+        snapshot = row.get("tools") or []
+        names = [t.get("name") for t in snapshot if isinstance(t, dict) and t.get("name")]
+        enable = row.get("enable_tools")
+        if enable:
+            allowed = set(enable)
+            names = [n for n in names if n in allowed]
+        disable = set(row.get("disable_tools") or [])
+        names = [n for n in names if n not in disable]
+
+        read_only_by_name = {
+            t.get("name"): bool(t.get("read_only"))
+            for t in snapshot
+            if isinstance(t, dict) and t.get("name")
+        }
+        for n in names:
+            out.append({
+                "name": f"mcp__{row['name']}__{n}",
+                "server": row["name"],
+                "server_id": mid,
+                "tool": n,
+                "read_only": read_only_by_name.get(n),
+            })
+    return out
+
+
+def _agent_base_view(eff) -> dict:
+    """ResolvedAgent → 列表项骨架（不含工具，工具需 await 取）。"""
+    return {
+        "name": eff.name,
+        "description": eff.description,
+        "stage": eff.stage,
+        "role": eff.role,
+        "enabled": eff.enabled,
+        "origin": eff.origin,
+        "reasoning_enabled": eff.reasoning_enabled,
+        "mcp_server_ids": sorted(eff.mcp_server_ids),
+    }
+
+
+@app.get("/agents")
+async def agents(ctx: TenantContext = Depends(get_tenant_context)) -> list[dict]:
+    """Agent 编队列表（DB 配置 + 内置静态默认的合并视图）。
+
+    **v2 起需要租户上下文** —— 返回值含 MCP 绑定（租户数据），不能再无鉴权。
+    dev 模式（无 JWT）仍回退到 ``X-Tenant-ID`` / ``local``，既有调用方不受影响。
+
+    每项字段：
+    - ``name`` / ``description`` / ``stage``（detect/diagnose/fix/verify/deliver/learn）
+    - ``role``（diagnose | fix）、``enabled``、``origin``（builtin | custom）
+    - ``reasoning_enabled``、``mcp_server_ids``、``bound_servers``
+    - **``local_tools``**：本地注册表工具，**含 ``level``/``needs_approval``**
+      （前端据此推导自治 tier）
+    - **``mcp_tools``**：MCP server 提供的工具（``mcp__{server}__{tool}``）
+    - ``tools``：前两者的名字并集，**保留旧字段**以免打断既有调用方
+
+    来源 ``cs.agent_config.list()``（**该租户**的覆盖行）∪ 内置 15 —— 与 ``/agent-configs``
+    同源；早期版本用全局 resolver，与多租户下的 CRUD 不同步。
+    """
+    cs = await _control_stores(ctx)
+    rows = await cs.agent_config.list()
+    resolver = AgentConfigResolver(rows)
+
+    out: list[dict] = []
+    for eff in resolver.all():
+        local_tools = _local_tool_views(eff.name)
+        mcp_tools = await _mcp_tool_views(eff.mcp_server_ids, cs)
+        bound = await _bound_servers(sorted(eff.mcp_server_ids), cs)
+        out.append({
+            **_agent_base_view(eff),
+            "bound_servers": bound,
+            "local_tools": local_tools,
+            "mcp_tools": mcp_tools,
+            # 旧字段：名字并集（既有前端仍在用）
+            "tools": [t["name"] for t in local_tools] + [t["name"] for t in mcp_tools],
+            "tool_count": len(local_tools) + len(mcp_tools),
+        })
+    return out
+
+
+@app.get("/agents/stats")
+async def agents_stats(
+    limit_runs: int = 50, ctx: TenantContext = Depends(get_tenant_context)
+) -> dict:
+    """按 agent 聚合执行统计（数据源 ``node_traces`` 的 ``kind='node'`` 行）。
+
+    **口径与来源**（诚实标注）：
+    - 取**最近 N 个 run**（默认 50）的节点流水聚合，不是全表 —— 全表无按 agent 的索引，
+      且 traces 只在真实 LLM 模式（有 DeepSeek Key）下才有数据，mock 模式全空。
+    - ``runs``：该 agent 参与过的节点次数；``success_rate``：节点 status 非 failed 的占比。
+    - ``avg_tokens`` / ``avg_cost``：来自节点流水 payload。
+    - ``avg_duration_ms``：来自节点 checkpoint 的耗时（B1 加的），**不是**从 traces 推的。
+
+    返回 ``{"window_runs": N, "agents": {name: {...}}}``；样本为空时各值为 ``None``
+    而不是 0 —— 前端要能区分「没跑过」与「跑了但为 0」。
+    """
+    service = _service()
+    store = await service.store_for(ctx.tenant_id)
+    runs = await store.list_runs(ctx.tenant_id, limit=max(1, min(limit_runs, 200)))
+
+    agg: dict[str, dict] = {}
+
+    def _slot(name: str) -> dict:
+        return agg.setdefault(
+            name,
+            {"runs": 0, "failed": 0, "tokens": 0, "cost": 0.0, "duration_ms": 0, "n_duration": 0},
+        )
+
+    for run in runs:
+        # 各 agent 的归属取自 traces（kind='node' 的 payload.agent）；耗时取自 checkpoint
+        trace_agents: dict[str, str] = {}
+        for tr in await store.get_node_traces(run["run_id"], kind="node"):
+            payload = tr.get("payload") or {}
+            agent = payload.get("agent")
+            if not agent:
+                continue
+            trace_agents[tr.get("node_id")] = agent
+            slot = _slot(agent)
+            slot["runs"] += 1
+            if payload.get("error"):
+                slot["failed"] += 1
+            slot["tokens"] += payload.get("tokens") or 0
+            slot["cost"] += payload.get("cost") or 0.0
+
+        for nid, cp in (await store.get_nodes(run["run_id"])).items():
+            agent = trace_agents.get(nid)
+            if not agent:
+                continue
+            slot = _slot(agent)
+            dur = cp.get("duration_ms")
+            if isinstance(dur, (int, float)):
+                slot["duration_ms"] += dur
+                slot["n_duration"] += 1
+
+    agents_out: dict[str, dict] = {}
+    for name, s in agg.items():
+        n = s["runs"]
+        agents_out[name] = {
+            "runs": n,
+            "failed": s["failed"],
+            "success_rate": round((n - s["failed"]) / n, 4) if n else None,
+            "avg_tokens": round(s["tokens"] / n, 1) if n else None,
+            "avg_cost": round(s["cost"] / n, 6) if n else None,
+            "avg_duration_ms": (
+                round(s["duration_ms"] / s["n_duration"]) if s["n_duration"] else None
+            ),
+        }
+
+    return {"window_runs": len(runs), "agents": agents_out}
+
+
+@app.get("/agents/{name}")
+async def agent_detail(
+    name: str, ctx: TenantContext = Depends(get_tenant_context)
+) -> dict:
+    """单 agent 详情：列表项的全部字段 + **完整 system_prompt** + 输出 schema + ``stored``。
+
+    ``stored`` 给出 DB 覆盖行里**实际存了什么**（未覆盖则为 null），前端可据此显示
+    "已覆盖 / 用内置默认"。与 ``GET /agent-configs/{name}`` 的区别：那个是配置视角
+    （聚焦可编辑字段），这个是**编队视角**（含工具面与绑定，供 Agent 目录的 Inspector 用）。
+    """
+    cs = await _control_stores(ctx)
+    rows = await cs.agent_config.list()
+    resolver = AgentConfigResolver(rows)
+    eff = resolver.resolve(name)
+    if eff is None:
+        raise HTTPException(status_code=404, detail=f"agent 不存在: {name}")
+
+    raw = next((r for r in rows if r["name"] == name), None)
+    local_tools = _local_tool_views(name)
+    mcp_tools = await _mcp_tool_views(eff.mcp_server_ids, cs)
+
+    return {
+        **_agent_base_view(eff),
+        "bound_servers": await _bound_servers(sorted(eff.mcp_server_ids), cs),
+        "local_tools": local_tools,
+        "mcp_tools": mcp_tools,
+        "tools": [t["name"] for t in local_tools] + [t["name"] for t in mcp_tools],
+        "tool_count": len(local_tools) + len(mcp_tools),
+        "system_prompt": eff.system_prompt,
+        "schema": eff.schema,
+        "stored": {
+            "description": (raw or {}).get("description"),
+            "system_prompt": (raw or {}).get("system_prompt"),
+            "schema": (raw or {}).get("schema"),
+        },
+    }
 
 
 @app.get("/health")
