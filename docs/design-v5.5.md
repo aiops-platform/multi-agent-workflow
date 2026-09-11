@@ -77,6 +77,7 @@ flowchart LR
         T1["query_logs / get_trace<br/>（时间区间必填）"]
         T2["query_metrics<br/>领域语义，非 PromQL"]
         T3["check_infra / describe_pod<br/>K8s 当前状态"]
+        T4["get_service_topology / locate_repo<br/>CMDB：静态服务目录 + 依赖拓扑"]
         PMAP["语义映射住在这里<br/>未知 metric → 报错，不兜底"]
         T2 --- PMAP
     end
@@ -114,13 +115,18 @@ flowchart LR
 全部 `readOnlyHint=True`。**带时间的查询，`start_time`/`end_time` 为必填**。
 
 | 工具 | 时间区间 | 查询目标 | 后端 |
+|---|---|---|---|
 | `query_logs` | `start_time`/`end_time` 必填 | `service`(可空)、`level`、`limit` | ES `_search` + `range` on `app.@timestamp` |
 | `get_trace` | `start_time`/`end_time` 必填 | `trace_id` 必填 | ES + 调用链重建 + 故障 span 判定 |
 | `query_metrics` | `start_time`/`end_time` 必填、`step_seconds` | `service` 必填、`metric` 必填（5 选 1） | Prometheus `/api/v1/query_range` |
 | `check_infra` | **无** | `namespace`、`pod`(可空=列全部) | `kubectl get pods -o json` |
 | `describe_pod` | **无** | `namespace`、`pod` 必填 | `kubectl describe pod` |
+| `get_service_topology` | **无**（静态目录） | `service` 必填、`hops`（默认 2） | 内置 CMDB 目录 + 依赖图 |
+| `locate_repo` | **无**（静态目录） | `service` 必填 | 内置 CMDB 目录 |
 
-> 末两个查的是集群**当前状态**，时间维度不适用——这是设计而非疏漏。
+> 末四个查的是**当前状态 / 静态目录**，时间维度不适用——这是设计而非疏漏。
+> 其中 CMDB 两个工具查的是「谁调谁、归属哪个团队/仓库」这类**静态服务目录**，
+> 与前三者的**运行时观测数据**性质不同，但同样属于"取数"——故并入同一 server。
 
 **返回契约**：`query_metrics` 返回窗口内聚合 `value`（**峰值**，诊断关心"是否打满"
 而非均值）与 `min`/`max`/`avg`/`last` + 降采样 `series` + **回显 `window`**
@@ -154,7 +160,7 @@ flowchart LR
 
 | 项 | 约定 |
 |---|---|
-| server 粒度 | 一个进程覆盖 ES + Prom + K8s（共享服务拓扑配置） |
+| server 粒度 | 一个进程覆盖 ES + Prom + K8s + CMDB（共享服务拓扑配置） |
 | 端口 | `8300`（git=8000/8100、applog=8200/8101 之后） |
 | 配置前缀 | 共享变量不前缀；领域变量 `DATASOURCE_*`（对齐 applog 的 `APPLOG_`） |
 | 工具签名 | 字面书写（非 exec 生成）+ `Annotated[..., Field(...)]` |
@@ -267,7 +273,7 @@ v5.5 只负责**数据面 MCP 化**。系统里仍有若干**继承自 v5.2/v5.3
 
 | 项 | TODO | 为何是生产阻塞 |
 |---|---|---|
-| CMDB 仍是 mock，接口不带 tenant，且硬编码个人绝对路径 | §6 | 生产路径依赖它；**接口本身已违反多租户隔离** |
+| ~~CMDB 是 mock + 硬编码个人路径 + 接口无 tenant~~ | §6 | ✅ **已解决**（2026-09-11）：CMDB 迁至 MCP，租户隔离随部署走；仓库映射改由配置驱动 |
 | 审批通知仍是日志桩 | §7 | 审批人收不到通知 → human-in-the-loop 断链 |
 | MCP server 无部署资产 / 默认无认证 / 凭证明文 | §8 | 上不了生产环境 |
 | 沙箱 exec 服务无认证、无 egress 控制 | §10 | 谁能连上就能执行代码 |
@@ -293,4 +299,5 @@ v5.5 只负责**数据面 MCP 化**。系统里仍有若干**继承自 v5.2/v5.3
 | v5.3 | 2026-09-09 | 多租户架构版：五条架构原则 + 管理库/Router/tenantctl 三组件 + 实施批次 |
 | v5.4 | 2026-09-10 | 动态编排版（design-only）：四档执行体 + Dispatch 五层漏斗 + Plan-as-DAG + 计划审批 |
 | **v5.5** | 2026-09-10 | **数据面 MCP 化版（已完成）**：`aiops-datasource-mcp-server`（领域型只读工具）+ 时间区间/查询目标强制契约 + 语义映射 server 侧 + 时间窗由调用方下发；批 1/2/3 全部实测通过，**取数 MCP-only** |
+| v5.5.2 | 2026-09-11 | **CMDB 并入数据面**：新增 `get_service_topology`（N 跳拓扑，方向相对起点）与 `locate_repo`；CMDB 从 agentflow 进程内的 mock 迁到 server 侧——**租户隔离由部署承载**，agent 进程不再持有服务目录（TODO §6 的硬编码个人路径与接口无 tenant 两问题一并消除） |
 | v5.5.1 | 2026-09-11 | **§8 重构**：原「残余风险与待办」把设计局限与实施债混在一起，拆分为「设计的适用边界与局限」——只留「这样设计就必然如此」的 6 条（启发式环境依赖性 / 无数据不掩盖 / 范围外交网关 / 时间窗须由调用方给 / 新增指标须改 server / 范围外未生产化项）。**实施债全部移入 `docs/TODO.md`**，并补入本轮审计发现的三处漏列（CMDB mock 且硬编码个人路径、审批通知桩、MCP server 缺部署资产）。另新增实测结论：工具列举 TTL 记忆化使 MCP 会话降 80% |

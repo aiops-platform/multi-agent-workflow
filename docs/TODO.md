@@ -102,7 +102,7 @@
 
 ---
 
-## 6. ⭐⭐ CMDB 生产化（**当前最关键的生产阻塞**）
+## 6. CMDB 生产化 —— ✅ 主体已完成（2026-09-11，`b25dc4b` + `9b37cbe`）
 
 > 2026-09-11 审计发现。**生产路径依赖一个 mock，且硬编码了个人绝对路径，还违反多租户隔离。**
 
@@ -142,10 +142,29 @@ async def get_repo_for_service(self, service: str) -> RepoSpec | None:
 3. **真实 CMDB 适配器**：接 v5.3 §9.4 的 `TenantMappingProvider` 生产实现（CMDB + 拓扑查询）
 4. 或（v5.3 P1 方向）改为**由租户 MCP 提供 repo 映射**，与数据面统一
 
-### 涉及文件
+### ✅ 落地情况（2026-09-11）
 
-`workspace/cmdb.py`（接口 + Mock 实现）、`workspace/prepare.py`（default_cmdb + 路径）、
-`api/app.py:build_cmdb`、`worker.py`、`agents/tools.py`（`_cmdb_locate_code`）
+**方案**：CMDB 纳入数据面 MCP（与 v5.3「数据面 = 租户自有 MCP」同向）。
+服务目录/拓扑是**静态数据**，放 server 侧后：**租户隔离随部署走**，agent 进程不再
+持有服务目录——上面第 ③ 条（接口无 tenant）**由架构消除**，不必再改签名。
+
+| 原目标 | 结果 |
+|---|---|
+| ① 接口加 tenant | ✅ **架构消除**：每租户部署自己的 server，跨租户物理不可见（v5.3 P1） |
+| ② repo 根配置化 | ✅ `AGENTFLOW_REPO_ROOT` + `AGENTFLOW_REPO_MAP`（agentflow 侧）；`DATASOURCE_REPO_ROOT`（server 侧）。**无默认个人路径** |
+| ③ 真实 CMDB 适配器 | ⏳ 数据仍 mock（按你的要求）；**接口已是生产形态**——换真实 CMDB 只需替换 `backends/cmdb.py` 取数实现 |
+| ④ 由租户 MCP 提供 | ✅ **本方案即此路** |
+
+**新增能力**：`get_service_topology(service, hops=2)` —— N 跳依赖拓扑，方向相对起点
+（`upstream`=爆炸半径 / `downstream`=可能的上游根因）。mock 目录扩到 10 服务三层。
+
+**删除**：`workspace/cmdb.py`、`prepare.py` 硬编码路径、本地 `locate_code` 工具、
+`cmdb=` 注入链（`build_local_tools`→`build_toolkit`→`AgentNodeRunner`→app/worker）。
+
+### 剩余（可选）
+
+- 真实 CMDB 适配：替换 `backends/cmdb.py` 的 `_SERVICES` / `_DEPENDS_ON` 为真实查询
+- 拓扑可考虑加环检测提示（当前 `direction=both` 已能反映环，但没有显式告警）
 
 ---
 
