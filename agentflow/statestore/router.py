@@ -22,6 +22,7 @@ from typing import Any
 from ..api.agent_store import AgentConfigStore, build_agent_config_store
 from ..api.management_store import decrypt_db_ref
 from ..api.mcp_store import MCPStore, build_mcp_store
+from ..api.ticket_store import TicketStore
 from ..api.workflow_store import WorkflowStore, build_workflow_store
 from ..config import Settings
 from ..tenants import ensure_tenant_database, parse_db_ref
@@ -42,9 +43,10 @@ class TenantStores:
     workflow: WorkflowStore
     mcp: MCPStore
     agent_config: AgentConfigStore
+    ticket: Any  # TicketStore | PgTicketStore
 
     async def aclose(self) -> None:
-        for s in (self.state, self.workflow, self.mcp, self.agent_config):
+        for s in (self.state, self.workflow, self.mcp, self.agent_config, self.ticket):
             close = getattr(s, "close", None)
             if close is not None:
                 await close()
@@ -89,11 +91,13 @@ class TenantStoresRouter:
             workflow = build_workflow_store_at("postgres", dsn)
             mcp = build_mcp_store_at("postgres", dsn)
             agent_config = build_agent_config_store_at("postgres", dsn)
+            ticket = build_ticket_store_at("postgres", dsn)
         elif backend == "memory":
             state = InMemoryStateStore()
             workflow = build_workflow_store_at("memory", None, settings=self._settings)
             mcp = build_mcp_store_at("memory", None, settings=self._settings)
             agent_config = build_agent_config_store_at("memory", None, settings=self._settings)
+            ticket = build_ticket_store_at("memory", None, settings=self._settings)
         else:
             path = db_ref["path"]
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -101,12 +105,13 @@ class TenantStoresRouter:
             workflow = WorkflowStore(path)
             mcp = MCPStore(path)
             agent_config = AgentConfigStore(path)
+            ticket = TicketStore(path)
         await state.connect()
-        for s in (workflow, mcp, agent_config):
+        for s in (workflow, mcp, agent_config, ticket):
             await s.connect()
         return TenantStores(
             tenant_id=tenant_id, state=state, workflow=workflow,
-            mcp=mcp, agent_config=agent_config,
+            mcp=mcp, agent_config=agent_config, ticket=ticket,
         )
 
     async def _resolve_ref(self, tenant_id: str) -> dict:
@@ -162,6 +167,17 @@ def build_agent_config_store_at(backend: str, dsn: str | None, settings: Setting
         return PgAgentConfigStore(dsn)
     assert settings is not None
     return build_agent_config_store(settings)
+
+
+def build_ticket_store_at(backend: str, dsn: str | None, settings: Settings | None = None):
+    if backend == "postgres":
+        from ..api.ticket_store import PgTicketStore
+
+        return PgTicketStore(dsn)
+    assert settings is not None
+    from ..api.ticket_store import build_ticket_store
+
+    return build_ticket_store(settings)
 
 
 # ----------------------------------------------------------------------

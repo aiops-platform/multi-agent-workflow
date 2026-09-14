@@ -301,7 +301,27 @@ class PgTicketStore:
 
 
 def build_ticket_store(settings):
-    """按 state_store 选择控制面 ticket 存储后端（对齐 build_workflow_store）。"""
+    """按 state_store 选择控制面 ticket 存储后端（对齐 build_workflow_store）。
+
+    > 单租户/未 init 时的回退用。**多租户路径必须走 ``TenantStores.ticket``**
+    > （router 按租户库构造）—— 早期只用了这个全局构造器，导致工单永远落在
+    > 共享库里、不随租户隔离（见 ``build_ticket_store_at`` 的说明）。
+    """
     if settings.state_store == "postgres":
         return PgTicketStore(postgres_dsn(settings))
     return TicketStore(settings.state_db_path)
+
+
+def build_ticket_store_at(backend: str, dsn: str | None, settings=None):
+    """按租户库的 backend/dsn 构造（router 用；对齐 build_mcp_store_at 等）。
+
+    **这是租户隔离的关键一环**：工单存储必须和其它配置表一样跟着租户库走。
+    早期 `ticket_store` 只作为模块全局存在、不在 `TenantStores` bundle 里，
+    于是所有租户的工单都写进共享库 —— 实测 `otr` 的 run 落在 `agentflow-otr`，
+    而同一租户的 ticket 落到了 `agentflow`。表现上"能用"（查询仍按 tenant_id 过滤），
+    但破坏了"每租户一个库"的物理隔离模型。
+    """
+    if backend == "postgres":
+        return PgTicketStore(dsn)
+    assert settings is not None
+    return build_ticket_store(settings)

@@ -373,6 +373,7 @@ async def _control_stores(ctx: TenantContext | None):
             self.workflow = workflow_store
             self.mcp = mcp_store
             self.agent_config = agent_config_store
+            self.ticket = ticket_store
 
     return _GlobalStores()
 
@@ -629,10 +630,15 @@ def _ticket_inputs(req: TicketRequest) -> dict:
 async def create_ticket(
     req: TicketRequest, ctx: TenantContext = Depends(get_tenant_context)
 ) -> dict:
-    """建工单。返回完整记录（含 inputs 与空的 run_ids）。"""
+    """建工单。返回完整记录（含 inputs 与空的 run_ids）。
+
+    走 ``cs.ticket``（租户库），与其它配置表一致 —— 早期用模块全局 ``ticket_store``，
+    工单会落到共享库、不随租户隔离。
+    """
     br = req.bug_report or {}
     ci = br.get("cmdb_ci") or {}
-    tid = await ticket_store.create(
+    tickets = (await _control_stores(ctx)).ticket
+    tid = await tickets.create(
         ctx.tenant_id,
         title=req.title,
         inputs=_ticket_inputs(req),
@@ -641,7 +647,7 @@ async def create_ticket(
         namespace=req.namespace or ci.get("namespace"),
         severity=req.severity,
     )
-    created = await ticket_store.get(ctx.tenant_id, tid)
+    created = await tickets.get(ctx.tenant_id, tid)
     assert created is not None
     return created
 
@@ -654,7 +660,7 @@ async def list_tickets(
     ctx: TenantContext = Depends(get_tenant_context),
 ) -> list[dict]:
     """列出该租户的工单（新→旧）。"""
-    return await ticket_store.list(
+    return await (await _control_stores(ctx)).ticket.list(
         ctx.tenant_id, status=status, limit=max(1, min(limit, 200)), offset=max(0, offset)
     )
 
@@ -662,7 +668,7 @@ async def list_tickets(
 @app.get("/tickets/{tid}")
 async def get_ticket(tid: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
     """取单条工单。跨租户一律 404（不泄漏存在性，§9.2）。"""
-    ticket = await ticket_store.get(ctx.tenant_id, tid)
+    ticket = await (await _control_stores(ctx)).ticket.get(ctx.tenant_id, tid)
     if ticket is None:
         raise HTTPException(status_code=404, detail="ticket 不存在")
     return ticket
@@ -679,11 +685,12 @@ async def run_ticket(
     组合端点，省掉前端「读工单 → 拼 inputs → POST /run → 回写关联」的往返。
     底层与 ``POST /run`` 共用 ``start_run``（配额/校验/租户语义一致）。
     """
-    ticket = await ticket_store.get(ctx.tenant_id, tid)
+    cs = await _control_stores(ctx)
+    tickets = cs.ticket
+    ticket = await tickets.get(ctx.tenant_id, tid)
     if ticket is None:
         raise HTTPException(status_code=404, detail="ticket 不存在")
 
-    cs = await _control_stores(ctx)
     workflow_id = (req.workflow_id if req else None) or None
     if workflow_id is None:
         # 未指定则用第一个已保存流程 —— 让「发起诊断」按钮无需先选流程
@@ -710,8 +717,8 @@ async def run_ticket(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     run_id = out["run_id"]
-    await ticket_store.attach_run(ctx.tenant_id, tid, run_id)
-    await ticket_store.set_status(ctx.tenant_id, tid, TICKET_RUNNING)
+    await tickets.attach_run(ctx.tenant_id, tid, run_id)
+    await tickets.set_status(ctx.tenant_id, tid, TICKET_RUNNING)
     return {"ticket_id": tid, "run_id": run_id, "workflow_id": workflow_id, "status": "started"}
 
 
