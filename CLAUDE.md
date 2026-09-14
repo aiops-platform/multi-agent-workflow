@@ -77,9 +77,14 @@ make lint      # ruff 检查
    - **生命周期**：`python -m agentflow.tenantctl provision|deploy|upgrade|migrate|
      deprovision`（幂等 saga）；standard 租户专属分支被拒（§9.2 规则 4）；部署记录
      pin SHA 不 pin 分支名。
-   - JWT：`AGENTFLOW_JWT_SECRET` 非空=JWT 模式（claim 派生，客户端提交忽略）；
-     空=dev 回退（告警）。跨租户 run 访问 404（`_run_for_tenant`，Router 模式下
-     查不到即 404——隔离由构造保证）。RS256 暂缓（v5.3 §12）。
+   - JWT：**鉴权只有两种模式**——`AGENTFLOW_JWT_SECRET` 非空=JWT 模式（claim 派生，
+     客户端提交的 tenant 字段一律忽略）；空=dev 回退（`X-Tenant-ID`，告警）。
+     租户 claim 优先级 `tenant_id` > `org_id` > `org`；`sub`=审批人身份（JWT 模式下
+     approve/reject 的 `by` 也取它，body 不可伪造）。跨租户 run 访问 404
+     （`_run_for_tenant`，Router 模式下查不到即 404——隔离由构造保证）。
+     **RS256 已可用**（`jwt_algorithm` 是算法无关的 `pyjwt.decode`，把 PEM 公钥放进
+     `AGENTFLOW_JWT_SECRET` 即可）；缺的不是算法而是配套：JWKS 自动取钥/轮换、签发侧。
+     详见 `docs/E2E_VERIFICATION_zh-CN.md` §JWT 模式。
 8. **Git 版本冻结**（§4.6/§8.7）：`workspace/manager.py` 明确不提供 git_pull；Run 期间工作区
    HEAD 必须 == base_sha，漂移报 `FrozenVersionMismatch`。每个 Run 用 `aiops/RUN_{run_id}` 分支隔离。
 9. **工具权限**（§9.5）：`build_agent` 默认 DONT_ASK + agent 注册工具的 allow 规则。
@@ -154,5 +159,5 @@ M6 🟡（适配器可用，真实 broker/DB 专项待生产）→ M7 🟡（诊
 多租户 v5.3 批 A/B/C ✅（管理库+Router+配置表入租户库 / 接单 CAS+topic 租户化+
 tenantctl+namespace 派生 / 共享数据源下线+repo 封堵+per-tenant MCP/配置路由，268 tests）。
 待办：MCP 凭证加密+回显脱敏、Mock CMDB 租户维度、Orchestrator 租户 namespace 接线、
-Kafka topic 自动建、JWT RS256（暂缓）、Langfuse/OTel、沙箱 API 认证、
-真实 Kafka/PG 故障恢复专项（§14）。
+Kafka topic 自动建、**JWT JWKS**（算法 RS256 已可用，缺自动取钥/轮换）、
+Langfuse/OTel、沙箱 API 认证、真实 Kafka/PG 故障恢复专项（§14）。

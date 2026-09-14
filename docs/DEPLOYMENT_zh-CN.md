@@ -109,12 +109,44 @@ kubectl logs deployment/agentflow-worker-team-alpha -n agentflow-team-alpha  # �
 
 | 密钥 | 用途 | 缺省 |
 |---|---|---|
-| `AGENTFLOW_JWT_SECRET` | JWT HS256 验签 + dev 模式开关 | 空 = dev（显式传参，告警） |
+| `AGENTFLOW_JWT_SECRET` | JWT 验签密钥 **+ dev 模式开关** | 空 = dev（显式传参，告警） |
+| `AGENTFLOW_JWT_ALGORITHM` | 验签算法：`HS256`（对称，默认）/ `RS256`（非对称） | `HS256` |
 | `AGENTFLOW_SECRET_KEY` | 租户库 db_ref / MCP 凭证 Fernet 加密 | 从 `jwt_secret` SHA256 派生（告警） |
 
 生产必须显式配置两者（K8s Secret / Vault 注入，不入镜像不入 git）。
-已知风险：HS256 为对称密钥，控制面可"伪签发"——生产上线前需 Gateway 签发 +
-RS256 只验签（v5.3 §12 待办 2）。
+
+### 5.1 RS256：算法已可用，"暂缓"指的是配套
+
+RS256 下 `AGENTFLOW_JWT_SECRET` 放 **PEM 公钥**（签发方持私钥）：
+
+```bash
+export AGENTFLOW_JWT_SECRET="$(cat /etc/agentflow/jwt_public.pem)"
+export AGENTFLOW_JWT_ALGORITHM=RS256
+```
+
+**实测可用**（2026-09-14）：私钥签发 → 公钥验签通过（HTTP 200）。原因是验签那行
+**算法无关**：
+
+```python
+pyjwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+```
+
+pyjwt 按 `jwt_algorithm` 决定把 `jwt_secret` 当 HMAC 密钥还是公钥 —— 本仓代码**无需改动**。
+
+**因此上面"HS256 对称 → 控制面可伪签发"这个风险，现在用配置就能消除**：
+签发方持私钥、控制面只持公钥，控制面不再具备伪造能力。
+
+**仍未做的是配套**（v5.3 §12 待办 2 说的"完整方案"）：
+
+| 项 | 状态 |
+|---|---|
+| RS256 算法 | ✅ 可用（配置即可） |
+| **JWKS**（从 `jwks_url` 自动取公钥、按 `kid` 匹配、轮换） | ❌ 未实现 —— 现靠手工分发 PEM，换钥要重启 |
+| **签发侧**（Gateway / IdP） | ❌ 不在本仓，需外部提供 |
+| 密钥装载（PEM 从文件读而非塞 env） | ❌ 未实现 —— PEM 多行，塞环境变量要 `"$(cat …)"` 绕 |
+
+> 换句话说：**能立刻降低风险的做了（换算法），运维便利的部分没做（JWKS）。**
+> 另见 `E2E_VERIFICATION_zh-CN.md` §JWT 模式（含 claim 派生规则与失败行为实测表）。
 
 ## 6. 分支治理（P5，CI 需落卡点）
 
