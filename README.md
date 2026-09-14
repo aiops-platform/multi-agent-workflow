@@ -1,7 +1,7 @@
 # agentflow — AI 运维 Bug Fix 智能体平台后端
 
 基于 `design-v5.2.md` 的 AIOps Bug Fix 智能体平台：DAG 编排引擎 + 15-agent 编队 +
-审批工作流 + per-tenant 多租户架构（独立库/队列/namespace/代码分支，design-v5.3，268 tests）。
+审批工作流 + per-tenant 多租户架构（独立库/队列/namespace/代码分支，design-v5.3/v5.6，300+ tests）。
 
 ## 里程碑状态
 
@@ -28,7 +28,7 @@ make install                     # 或 ./venv/bin/pip install -e ".[dev]"
 # 2. 配置（模型 + 基础设施后端）
 cp .env.example .env            # 填 DEEPSEEK_API_KEY（design §16.3 模型 deepseek-v4-flash）
 
-# 3. 跑测试（268 tests：DAG 语义 + 幂等 + Resume + Worker/队列 + 多租户路由/隔离）
+# 3. 跑测试（300+ tests：DAG 语义 + 幂等 + Resume + Worker/队列 + 多租户路由/隔离）
 make test
 
 # 4. 跑脚本化 demo（create_run → 审批 → done）
@@ -56,7 +56,9 @@ AGENTFLOW_JWT_SECRET=...    # 非空 = 强制 Bearer JWT，tenant 由 claim（te
 AGENTFLOW_SECRET_KEY=...    # 租户库 db_ref / 凭证 Fernet 加密（缺省从 jwt_secret 派生并告警）
 
 # ── 存储与租户（v5.3 §5：per-tenant DB + 管理库）──
-AGENTFLOW_STATE_STORE=sqlite   # sqlite=每租户一个 data/tenants/{tenant}.db；postgres=按 isolation_level 分级
+AGENTFLOW_STATE_STORE=sqlite   # 两种后端都是**每租户一份**：
+                               #   sqlite   → data/tenants/{tenant}.db
+                               #   postgres → 独立 database {基础库}-{tenant}（如 agentflow-otr）
 AGENTFLOW_TENANTS_FILE=tenants.yaml   # 仅 bootstrap 种子：首启导入管理库，运行时以管理库为准
 
 # ── 数据面姿态（§7/P1）──
@@ -102,13 +104,13 @@ agentflow/
 │   ├── mcp_manager.py     # MCP server 连接管理（stdio/http + 热刷新 + per-tenant 缓存与绑定）
 │   ├── runner.py          # AgentNodeRunner：真实 LLM 接入 DAGExecutor（按 current_tenant 租户路由）
 │   ├── transcript.py      # 节点级 LLM 对话/工具调用明细采集 → node_traces
-│   └── datasources.py     # 真实数据源适配（ES/Prometheus/kubectl，testbed 联调）
-├── workspace/         # M3：WorkspaceManager（base_sha 冻结/分支隔离/无 git_pull）+ CMDB
+│   └── tools.py           # 本地只读工具（CMDB 映射 / 知识检索）；取数工具全在租户 MCP
+├── workspace/         # M3：WorkspaceManager（base_sha 冻结/分支隔离/无 git_pull）；CMDB 已迁 MCP
 ├── sandbox/           # M4：exec 服务(纯 stdlib) + SandboxClient + SandboxOrchestrator + ActionExecutor + ToolPolicy
 ├── approval/          # M5：审批超时 Sweeper（§8.9）+ 通知
 ├── audit/             # M5：审计日志（§9.5 字段 + 输入脱敏）
 ├── tenants.py         # v5.3 §5.2：租户配置（default-deny 审批白名单；管理库驱动，yaml 仅 bootstrap）
-├── api/               # 控制面 FastAPI（27 端点 + JWT 租户派生 + sweeper 后台任务）
+├── api/               # 控制面 FastAPI（36 端点 + JWT 租户派生 + sweeper 后台任务）
 │   ├── auth.py            # §9.1：JWT → 派生 tenant_id（get_tenant_context 依赖）
 │   └── management_store.py # v5.3 §5.2：管理库（tenants/schema_versions，db_ref 加密）
 ├── statestore/router.py # v5.3 §5.3：TenantStoresRouter（tenant_id → 租户库 bundle，LRU）
@@ -127,7 +129,7 @@ deploy/
 └── worker-deployment.yaml # v5.3 §6.2 每租户 Worker Deployment（示例 team-alpha）
 docs/
 └── DEPLOYMENT_zh-CN.md    # v5.3：部署矩阵/Kafka ACL/每租户 Worker/本地 minikube 实操
-tests/                 # 268 tests（DAG/幂等/Resume/审批/Worker/队列/多租户路由与数据面）
+tests/                 # 300+ tests（DAG/幂等/Resume/审批/Worker/队列/多租户路由与数据面）
 ```
 
 ## M4 沙箱（独立执行 Pod）
@@ -191,19 +193,40 @@ agent 不知道"当前时间"，不能让它在运行期猜（猜错会得到错
 
 详见 `docs/design-v5.6.md`。
 
-## 控制面 API（27 端点）
+## 控制面 API（36 端点）
+
+> **租户**：JWT 模式下由 token claim 派生（客户端提交忽略）；dev 模式回退
+> `X-Tenant-ID` 头（缺省 `local`）。**前端恒带该头**（`src/api/agentflow.js`）。
 
 ```
-POST /run                          触发 run（JWT 模式 tenant 由 token 派生）
-GET  /runs/{id}                    聚合详情（图/节点/tokens/cost/pending_approvals）
+── 工单（流程入口）──
+POST /tickets                      建工单（字段对齐 ServiceNow 事件形状）
+GET  /tickets                      列表（?status=&limit=&offset=）
+GET  /tickets/{tid}                详情（跨租户 404，不泄漏存在性）
+POST /tickets/{tid}/run            组合端点：取工单 inputs → 建 run → 回挂工单
+
+── run ──
+POST /run                          触发 run（立即返回 run_id，后台/Worker 执行）
+GET  /runs                         列表（?status=&limit=&offset=；含 inputs/时间戳）
+GET  /runs/{id}                    聚合详情（图/节点/tokens/cost/待审批 + **inputs**）
+                                   nodes 含 error / started_at / duration_ms / attempts
 GET  /runs/{id}/traces             节点级 LLM 对话/工具调用明细
 POST /runs/{id}/approve|reject     审批（CAS + 时间谓词；白名单校验；冲突 409）
 POST /runs/{id}/pause|resume       暂停 / 断点续跑（queue 模式发布命令）
 POST /runs/{id}/stop               停止（置 cancelled）
+
+── 配置 ──
 POST/GET/PUT/DELETE /workflows     流程 CRUD + /workflows/preview
 POST/GET/PUT/DELETE /mcp-servers   MCP server 配置 + /test 连测 + /{id}/tools
 POST/GET/PUT/DELETE /agent-configs Agent 配置（DB 驱动，热生效）
-GET  /agents                       15-agent 编队视图
+
+── agent 编队 ──
+GET  /agents                       编队列表（含 local_tools 的 level/needs_approval、
+                                   mcp_tools、bound_servers、role/stage/origin）
+GET  /agents/stats                 按 agent 聚合的执行统计（样本为空时为 null 而非 0）
+GET  /agents/{name}                单 agent 详情（+ 完整 system_prompt / schema）
+
+── 其它 ──
 GET  /audit                        审计查询（JWT 模式 tenant 强制派生）
 GET  /health                       存活检查
 ```

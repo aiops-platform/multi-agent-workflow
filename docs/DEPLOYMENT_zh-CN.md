@@ -22,8 +22,8 @@
 ├ 每租户 Worker Deployment（租户分支镜像 {tenant}-{sha}，1 个副本起）
 │   └─ 运行在租户 namespace（agentflow-{tenant}，ResourceQuota + NetworkPolicy + SA）
 ├ Kafka（SASL + ACL：租户 principal 只读写 run.trigger.{tenant}/run.command.{tenant}）
-├ PostgreSQL：管理库（management.db 对应的库）+ 每租户库（strong=独立实例，
-│   standard=共享实例独立 database/schema）
+├ PostgreSQL：管理库 agentflow（tenants/schema_versions）
+│   + 每租户库 agentflow-{tenant}（运行期表 + 四张控制面配置表，全部隔离）
 └ Redis（可选）：分布式锁（配额临界区 / sweeper 多副本互斥）
 ```
 
@@ -37,7 +37,15 @@ python -m agentflow.tenantctl provision team-a \
 ```
 
 - `strong` 租户才允许专属分支（§9.2 规则 4）；`standard` 固定 `code_branch=main`。
-- 租户库 schema 随首连自动幂等建立；`tenantctl migrate` 扇出后续结构变更。
+- **租户库由 `provision` 真的建出来**（`CREATE DATABASE … TEMPLATE template0`），
+  schema 随首连幂等建立；`tenantctl migrate` 扇出后续结构变更。
+- **`strong` 与 `standard` 目前都落在同一 PG 实例的不同 database** 上 ——
+  真正的"独立实例"需 `provision --db-dsn <dsn>` 显式指定。
+- 库名派生 `{基础库}-{tenant_id}`；`deprovision --confirm-delete` 会 DROP 该库
+  （**指向共享基础库的旧 db_ref 一律拒绝删除**，防连坐管理库）。
+- **隔离是物理的、不是靠列过滤**：`workflows` / `mcp_servers` / `agent_configs` /
+  `tickets` 四张控制面表**没有 tenant_id 列**，它们的隔离完全依赖"每租户一个库"。
+  这正是早期 postgres 共享 DSN 会造成跨租户可见的原因（见 `design-v5.6.md` §3）。
 
 ### 2.2 每租户 Worker Deployment
 
@@ -87,7 +95,9 @@ kubectl logs deployment/agentflow-worker-team-alpha -n agentflow-team-alpha  # �
 - **kafka advertised 必须匹配静态 IP**：compose 给 kafka `ipv4_address: 10.89.0.9`（顶层
   `networks.ipam`），advertised 不再随 recreate 漂移——否则 broker 自连/客户端全断。
 - **Worker 容器内不用管理库 db_ref**（provision 时记录的是 `localhost` DSN，容器不可达）：
-  以 `--tenant team-alpha --dsn postgresql://…@10.89.0.2:5432/agentflow` **直连共享库**单租户消费。
+  以 `--tenant <t> --dsn postgresql://…@<pg>:5432/agentflow-<t>` **直连该租户自己的库**消费。
+  > 注意库名：每租户一个独立 database（`agentflow-{tenant}`），**不再是共享库**；
+  > 本节的 `10.89.0.2` 是 compose 网络的 PG 静态 IP，按你的实际拓扑替换。
 - Deployment 在租户 ns 需**显式 resources**（RQ 强制，否则创建被拒）；`hostNetwork: true`
   走 kicbase 网络栈访问 compose（生产去掉，用同 ns Service/ClusterIP）。
 - 宿主 API 连 kafka 走 EXTERNAL：`.env` 设 `AGENTFLOW_KAFKA_BOOTSTRAP=localhost:19092`。
@@ -160,4 +170,6 @@ pyjwt 按 `jwt_algorithm` 决定把 `jwt_secret` 当 HMAC 密钥还是公钥 —
 - Worker 崩溃：消息 at-least-once 重投 → 接单 CAS（`queued→running`）保证恰一个
   Worker 接单；副作用幂等键兜底（§8.4）。
 - 审批超时：sweeper（API 进程内）逐租户扫描 → CAS TIMED_OUT → resume 命令。
-- 数据删除：`tenantctl deprovision --confirm-delete`（sqlite 删文件 / PG 手工 DROP）。
+- 数据删除：`tenantctl deprovision --confirm-delete` —— sqlite 删文件、
+  **PG 会真的 `DROP DATABASE … WITH (FORCE)`**（每租户一个库）。
+  指向共享基础库的旧 db_ref 会被**拒绝删除**，避免连坐管理库。

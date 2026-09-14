@@ -5,6 +5,7 @@
 **基线**：design-v5.5.md（数据面 MCP 化，**已实施**）+ design-v5.4.md（动态编排，**设计稿**）
 **取代**：design-v5.5.md、design-v5.4.md（两者内容已全量并入本文档，原稿保留仅供追溯）
 **继承**：design-v5.3.md（多租户）、design-v5.2.md（第三轮评审签字版）——其原则与修正清单继续有效
+**当前版本**：v5.6.1（2026-09-14）
 **状态**：⚠️ **本文档是双状态的**——§3 数据面 🟢 **已实施并实测**；§4 编排层 🟡 **未实施（设计稿）**。
 逐节标题带徽标，请按徽标读，不要把"v5.6 写完"误读成"v5.6 做完"。
 
@@ -355,7 +356,7 @@ limit → 百分比无定义；后者因 testbed 应用侧 `data_disk_total_byte
 
 > **注**：v5.5 原稿在此处曾登记"Worker 进程的 agent 配置为永久缓存、绑定新 MCP server
 > 需重启"作为遗留项。该问题**已修复**（`911c7d3`：按库内指纹 TTL 热载），登记已移入
-> `docs/TODO.md` 并在 §11 留痕，不再属于本文档范围。
+> `docs/TODO.md` 并在 §12 留痕，不再属于本文档范围。
 
 #### 3.7.3 平台侧范围外事项（明确交由部署承担）
 
@@ -377,7 +378,7 @@ MCP server **不做** metrics / 限流 / Origin-Host 校验（对齐 applog-mcp-
 
 | 项 | TODO | 为何是生产阻塞 |
 |---|---|---|
-| ~~CMDB 是 mock + 硬编码个人路径 + 接口无 tenant~~ | §11（留痕） | ✅ **已解决**（2026-09-11）：CMDB 迁至 MCP，租户隔离随部署走；仓库映射改由配置驱动。**尾巴见 TODO §7** |
+| ~~CMDB 是 mock + 硬编码个人路径 + 接口无 tenant~~ | §12（留痕） | ✅ **已解决**（2026-09-11）：CMDB 迁至 MCP，租户隔离随部署走；仓库映射改由配置驱动。**尾巴见 TODO §9** |
 | 审批通知仍是日志桩 | §1 | 审批人收不到通知 → human-in-the-loop 断链 |
 | MCP server 无部署资产 / 默认无认证 / 凭证明文 | §2 | 上不了生产环境 |
 | 沙箱 exec 服务无认证、无 egress 控制 | §3 | 谁能连上就能执行代码 |
@@ -699,7 +700,7 @@ dispatch 只在"灰色地带"（候选为空但有线索）才消耗 LLM。目�
 
 ### 4.9 编排层现状缺口（诚实清单）
 
-以下为**代码级核实**（2026-09-11）确认的零实现项，实施拆解见 `docs/TODO.md` §4：
+以下为**代码级核实**（2026-09-11）确认的零实现项，实施拆解见 `docs/TODO.md` §6：
 
 | # | 缺口 | 核实结论 |
 |---|---|---|
@@ -775,7 +776,7 @@ dispatch 只在"灰色地带"（候选为空但有线索）才消耗 LLM。目�
 > **实施状态（design-only）**：尚无实施。下列批次为排期建议，**须人工评审批准后按 A→B→C 顺序实施**；
 > 每批独立提交。涉及 execution gap 的诚实标注已放在各节
 > （§4.3.1 校验层、§4.4.1 元数据列、§4.7.2 指标聚合、§4.7.3 knowledge mock）。
-> 详细拆解见 `docs/TODO.md` §4。
+> 详细拆解见 `docs/TODO.md` §6。
 
 | 批次 | 内容 | 主要触碰点 |
 |---|---|---|
@@ -794,6 +795,81 @@ dispatch 只在"灰色地带"（候选为空但有线索）才消耗 LLM。目�
 5. lint 改动文件清零。
 
 ---
+
+### 7.3 控制面：工单入口与 API 增量 🟢 已完成（2026-09-14）
+
+本节记录一轮**控制面**的实证补齐。它既不属于 §3 数据面、也不属于 §4 编排层 ——
+前者管"取数怎么可信"，后者管"图怎么选/怎么编"，而这里管的是**流程的入口与可观测**：
+一条事件从哪进来、跑到哪了、每一步花了多少。
+
+属于 §4.1 L0/L1 之前的**落地前提**：v5.4 编排层设想"事件(ticket/alert) → dispatch"，
+但在此之前**控制面连工单都不存**，dispatch 无从谈起。
+
+#### 7.3.1 工单成为一等实体
+
+改造前 `ticket` 只是 `POST /run` body 的一个字段，被拍平成 run 的 `inputs` 存一次，
+**此后再无任何 API 能读回** —— 「这条 run 来自哪个工单」不可查，也没有"待处理工单"列表。
+
+新增 `api/ticket_store.py` + 4 个端点：
+
+| 端点 | 作用 |
+|---|---|
+| `POST /tickets` | 建工单；`number`/`service`/`namespace` 可从 `bug_report.cmdb_ci` 兜底取 |
+| `GET /tickets` | 列表（`?status=&limit=&offset=`） |
+| `GET /tickets/{tid}` | 详情；跨租户 404（不泄漏存在性） |
+| `POST /tickets/{tid}/run` | **组合端点**：取工单 inputs → 建 run → 回挂工单，省掉前端四次往返 |
+
+**存储位置**：租户库的 `tickets` 表（`TenantStores.ticket`），与 workflow/mcp/agent_config 同级。
+行内另带 `tenant_id` 且每个方法强制过滤 —— 租户库形态下是第二道防线，单库回退形态下是唯一隔离手段。
+
+#### 7.3.2 run 可观测性补齐
+
+`GET /runs/{id}` 此前只返 8 个字段，且**不回显 `inputs`**。这直接冲击 §3.6.1 的约定 ——
+时间窗由调用方下发（`window_start/end`），却**查不回来**，"这次诊断的是哪段时间"无从核对。
+
+| 补的字段 | 为什么必须 |
+|---|---|
+| `inputs` | v5.5 §3.6.1 要求窗口由调用方给，不给回显就无法核对 |
+| `created_at`/`updated_at` | 前端显示"多久前"、算总耗时 |
+| 节点 `error` | `cp.error` 一直存在，只是没映射 —— 失败原因前端看不到 |
+| 节点 `started_at`/`ended_at`/`duration_ms` | 做不出耗时条；随 checkpoint 走（`nodes` 表无时间列） |
+| 节点 `attempts` | 重试次数（`node_attempts` 表此前无任何 API 暴露） |
+
+新增 `GET /runs` 列表（此前只能单查，前端拿不到历史）。
+**排序注意**：`created_at` 只到秒（sqlite `CURRENT_TIMESTAMP` 无小数位），
+同秒内创建的 run 靠 `run_id` 定序，不代表真实先后。
+
+#### 7.3.3 `/agents` 富化
+
+改造前只返 `name/description/tools/stage`，且 **`tools` 只含本地注册表、不含 MCP** ——
+后果是 15 个 agent 里 7 个显示 "no tools"，恰恰是最依赖取数的 7 个
+（triage / log-analyst / trace-analyst / metrics-analyst / infra-locator / fix-planner / postmortem）。
+页面上的 "Total Tools" 与 "Ready" 两个 KPI 因此是**误导的**。
+
+补齐：`role`/`enabled`/`origin`/`reasoning_enabled`/`mcp_server_ids`/`bound_servers`，
+并把 `tools` 拆成 **`local_tools`**（含 `level`/`needs_approval`）与 **`mcp_tools`**。
+`level`/`needs_approval` 是前端推导**自治 tier**（T1 只读 / T2 起草待批 / T3 受限执行 /
+T3+ 半自动）的唯一依据 —— 只给工具名推不出来。
+
+新增 `GET /agents/{name}`（详情：完整 `system_prompt` + 输出 schema + DB 覆盖状态）
+与 `GET /agents/stats`（按 agent 聚合执行统计；**样本为空时各值为 `null` 而非 0**，
+前端要能区分"没跑过"与"跑了但为 0"）。
+
+`/agents` 由无鉴权改为**需要租户上下文** —— 返回值含 MCP 绑定（租户数据）。
+
+#### 7.3.4 与 §4 编排层的衔接
+
+这批能力**正是 §4 的前置**：
+
+- §4.2 复杂度判定的输入是"事件特征归一"（symptom/service/severity）—— 现在有了工单实体，
+  这些字段第一次有了承载；
+- §4.7.2 明说"晋升与漏斗都依赖 run 指标聚合，而现状没有" —— §7.3.2 的
+  `/runs` 列表与按节点的 `duration_ms` 是那个聚合的数据底座；
+- §4.1 L2/L3 的分档与 §4.6.2 的计划审批，都要展示"这张图要跑什么" ——
+  §7.3.3 的 `local_tools.level/needs_approval` 与 MCP 工具面是它的依据。
+
+> 这批仍是**控制面**补齐，不改变 §4 的结论（编排层依然 0 实现）。
+> 详细验收见 `docs/E2E_VERIFICATION_zh-CN.md`。
 
 ## 8. 残余风险与待办（诚实清单）
 
@@ -841,4 +917,5 @@ dispatch 只在"灰色地带"（候选为空但有线索）才消耗 LLM。目�
 | v5.5 | 2026-09-10 | 数据面 MCP 化版（已完成）：批 1/2/3 全部实测通过，**取数 MCP-only** |
 | v5.5.1 | 2026-09-11 | 原稿 §8 重构：设计局限与实施债拆分，实施债移入 `docs/TODO.md` |
 | v5.5.2 | 2026-09-11 | CMDB 并入数据面：新增 `get_service_topology` / `locate_repo` |
+| v5.6.1 | 2026-09-14 | **控制面补齐 + 租户库物理隔离修复**（见 §7.3）：① PG 模式 `provision` 真的建独立库 `agentflow-{tenant}` —— 修掉三张无 tenant_id 列的控制面表跨租户可见（实测未开通租户能列别人的 workflow）；② 工单成为一等实体（`ticket_store` + 4 端点），并纳入 `TenantStores` 路由；③ `GET /runs` 列表 + run 详情补 inputs/时间戳/节点 error·耗时·重试；④ `/agents` 富化（local_tools 带 level/needs_approval、mcp_tools、bound_servers）+ `GET /agents/{name}` + `GET /agents/stats`。均经真实 PG+Kafka 端到端验证（15 节点全绿）。未实施部分见 `docs/TODO.md` §4/§5 |
 | **v5.6** | 2026-09-11 | **编排层 × 数据面合并版**：把 design-v5.4（编排层）与 design-v5.5（数据面）全量并入单一文档，**取代二者**；新增 §1.3 状态总览与 §1.4 旧章节号映射、§2 系统全景图、**§5 两层接缝**（新写，含 4 项开放问题）、§7 实施状态分区。数据面内容与结论**未改动**，仅重编号；编排层保持 design-only 并汇总代码级核实缺口（§4.9）。未实施部分登记于 `docs/TODO.md` §4（2026-09-11 按优先级重排后编号） |

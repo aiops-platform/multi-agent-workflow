@@ -78,8 +78,8 @@ _worker_task: asyncio.Task | None = None
 # 控制面配置存储（workflows/mcp_servers/agent_configs）：state_store=postgres 时落 PG，
 # 否则沿用本地 sqlite（构造不做 DB/I/O，惰性 connect；测试可 monkeypatch 模块全局）。
 workflow_store = build_workflow_store(settings)
-# 工单存储：此前 ticket 只作为 run 的 inputs 存一次、再也读不回来，
-# 导致「这条 run 来自哪个工单」不可查（见 ticket_store 模块 docstring）
+# 工单存储。**多租户路径不用它** —— 那些走 TenantStores.ticket（router 按租户库构造）；
+# 这里只是单租户/未 init 时的回退形状（`_control_stores` 的 _GlobalStores）。
 ticket_store = build_ticket_store(settings)
 mcp_store = build_mcp_store(settings)
 agent_config_store = build_agent_config_store(settings)
@@ -588,9 +588,9 @@ async def _mcp_snapshot(data: dict, tenant_id: str | None = None) -> list[dict[s
 
 
 # ── Ticket Inbox（工单入口：从抓到 ticket 到发起诊断）──
-# 工单存在控制面库的 tickets 表，**每行带 tenant_id 且每个方法强制过滤**
-# （与 workflow_store 不同 —— 那个没有 tenant 列，是历史遗留）。
-# 若将来迁到「配置表随租户库走」（v5.3 P5），tenant_id 列让迁移直接可做。
+# 工单存**租户库**的 tickets 表（``cs.ticket``），与 workflow / mcp / agent_config 一致。
+# 行内**另带 tenant_id 且每个方法强制过滤** —— 租户库形态下是第二道防线（防构造漏网），
+# 单库回退形态下则是唯一的隔离手段，故两个都保留。
 
 class TicketRequest(BaseModel):
     """建工单。字段对齐测试数据里的 ServiceNow 事件形状（DIAGNOSE_TEST_GUIDE §BUG）。"""

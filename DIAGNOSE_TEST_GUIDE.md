@@ -256,7 +256,7 @@ import pytest
 pytestmark = pytest.mark.skipif(not os.environ.get("RUN_E2E"), reason="需 RUN_E2E=1 + testbed")
 
 BASE = "http://localhost:8000"
-HDR = {"X-Tenant-ID": "local"}
+HDR = {"X-Tenant-ID": "otr"}   # 本机租户；不带会被 dev 回退到 "local" 并触发自动建空库
 
 
 def run_scenario(workflow_yaml: str, start: str, end: str) -> dict:

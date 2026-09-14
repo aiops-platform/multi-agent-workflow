@@ -97,8 +97,8 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    S0["0️⃣ 事件入口<br/>bug_report（ServiceNow / Alertmanager）"]
-    S1["1️⃣ POST /run<br/>FastAPI → Workflow.load_yaml<br/>静态校验 + 版本冻结 workflow_hash"]
+    S0["0️⃣ 事件入口 → 工单落库<br/>bug_report（ServiceNow / Alertmanager）<br/>POST /tickets（存租户库）"]
+    S1["1️⃣ 从工单发起<br/>POST /tickets/{tid}/run（组合端点）<br/>→ Workflow.load_yaml + 静态校验 + 版本冻结"]
     S2["2️⃣ RunService.create_run<br/>save_snapshot + create_run 落库<br/>+ DAGExecutor 启动"]
     S3["3️⃣ 诊断链（并发）<br/>triage → logs/trace/metrics/<br/>infra/locate/know → rca<br/>（join any · 负证据 on_failure:continue）"]
     S4["4️⃣ 根因 → 修复方案<br/>rca → fix-planner(plan)"]
@@ -119,8 +119,8 @@ flowchart TB
 
 | # | 组件 | 这一步做了什么 | 技术 | 为什么 |
 |---|---|---|---|---|
-| 0 | 外部系统 | 推送故障事件（bug_report：工单号、影响面、CMDB CI、trace 提示） | ServiceNow / Alertmanager 概念 | 平台是被动响应事件，事件即 Run 的 `inputs` |
-| 1 | `api/app.py` + `core/workflow.py` | 解析 workflow_yaml → `DAG.build` 静态校验（环 / join 一致性 / params 只引用上游）→ 计算 `workflow_hash` | FastAPI + PyYAML + hashlib | 声明式 + 启动即校验，非法 DAG 直接 422；hash 用于去重与版本冻结 |
+| 0 | 外部系统 + `api/ticket_store.py` | 推送故障事件，落为**工单**（bug_report：工单号、影响面、CMDB CI、trace 提示；+ `window_start/end` 诊断窗口） | ServiceNow / Alertmanager 概念；`tickets` 表在**租户库** | 事件不再只是一次性的 `inputs` —— 落库后才可查、可列、可重发；窗口显式记录才能核对"诊断了哪段" |
+| 1 | `api/app.py` + `core/workflow.py` | `POST /tickets/{tid}/run` 取工单 inputs → 解析 workflow_yaml → `DAG.build` 静态校验（环 / join 一致性 / params 只引用上游）→ 计算 `workflow_hash` → 把 run 回挂工单 | FastAPI + PyYAML + hashlib | 组合端点省掉前端四次往返；声明式 + 启动即校验，非法 DAG 直接 422；hash 用于去重与版本冻结 |
 | 2 | `service.py` `RunService.create_run` | 保存 snapshot（同 hash 复用）→ `create_run` 落库 → 构建 `DAGExecutor` 并 `run()` | asyncio | 状态先落库再执行，为崩溃恢复留基础 |
 | 3 | `executor/dag_executor.py` + 诊断 8 agent | 并发执行 ready 节点：triage 先出初步判断，6 个只读 agent 并行取证，最后 rca 汇合。每节点完成即持久化 checkpoint | `asyncio.gather` + AgentScope | 并行取证快；`on_failure:continue` 的 agent（logs/metrics/infra/know）失败产出负证据不中断；checkpoint 支持 Resume |
 | 4 | `fix-planner` | 根据根因生成结构化修复方案（steps） | AgentScope + DeepSeek | 修复动作前先规划，便于审批展示 |

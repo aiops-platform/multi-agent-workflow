@@ -35,7 +35,7 @@
 
 ### 租户库隔离（2026-09-14 修复）
 
-**每个租户一个独立 database**，命名 `{基础库}-{tenant_id}`（如 `agentflow-local`），
+**每个租户一个独立 database**，命名 `{基础库}-{tenant_id}`（如 `agentflow-otr`），
 管理库 `agentflow` 只放 `tenants` / `schema_versions`。
 
 ```
@@ -50,20 +50,20 @@ agentflow-{tenant}        ← 每个租户一份：runs/nodes/workflows/mcp_serv
 > 修复前 `_default_db_ref` 的 postgres 分支返回共享 DSN（且有三份副本），
 > 只在 sqlite 下真正每租户一份文件。现已合并为一份实现，PG 对齐 sqlite 语义。
 
-**⚠ 存量租户需迁移**：`local` 与 `team-*` 是在修复**之前**开通的，db_ref 仍指向共享库
-`agentflow` —— 也就是说**它们自己还没被隔离**（新建的租户才有独立库）。
-
-本机当前实际状态：
+**本机现状**（2026-09-14）：租户为 **`otr`**，修复前开通的 `local` / `team-*` 已全部注销、
+数据已清。当前只有两个库：
 
 ```bash
 $PY -c "
 import psycopg
 with psycopg.connect('postgresql://localhost:5432/agentflow?user=agentflow&password=agentflow') as c:
     print([r[0] for r in c.execute('SELECT datname FROM pg_database WHERE datistemplate=false ORDER BY datname')])
-"   # → ['agentflow', 'postgres']   ← 还没有 agentflow-local
+"   # → ['agentflow', 'agentflow-otr', 'postgres']
 ```
 
-迁移 = `provision <tenant> --force`，但**旧数据不自动搬迁**（见 §6.7）。
+> **对比存量租户**：若你手上还有修复**之前**开通的租户（db_ref 指向共享库 `agentflow`），
+> 它们自己尚未被隔离 —— 需 `provision <tenant> --force` 重绑到独立库，
+> 且**旧数据不自动搬迁**（见 §6.7）。本机已用「新建 `otr` + 注销旧租户」的方式规避。
 
 ## 二、启动顺序（严格按序）
 
@@ -95,24 +95,24 @@ $PY -c "import psycopg;psycopg.connect('postgresql://agentflow:agentflow@localho
 ### 2) 租户开通（幂等，已开过可跳过）
 
 ```bash
-$PY -m agentflow.tenantctl provision local
+$PY -m agentflow.tenantctl provision otr
 ```
 
 **首次开通**的输出（会真的建库，`CREATE DATABASE … TEMPLATE template0`）：
 
 ```
-🆕 已创建租户库 postgresql://localhost:5432/agentflow-local?user=…&password=…
-✅ provision local: isolation=standard db=postgresql://…/agentflow-local namespace=agentflow-local schema=2026-09-09.1
+🆕 已创建租户库 postgresql://localhost:5432/agentflow-otr?user=…&password=…
+✅ provision otr: isolation=standard db=postgresql://…/agentflow-otr namespace=agentflow-otr schema=2026-09-09.1
 ```
 
 **已存在且 status=active 时幂等跳过**（不加 `--force` 不会改 db_ref）：
 
 ```
-[tenantctl] 租户 local 已存在（status=active），幂等跳过（--force 重写）
+[tenantctl] 租户 otr 已存在（status=active），幂等跳过（--force 重写）
 ```
 
-> ⚠ 本机的 `local` 属于**修复前**开通的存量租户（db_ref 指向共享库）。上面的
-> `provision local` 会**跳过**它、不会给它建独立库。要迁移见 §一「存量租户需迁移」。
+> 本机的 `otr` 是**修复后**开通的，已在自己的独立库里。上面的命令是幂等跳过；
+> 若库里没有它会真的建库。
 
 验证库是否建出来了：
 
@@ -124,8 +124,10 @@ with psycopg.connect('postgresql://localhost:5432/agentflow?user=agentflow&passw
 "
 ```
 
-> 租户名用 **`local`**：dev 模式（`AGENTFLOW_JWT_SECRET` 为空）下 API 从
-> `X-Tenant-ID` 头取租户，前端不发该头 → 落到 `"local"`（`api/auth.py:61`）。
+> 本机租户名是 **`otr`**。dev 模式（`AGENTFLOW_JWT_SECRET` 为空）下 API 从
+> `X-Tenant-ID` 头取租户；**前端已恒带该头**（`src/api/agentflow.js`）。
+> 后端缺省回退到 `"local"`（`api/auth.py:61`）—— 那会触发**给未注册租户自动建空库**，
+> 所以手工 curl 时**别漏这个头**（见 §6.10）。
 
 **`--force` 会重新绑定 db_ref**。对**已存在**的租户执行时，若目标库与旧库不同，
 会打印警告 —— **旧库数据不会自动搬迁**，仍留在原处（只是不再被读）。见 §6.7。
@@ -134,8 +136,8 @@ with psycopg.connect('postgresql://localhost:5432/agentflow?user=agentflow&passw
 同一个 PG 实例的不同 database 上）：
 
 ```bash
-$PY -m agentflow.tenantctl provision team-x --isolation strong \
-    --branch tenant/team-x --db-dsn 'postgresql://other-host:5432/agentflow?user=…&password=…'
+$PY -m agentflow.tenantctl provision team-acme --isolation strong \
+    --branch tenant/team-acme --db-dsn 'postgresql://other-host:5432/agentflow?user=…&password=…'
 ```
 
 ### 3) MCP server
@@ -166,13 +168,13 @@ $PY -m uvicorn agentflow.api.app:app --port 8000
 
 ```bash
 cd <repo>/backend
-$PY -m agentflow.worker --tenant local
+$PY -m agentflow.worker --tenant otr
 ```
 
 验证日志：
 
 ```
-Worker(tenant=local)：消费 run.trigger.local / run.command.local
+Worker(tenant=otr)：消费 run.trigger.otr / run.command.otr
 kafka.net.connection ... Connected
 ```
 
@@ -194,7 +196,7 @@ import json,pathlib,urllib.request
 y=pathlib.Path('workflows/bug-fix-scenario2.yaml').read_text()
 req=urllib.request.Request('http://localhost:8000/workflows',
   data=json.dumps({'name':'bug-fix-scenario2','yaml':y}).encode(),
-  headers={'Content-Type':'application/json'})
+  headers={'Content-Type':'application/json','X-Tenant-ID':'otr'})
 print(json.load(urllib.request.urlopen(req)))
 "
 ```
@@ -221,8 +223,9 @@ print(json.load(urllib.request.urlopen(req)))
 ### 3.3 命令行等价路径（便于脚本化）
 
 ```bash
-# 建工单
-tid=$(curl -s -X POST localhost:8000/tickets -H 'Content-Type: application/json' -d '{
+# 建工单（T 变量 = 租户头，见下）
+T='X-Tenant-ID: otr'
+tid=$(curl -s -X POST localhost:8000/tickets -H 'Content-Type: application/json' -H "$T" -d '{
   "title":"订单服务结账无响应",
   "bug_report":{"number":"INC0012345","short_description":"订单服务结账无响应",
                 "cmdb_ci":{"name":"order-service","namespace":"order"}},
@@ -230,16 +233,16 @@ tid=$(curl -s -X POST localhost:8000/tickets -H 'Content-Type: application/json'
 }' | $PY -c "import sys,json;print(json.load(sys.stdin)['id'])")
 
 # 发起（未指定 workflow_id → 用库里第一个）
-rid=$(curl -s -X POST localhost:8000/tickets/$tid/run -H 'Content-Type: application/json' -d '{}' \
+rid=$(curl -s -X POST localhost:8000/tickets/$tid/run -H 'Content-Type: application/json' -H "$T" -d '{}' \
   | $PY -c "import sys,json;print(json.load(sys.stdin)['run_id'])")
 
 # 轮询
-watch -n3 "curl -s localhost:8000/runs/$rid | $PY -c \"
+watch -n3 "curl -s -H \"$T\" localhost:8000/runs/$rid | $PY -c \"
 import sys,json;d=json.load(sys.stdin);n=d['nodes']
 print(d['status'], len(n), sum(1 for x in n.values() if x['status']=='done'))\""
 
 # 审批
-curl -s -X POST localhost:8000/runs/$rid/approve -H 'Content-Type: application/json' \
+curl -s -X POST localhost:8000/runs/$rid/approve -H 'Content-Type: application/json' -H "$T" \
   -d '{"node_id":"approve-commit","by":"lead-engineer","comment":"ok"}'
 ```
 
@@ -255,19 +258,39 @@ curl -s -X POST localhost:8000/runs/$rid/approve -H 'Content-Type: application/j
 | 6 | 界面完整 | 见下表 | 前端 |
 | 7 | **租户库隔离** | 每个租户只看得到自己的配置 | 见下 |
 
+**工单存储位置验收**（2026-09-14 修复项）：
+
+工单必须和 run 一样落在**租户库**，不能落管理库。
+
+```bash
+$PY -c "
+import psycopg
+for db in ['agentflow','agentflow-otr']:
+    with psycopg.connect(f'postgresql://localhost:5432/{db}?user=agentflow&password=agentflow') as c:
+        has = c.execute(\"SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tablename='tickets'\").fetchone()[0]
+        rows = list(c.execute('SELECT tenant_id,title FROM tickets')) if has else []
+        print(f'  {db:16} {rows}')
+"
+```
+
+期望：`agentflow`（管理库）**为空**，`agentflow-otr` 有该工单。
+
+> 修复前 `otr` 的 run 落 `agentflow-otr` 而**工单落到 `agentflow`** —— `ticket_store`
+> 曾是模块全局、不在 `TenantStores` bundle 里，所以永远不被租户路由。
+
 **租户隔离验收**（§一「租户库隔离」）：
 
 ```bash
 # 用两个不同租户 id 列控制面配置 —— 必须互不可见
-for t in local some-unprovisioned-id; do
+for t in otr some-unprovisioned-id; do
   echo -n "  $t: "
   curl -s -H "X-Tenant-ID: $t" localhost:8000/workflows \
     | $PY -c "import sys,json;d=json.load(sys.stdin);print(f'workflows={len(d)}', [x['name'] for x in d])"
 done
 ```
 
-期望：`local` 有它自己的 workflow；`some-unprovisioned-id` **为 0**
-（该 id 会得到一个空的独立库，而不是看到 `local` 的数据）。
+期望：`otr` 有它自己的 workflow；`some-unprovisioned-id` **为 0**
+（该 id 会得到一个空的独立库，而不是看到 `otr` 的数据）。
 修复前这里两边会返回**同一份列表**。
 
 **参考实现度量**（2026-09-14 实测，供对照）：
@@ -299,20 +322,28 @@ with psycopg.connect('postgresql://agentflow:agentflow@localhost:5432/agentflow'
 
 ## 六、已知问题与排障
 
-### 6.1 历史租户的 db_ref 解不开（噪音，不影响 `local`）
+### 6.1 租户的 db_ref 解不开（噪音，不阻断其它租户）
 
-`tenants` 表里有 4 个更早会话创建的租户（team-alpha / team-a / team-b / team-x），
-它们的 `db_ref_enc` 是用**另一个 SECRET_KEY** 加密的 → API 与 Sweeper 遍历时会报：
+`tenants` 表里**任何一个**租户的 `db_ref_enc` 若与当前 `AGENTFLOW_SECRET_KEY` 不匹配
+（换过密钥 / 在别的环境创建），API 与 Sweeper 遍历到它时就会报：
 
 ```
 ValueError: db_ref 解密失败（密钥不匹配？）
 ```
 
-**只影响日志**：用 `local` 租户的流程完全正常。要清掉：
+**只影响日志与那个租户**：其余租户完全正常，可继续验证流程。
+
+> 本机曾出现 4 个这样的租户（team-alpha / team-a / team-b / team-x，早于每租户建库的
+> 修复），**已于 2026-09-14 全部注销并清理**。保留本条是因为换密钥是常见操作，
+> 换完就会重现 —— 成因见 §8.5。
+
+清掉（幂等，逐个）：
 
 ```bash
-$PY -m agentflow.tenantctl deprovision team-a --confirm-delete   # 逐个
-# 或直接 DELETE FROM tenants WHERE tenant_id IN (...)
+$PY -m agentflow.tenantctl deprovision <tenant> --confirm-delete
+# 若解密失败导致 deprovision 也报错，直接删管理库里那一行：
+#   DELETE FROM tenants WHERE tenant_id IN (...)
+#   DELETE FROM schema_versions WHERE tenant_id IN (...)
 ```
 
 > 这些租户同时是**旧库绑定**（db_ref 指向共享库 `agentflow`，见 §6.7）。
@@ -359,19 +390,19 @@ PR 是 stub。这是设计内的（见 TODO「审批通知/沙箱等生产化」
 **旧库里的 run/workflow 不会自动搬迁**：
 
 ```
-[tenantctl] ⚠ 租户 local 的库引用已变更：
+[tenantctl] ⚠ 租户 otr 的库引用已变更：
             旧 → postgresql://…/agentflow?…
-            新 → postgresql://…/agentflow-local?…
+            新 → postgresql://…/agentflow-otr?…
             旧库数据**不会**自动搬迁，仍保留在原处。
 ```
 
 数据没丢，还在 `agentflow` 库里。要保留历史，先手工搬：
 
 ```bash
-# 例：把 local 的运行历史从共享库搬到它自己的库
+# 例：把某租户的运行历史从共享库搬到它自己的库
 pg_dump --data-only --table=runs --table=nodes --table=approvals \
         --table=workflow_snapshots --table=node_traces --table=audit_logs \
-  'postgresql://…/agentflow' | psql 'postgresql://…/agentflow-local'
+  'postgresql://…/agentflow' | psql 'postgresql://…/agentflow-otr'
 ```
 
 > 注意 `workflows` / `mcp_servers` / `agent_configs` 在旧共享库里**没有 tenant_id 列**，
@@ -432,12 +463,12 @@ curl -sf $B/health >/dev/null && echo "✓ API"
 curl -sf $B/workflows | grep -q '\[.\]' || { echo "✗ 库里没有 workflow"; exit 1; }
 echo "✓ workflow 已入库"
 
-# 租户库隔离：未注册的租户 id 不能看到 local 的配置
+# 租户库隔离：未注册的租户 id 不能看到 otr 的配置
 mine=$(curl -s $B/workflows | $PY -c "import sys,json;print(len(json.load(sys.stdin)))")
 theirs=$(curl -s -H 'X-Tenant-ID: smoke-probe-unprovisioned' $B/workflows \
   | $PY -c "import sys,json;print(len(json.load(sys.stdin)))")
 [ "$theirs" = "0" ] || { echo "✗ 租户隔离失败：外部租户看到 $theirs 条 workflow"; exit 1; }
-echo "✓ 租户库隔离（local=$mine, 探针租户=0）"
+echo "✓ 租户库隔离（otr=$mine, 探针租户=0）"
 
 tid=$(curl -s -X POST $B/tickets -H 'Content-Type: application/json' -d '{
   "title":"smoke","bug_report":{"number":"SMOKE-1","short_description":"smoke",
