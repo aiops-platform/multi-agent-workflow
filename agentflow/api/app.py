@@ -46,6 +46,7 @@ from .agent_store import (
 from .auth import TenantContext, get_tenant_context
 from .management_store import build_management_store
 from .mcp_store import MCPStore, build_mcp_store
+from .ticket_store import TICKET_NEW, TICKET_RUNNING, TicketStore, build_ticket_store
 from .workflow_store import WorkflowStore, build_workflow_store
 
 settings: Settings = get_settings()
@@ -66,6 +67,7 @@ async def lifespan(_: FastAPI):
     await init()
     yield
     await mcp_manager.close_all()
+    await ticket_store.close()
 
 
 app = FastAPI(title="agentflow 控制面", version="0.1.0", lifespan=lifespan)
@@ -76,6 +78,9 @@ _worker_task: asyncio.Task | None = None
 # 控制面配置存储（workflows/mcp_servers/agent_configs）：state_store=postgres 时落 PG，
 # 否则沿用本地 sqlite（构造不做 DB/I/O，惰性 connect；测试可 monkeypatch 模块全局）。
 workflow_store = build_workflow_store(settings)
+# 工单存储。**多租户路径不用它** —— 那些走 TenantStores.ticket（router 按租户库构造）；
+# 这里只是单租户/未 init 时的回退形状（`_control_stores` 的 _GlobalStores）。
+ticket_store = build_ticket_store(settings)
 mcp_store = build_mcp_store(settings)
 agent_config_store = build_agent_config_store(settings)
 # 运行时 MCP client 管理器（持有同一个 store 引用，读取 enabled=1 配置）
@@ -196,6 +201,28 @@ def _effective_agent_resolver() -> AgentConfigResolver:
     return _agent_config_resolver if _agent_config_resolver is not None else AgentConfigResolver([])
 
 
+async def _agent_config_provider(tenant_id: str | None) -> AgentConfigResolver:
+    """per-tenant AgentSpec 解析器（代际缓存：CRUD 后 ``_resolver_generation`` 递增 → 失效重建）。
+
+    **必须在模块作用域**：``_reload_agent_config_resolver`` 里注册给 mcp_manager 的
+    ``_tenant_server_ids_for`` 闭包会调它，而那个闭包的外层是模块而非 ``init()``。
+    早期把它定义在 ``init()`` 内部（作为局部函数），于是运行时每次解析 MCP 绑定都抛
+    ``NameError: name '_agent_config_provider' is not defined`` —— 表现为**任何 agent 节点
+    执行失败**（"重试耗尽"）。单测发现不了：它们 monkeypatch 掉 service/mcp_manager，
+    不走这条路径；只有起真服务跑一次 run 才暴露。
+    """
+    key = tenant_id or "local"
+    hit = _resolver_cache.get(key)
+    if hit is not None and hit[0] == _resolver_generation:
+        return hit[1]
+    if stores_router is None:  # 未 init（测试）：退化为全局单例
+        return _effective_agent_resolver()
+    bundle = await stores_router.get(key)
+    resolver = AgentConfigResolver(await bundle.agent_config.list())
+    _resolver_cache[key] = (_resolver_generation, resolver)
+    return resolver
+
+
 async def _migrate_sqlite_config_to_pg() -> None:
     """本地 SQLite → PostgreSQL 一次性迁移（仅 state_store=postgres、源库存在时执行）。
 
@@ -259,16 +286,7 @@ async def init() -> RunService:
     # ── 租户库路由（P4）：tenant_id → TenantStores（state+workflow+mcp+agent_config）──
     stores_router = TenantStoresRouter(settings, management_store)
 
-    # per-tenant AgentSpec 解析器（代际缓存：CRUD 后 _reload 递增 → 失效重建）
-    async def _agent_config_provider(tenant_id: str | None) -> AgentConfigResolver:
-        key = tenant_id or "local"
-        hit = _resolver_cache.get(key)
-        if hit is not None and hit[0] == _resolver_generation:
-            return hit[1]
-        bundle = await stores_router.get(key)
-        resolver = AgentConfigResolver(await bundle.agent_config.list())
-        _resolver_cache[key] = (_resolver_generation, resolver)
-        return resolver
+    # per-tenant AgentSpec 解析器见模块级 _agent_config_provider（作用域原因，见其 docstring）
 
     # per-tenant mcp store 路由（§7：租户的 mcp_servers 表在租户自己的库）
     async def _mcp_store_provider(tenant_id: str | None):
@@ -355,6 +373,7 @@ async def _control_stores(ctx: TenantContext | None):
             self.workflow = workflow_store
             self.mcp = mcp_store
             self.agent_config = agent_config_store
+            self.ticket = ticket_store
 
     return _GlobalStores()
 
@@ -568,6 +587,141 @@ async def _mcp_snapshot(data: dict, tenant_id: str | None = None) -> list[dict[s
     return res.get("tools") if res.get("ok") else None
 
 
+# ── Ticket Inbox（工单入口：从抓到 ticket 到发起诊断）──
+# 工单存**租户库**的 tickets 表（``cs.ticket``），与 workflow / mcp / agent_config 一致。
+# 行内**另带 tenant_id 且每个方法强制过滤** —— 租户库形态下是第二道防线（防构造漏网），
+# 单库回退形态下则是唯一的隔离手段，故两个都保留。
+
+class TicketRequest(BaseModel):
+    """建工单。字段对齐测试数据里的 ServiceNow 事件形状（DIAGNOSE_TEST_GUIDE §BUG）。"""
+
+    title: str
+    bug_report: dict | None = None
+    window_start: str | None = None
+    window_end: str | None = None
+    # 以下若不传，从 bug_report 里兜底取（number / cmdb_ci.name / cmdb_ci.namespace）
+    number: str | None = None
+    service: str | None = None
+    namespace: str | None = None
+    severity: str | None = None
+
+
+class TicketRunRequest(BaseModel):
+    """从工单发起一次 run。``workflow_id`` 不传则用库里第一个已保存流程。"""
+
+    workflow_id: str | None = None
+
+
+def _ticket_inputs(req: TicketRequest) -> dict:
+    """TicketRequest → workflow 的 ``inputs``（bug_report + 时间窗）。
+
+    None 的键**不写入**：workflow YAML 里 window_start/end 声明为 required，
+    缺键与传 null 都不满足，但缺键的报错更直白（v5.5 §7.1 要求窗口由调用方下发）。
+    """
+    inputs: dict = {"bug_report": req.bug_report or {}}
+    if req.window_start:
+        inputs["window_start"] = req.window_start
+    if req.window_end:
+        inputs["window_end"] = req.window_end
+    return inputs
+
+
+@app.post("/tickets", status_code=201)
+async def create_ticket(
+    req: TicketRequest, ctx: TenantContext = Depends(get_tenant_context)
+) -> dict:
+    """建工单。返回完整记录（含 inputs 与空的 run_ids）。
+
+    走 ``cs.ticket``（租户库），与其它配置表一致 —— 早期用模块全局 ``ticket_store``，
+    工单会落到共享库、不随租户隔离。
+    """
+    br = req.bug_report or {}
+    ci = br.get("cmdb_ci") or {}
+    tickets = (await _control_stores(ctx)).ticket
+    tid = await tickets.create(
+        ctx.tenant_id,
+        title=req.title,
+        inputs=_ticket_inputs(req),
+        number=req.number or br.get("number"),
+        service=req.service or ci.get("name"),
+        namespace=req.namespace or ci.get("namespace"),
+        severity=req.severity,
+    )
+    created = await tickets.get(ctx.tenant_id, tid)
+    assert created is not None
+    return created
+
+
+@app.get("/tickets")
+async def list_tickets(
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    ctx: TenantContext = Depends(get_tenant_context),
+) -> list[dict]:
+    """列出该租户的工单（新→旧）。"""
+    return await (await _control_stores(ctx)).ticket.list(
+        ctx.tenant_id, status=status, limit=max(1, min(limit, 200)), offset=max(0, offset)
+    )
+
+
+@app.get("/tickets/{tid}")
+async def get_ticket(tid: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
+    """取单条工单。跨租户一律 404（不泄漏存在性，§9.2）。"""
+    ticket = await (await _control_stores(ctx)).ticket.get(ctx.tenant_id, tid)
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="ticket 不存在")
+    return ticket
+
+
+@app.post("/tickets/{tid}/run")
+async def run_ticket(
+    tid: str,
+    req: TicketRunRequest | None = None,
+    ctx: TenantContext = Depends(get_tenant_context),
+) -> dict:
+    """从工单发起一次 run：取工单的 inputs → 建 run → 把 run 挂回工单。
+
+    组合端点，省掉前端「读工单 → 拼 inputs → POST /run → 回写关联」的往返。
+    底层与 ``POST /run`` 共用 ``start_run``（配额/校验/租户语义一致）。
+    """
+    cs = await _control_stores(ctx)
+    tickets = cs.ticket
+    ticket = await tickets.get(ctx.tenant_id, tid)
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="ticket 不存在")
+
+    workflow_id = (req.workflow_id if req else None) or None
+    if workflow_id is None:
+        # 未指定则用第一个已保存流程 —— 让「发起诊断」按钮无需先选流程
+        saved = await cs.workflow.list()
+        if not saved:
+            raise HTTPException(
+                status_code=400, detail="库里没有已保存的 workflow，无法发起诊断"
+            )
+        workflow_id = saved[0]["id"]
+
+    wf_row = await cs.workflow.get(workflow_id)
+    if wf_row is None:
+        raise HTTPException(status_code=404, detail="workflow 不存在")
+    try:
+        workflow = Workflow.load_yaml(wf_row["yaml"])
+    except (ValueError, yaml.YAMLError, WorkflowDAGError) as exc:
+        raise HTTPException(status_code=400, detail=f"Workflow 解析失败: {exc}") from exc
+
+    try:
+        out = await _service().start_run(ctx.tenant_id, workflow, ticket["inputs"])
+    except TenantQuotaExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except InputsValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    run_id = out["run_id"]
+    await tickets.attach_run(ctx.tenant_id, tid, run_id)
+    await tickets.set_status(ctx.tenant_id, tid, TICKET_RUNNING)
+    return {"ticket_id": tid, "run_id": run_id, "workflow_id": workflow_id, "status": "started"}
+
+
 @app.post("/mcp-servers", status_code=201)
 async def create_mcp_server(req: MCPServerCreate, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
     """保存一条 MCP server 配置（存该租户库）并热刷新 client，返回 id。
@@ -674,6 +828,82 @@ async def mcp_server_tools(mid: str, ctx: TenantContext = Depends(get_tenant_con
     return res
 
 
+# run 状态对外映射：DB 存的节点终态是 ``done``，对 UI 统一呈现为 ``success``。
+# **GET /runs 与 GET /runs/{id} 必须共用同一张表** —— 早期列表端点直接透传 DB 原始值，
+# 与详情端点不一致（同样是跑完的 run，列表说 done、详情说 success），前端没法统一判终态。
+_RUN_STATUS_TO_API = {"done": "success"}
+_RUN_STATUS_TO_DB = {v: k for k, v in _RUN_STATUS_TO_API.items()}
+
+
+def _api_run_status(db_status: str) -> str:
+    return _RUN_STATUS_TO_API.get(db_status, db_status)
+
+
+def _db_run_status(api_status: str) -> str:
+    """对外状态反查 DB 状态（列表过滤用）。未知值原样返回，交给 DB 过滤 → 结果为空。"""
+    return _RUN_STATUS_TO_DB.get(api_status, api_status)
+
+
+@app.get("/runs")
+async def list_runs(
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    ctx: TenantContext = Depends(get_tenant_context),
+) -> list[dict]:
+    """列出当前租户的 run（新→旧），供 UI 的流程列表用。
+
+    此前只有 ``GET /runs/{id}`` 单查 —— 前端拿不到「历史上跑过哪些 run」，
+    只能自己在内存里记 run_id，刷新即丢。
+
+    - ``status``：精确过滤（``running`` / ``waiting_approval`` / ``done`` …）
+    - **已知 N+1**：workflow 名逐个从 snapshot 取、token/cost 逐个 sum 节点。
+      ``limit`` 上限 200，控制面 UI 的用量下可接受；真要优化得加 run 级聚合列。
+    - **排序**：``created_at DESC, run_id DESC``。注意 ``created_at`` 只到**秒**
+      （sqlite 的 ``CURRENT_TIMESTAMP`` 无小数位），同一秒内创建的 run 只能靠
+      run_id 定序，不代表真实先后。
+    """
+    service = _service()
+    store = await service.store_for(ctx.tenant_id)
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    rows = await store.list_runs(
+        ctx.tenant_id,
+        status=_db_run_status(status) if status is not None else None,
+        limit=limit,
+        offset=offset,
+    )
+
+    out: list[dict] = []
+    for run in rows:
+        rid = run["run_id"]
+        # workflow 名从原 snapshot 取（与 GET /runs/{id} 同源；workflow 被删也显示得出）
+        name = None
+        try:
+            snap = await store.get_snapshot(run["workflow_snapshot_id"])
+            if snap:
+                name = Workflow.load_yaml(snap["workflow_yaml"]).name
+        except (ValueError, yaml.YAMLError, WorkflowDAGError):
+            name = None
+
+        nodes_raw = await store.get_nodes(rid)
+        tokens = sum((cp.get("tokens") or 0) for cp in nodes_raw.values())
+        cost = sum((cp.get("cost") or 0.0) for cp in nodes_raw.values())
+
+        out.append({
+            "run_id": rid,
+            "workflow": name,
+            "status": _api_run_status(run["status"]),
+            "total_tokens": tokens,
+            "total_cost": cost,
+            "inputs": run.get("inputs") or {},
+            "created_at": run.get("created_at"),
+            "updated_at": run.get("updated_at"),
+        })
+    return out
+
+
 @app.get("/runs/{run_id}")
 async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
     """聚合 run 详情（UI 轮询契约，对齐 agentflow 后端）：图 + 节点状态 + 统计 + 待审批。
@@ -699,6 +929,13 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
         graph = {}
 
     nodes_raw = await store.get_nodes(run_id)
+    # 每节点的重试次数：node_attempts 里同 (run_id, node_id) 的行数（表本身无读取端点）
+    attempts_by_node: dict[str, int] = {}
+    for att in await store.list_attempts(run_id):
+        nid_a = att.get("node_id")
+        if nid_a:
+            attempts_by_node[nid_a] = attempts_by_node.get(nid_a, 0) + 1
+
     nodes: dict[str, dict] = {}
     total_tokens = 0
     total_cost = 0.0
@@ -711,6 +948,13 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
             "tokens": cp.get("tokens", 0),
             "cost": cp.get("cost", 0.0),
             "prompt": json.dumps(params, ensure_ascii=False),
+            # 失败原因：cp.error 一直存在，此前没映射出来 → 前端看不到失败原因
+            "error": cp.get("error"),
+            # 耗时：随 checkpoint 走（nodes 表无时间列，见 dag_executor._stamp_timing）
+            "started_at": cp.get("started_at"),
+            "ended_at": cp.get("ended_at"),
+            "duration_ms": cp.get("duration_ms"),
+            "attempts": attempts_by_node.get(nid, 0),
         }
         total_tokens += cp.get("tokens", 0)
         total_cost += cp.get("cost", 0.0)
@@ -729,22 +973,20 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
             "upstream": upstream_out,
         })
 
-    status_map = {
-        "done": "success",
-        "running": "running",
-        "failed": "failed",
-        "cancelled": "cancelled",
-        "waiting_approval": "waiting_approval",
-    }
     return {
         "run_id": run_id,
         "workflow": graph.get("name"),
         "graph": graph,
-        "status": status_map.get(run["status"], run["status"]),
+        "status": _api_run_status(run["status"]),
         "total_tokens": total_tokens,
         "total_cost": total_cost,
         "nodes": nodes,
         "pending_approvals": pending,
+        # 回显建 run 时的 inputs：此前完全不返回，导致连「诊断的是哪段时间窗」
+        # （window_start/end，v5.5 §7.1 要求由调用方下发）都查不回来
+        "inputs": run.get("inputs") or {},
+        "created_at": run.get("created_at"),
+        "updated_at": run.get("updated_at"),
     }
 
 
@@ -1110,22 +1352,226 @@ async def delete_agent_config(
     return {"ok": True}
 
 
-@app.get("/agents")
-async def agents() -> list[dict]:
-    """Agent 编队列表（DB AgentSpec 配置 + 内置静态默认的合并视图；与 /health 同级无鉴权）。
+def _local_tool_views(agent_name: str) -> list[dict]:
+    """该 agent 在**本地** Tool Registry 里可见的工具（含 L1/L2 与是否需审批）。
 
-    来源 ``_effective_agent_resolver().all()``：内置 15（DB 覆盖或静态默认）∪ 自定义 agent。
-    返回 [{name, description, tools, stage}]，tools 为该 agent 在 Tool Registry 中可见的函数
-    工具名（L1 数据源，与 MCP 绑定无关），stage 为流水线阶段（detect/diagnose/fix/verify/
-    deliver/learn），供前端舰队分组展示。store 为空（未 init）时 == 纯内置 15，形状/顺序与
-    既有静态注册表一致。
+    ``level``/``needs_approval`` 是前端推导「自治 tier」的唯一依据（T1 只读 / T3 受限执行 /
+    T3+ 半自动），**不能只返回名字**。
     """
     return [
-        {"name": spec.name, "description": spec.description,
-         "tools": [t.name for t in tools_for_agent(spec.name)],
-         "stage": spec.stage}
-        for spec in _effective_agent_resolver().all()
+        {
+            "name": t.name,
+            "level": t.level,
+            "needs_approval": t.needs_approval,
+            "description": t.description,
+        }
+        for t in tools_for_agent(agent_name)
     ]
+
+
+async def _mcp_tool_views(server_ids, cs) -> list[dict]:
+    """绑定 server 提供的 MCP 工具（套 enable/disable 过滤），按 ``mcp__{server}__{tool}`` 拼。
+
+    改造前 ``/agents`` 的 ``tools`` **只含本地注册表**（端点注释明说"与 MCP 绑定无关"），
+    于是 15 个 agent 里 7 个显示 "no tools" —— 恰恰是最依赖取数的那 7 个（triage /
+    log-analyst / trace-analyst / metrics-analyst / infra-locator / fix-planner /
+    postmortem）。它们的工具经 MCP 下发，端点看不见，页面上的 "Total Tools" 与
+    "Ready" 两个 KPI 因此是误导的。
+
+    工具名取自 server 记录里的 **tools 快照**（最近一次 tools/list 的结果）；从未探测过
+    的 server 快照为 None → 该 server 贡献 0 个工具（前端应显示"未探测"而不是"无工具"）。
+    """
+    out: list[dict] = []
+    for mid in sorted(server_ids or ()):
+        row = await cs.mcp.get(mid)
+        if row is None or not row.get("enabled", 1):
+            continue
+        snapshot = row.get("tools") or []
+        names = [t.get("name") for t in snapshot if isinstance(t, dict) and t.get("name")]
+        enable = row.get("enable_tools")
+        if enable:
+            allowed = set(enable)
+            names = [n for n in names if n in allowed]
+        disable = set(row.get("disable_tools") or [])
+        names = [n for n in names if n not in disable]
+
+        read_only_by_name = {
+            t.get("name"): bool(t.get("read_only"))
+            for t in snapshot
+            if isinstance(t, dict) and t.get("name")
+        }
+        for n in names:
+            out.append({
+                "name": f"mcp__{row['name']}__{n}",
+                "server": row["name"],
+                "server_id": mid,
+                "tool": n,
+                "read_only": read_only_by_name.get(n),
+            })
+    return out
+
+
+def _agent_base_view(eff) -> dict:
+    """ResolvedAgent → 列表项骨架（不含工具，工具需 await 取）。"""
+    return {
+        "name": eff.name,
+        "description": eff.description,
+        "stage": eff.stage,
+        "role": eff.role,
+        "enabled": eff.enabled,
+        "origin": eff.origin,
+        "reasoning_enabled": eff.reasoning_enabled,
+        "mcp_server_ids": sorted(eff.mcp_server_ids),
+    }
+
+
+@app.get("/agents")
+async def agents(ctx: TenantContext = Depends(get_tenant_context)) -> list[dict]:
+    """Agent 编队列表（DB 配置 + 内置静态默认的合并视图）。
+
+    **v2 起需要租户上下文** —— 返回值含 MCP 绑定（租户数据），不能再无鉴权。
+    dev 模式（无 JWT）仍回退到 ``X-Tenant-ID`` / ``local``，既有调用方不受影响。
+
+    每项字段：
+    - ``name`` / ``description`` / ``stage``（detect/diagnose/fix/verify/deliver/learn）
+    - ``role``（diagnose | fix）、``enabled``、``origin``（builtin | custom）
+    - ``reasoning_enabled``、``mcp_server_ids``、``bound_servers``
+    - **``local_tools``**：本地注册表工具，**含 ``level``/``needs_approval``**
+      （前端据此推导自治 tier）
+    - **``mcp_tools``**：MCP server 提供的工具（``mcp__{server}__{tool}``）
+    - ``tools``：前两者的名字并集，**保留旧字段**以免打断既有调用方
+
+    来源 ``cs.agent_config.list()``（**该租户**的覆盖行）∪ 内置 15 —— 与 ``/agent-configs``
+    同源；早期版本用全局 resolver，与多租户下的 CRUD 不同步。
+    """
+    cs = await _control_stores(ctx)
+    rows = await cs.agent_config.list()
+    resolver = AgentConfigResolver(rows)
+
+    out: list[dict] = []
+    for eff in resolver.all():
+        local_tools = _local_tool_views(eff.name)
+        mcp_tools = await _mcp_tool_views(eff.mcp_server_ids, cs)
+        bound = await _bound_servers(sorted(eff.mcp_server_ids), cs)
+        out.append({
+            **_agent_base_view(eff),
+            "bound_servers": bound,
+            "local_tools": local_tools,
+            "mcp_tools": mcp_tools,
+            # 旧字段：名字并集（既有前端仍在用）
+            "tools": [t["name"] for t in local_tools] + [t["name"] for t in mcp_tools],
+            "tool_count": len(local_tools) + len(mcp_tools),
+        })
+    return out
+
+
+@app.get("/agents/stats")
+async def agents_stats(
+    limit_runs: int = 50, ctx: TenantContext = Depends(get_tenant_context)
+) -> dict:
+    """按 agent 聚合执行统计（数据源 ``node_traces`` 的 ``kind='node'`` 行）。
+
+    **口径与来源**（诚实标注）：
+    - 取**最近 N 个 run**（默认 50）的节点流水聚合，不是全表 —— 全表无按 agent 的索引，
+      且 traces 只在真实 LLM 模式（有 DeepSeek Key）下才有数据，mock 模式全空。
+    - ``runs``：该 agent 参与过的节点次数；``success_rate``：节点 status 非 failed 的占比。
+    - ``avg_tokens`` / ``avg_cost``：来自节点流水 payload。
+    - ``avg_duration_ms``：来自节点 checkpoint 的耗时（B1 加的），**不是**从 traces 推的。
+
+    返回 ``{"window_runs": N, "agents": {name: {...}}}``；样本为空时各值为 ``None``
+    而不是 0 —— 前端要能区分「没跑过」与「跑了但为 0」。
+    """
+    service = _service()
+    store = await service.store_for(ctx.tenant_id)
+    runs = await store.list_runs(ctx.tenant_id, limit=max(1, min(limit_runs, 200)))
+
+    agg: dict[str, dict] = {}
+
+    def _slot(name: str) -> dict:
+        return agg.setdefault(
+            name,
+            {"runs": 0, "failed": 0, "tokens": 0, "cost": 0.0, "duration_ms": 0, "n_duration": 0},
+        )
+
+    for run in runs:
+        # 各 agent 的归属取自 traces（kind='node' 的 payload.agent）；耗时取自 checkpoint
+        trace_agents: dict[str, str] = {}
+        for tr in await store.get_node_traces(run["run_id"], kind="node"):
+            payload = tr.get("payload") or {}
+            agent = payload.get("agent")
+            if not agent:
+                continue
+            trace_agents[tr.get("node_id")] = agent
+            slot = _slot(agent)
+            slot["runs"] += 1
+            if payload.get("error"):
+                slot["failed"] += 1
+            slot["tokens"] += payload.get("tokens") or 0
+            slot["cost"] += payload.get("cost") or 0.0
+
+        for nid, cp in (await store.get_nodes(run["run_id"])).items():
+            agent = trace_agents.get(nid)
+            if not agent:
+                continue
+            slot = _slot(agent)
+            dur = cp.get("duration_ms")
+            if isinstance(dur, (int, float)):
+                slot["duration_ms"] += dur
+                slot["n_duration"] += 1
+
+    agents_out: dict[str, dict] = {}
+    for name, s in agg.items():
+        n = s["runs"]
+        agents_out[name] = {
+            "runs": n,
+            "failed": s["failed"],
+            "success_rate": round((n - s["failed"]) / n, 4) if n else None,
+            "avg_tokens": round(s["tokens"] / n, 1) if n else None,
+            "avg_cost": round(s["cost"] / n, 6) if n else None,
+            "avg_duration_ms": (
+                round(s["duration_ms"] / s["n_duration"]) if s["n_duration"] else None
+            ),
+        }
+
+    return {"window_runs": len(runs), "agents": agents_out}
+
+
+@app.get("/agents/{name}")
+async def agent_detail(
+    name: str, ctx: TenantContext = Depends(get_tenant_context)
+) -> dict:
+    """单 agent 详情：列表项的全部字段 + **完整 system_prompt** + 输出 schema + ``stored``。
+
+    ``stored`` 给出 DB 覆盖行里**实际存了什么**（未覆盖则为 null），前端可据此显示
+    "已覆盖 / 用内置默认"。与 ``GET /agent-configs/{name}`` 的区别：那个是配置视角
+    （聚焦可编辑字段），这个是**编队视角**（含工具面与绑定，供 Agent 目录的 Inspector 用）。
+    """
+    cs = await _control_stores(ctx)
+    rows = await cs.agent_config.list()
+    resolver = AgentConfigResolver(rows)
+    eff = resolver.resolve(name)
+    if eff is None:
+        raise HTTPException(status_code=404, detail=f"agent 不存在: {name}")
+
+    raw = next((r for r in rows if r["name"] == name), None)
+    local_tools = _local_tool_views(name)
+    mcp_tools = await _mcp_tool_views(eff.mcp_server_ids, cs)
+
+    return {
+        **_agent_base_view(eff),
+        "bound_servers": await _bound_servers(sorted(eff.mcp_server_ids), cs),
+        "local_tools": local_tools,
+        "mcp_tools": mcp_tools,
+        "tools": [t["name"] for t in local_tools] + [t["name"] for t in mcp_tools],
+        "tool_count": len(local_tools) + len(mcp_tools),
+        "system_prompt": eff.system_prompt,
+        "schema": eff.schema,
+        "stored": {
+            "description": (raw or {}).get("description"),
+            "system_prompt": (raw or {}).get("system_prompt"),
+            "schema": (raw or {}).get("schema"),
+        },
+    }
 
 
 @app.get("/health")

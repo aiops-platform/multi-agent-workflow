@@ -46,8 +46,18 @@ make lint      # ruff 检查
 7. **多租户（v5.3 五原则，design-v5.3.md）**：
    - **存储路由**：一切库访问经 `statestore/router.py`——普通 StateStore 包装固定解析
      （既有单库用法/测试零改动），`TenantStoresRouter` 按 tenant_id 路由到租户库
-     bundle（state+workflow+mcp+agent_config 同库异表，LRU 淘汰关闭）。**新读路径
+     bundle（**state+workflow+mcp+agent_config+ticket**，LRU 淘汰关闭）。**新读路径
      必须经 `service.store_for(tenant)` / router，禁止绕过**（P4：隔离由构造保证）。
+     > **新增控制面表时务必加进 `TenantStores`**。`ticket_store` 起初只作为模块全局
+     > 存在、不在 bundle 里 → 所有租户的工单都写进共享库（2026-09-14 修复）。
+     > 判据：**模块全局 store 只该出现在 `_GlobalStores` 回退形状里**。
+   - **PG 租户库是真的独立 database**（`{基础库}-{tenant_id}`，如 `agentflow-otr`）：
+     `provision` 会 `CREATE DATABASE … TEMPLATE template0` 建库，`deprovision
+     --confirm-delete` 会 DROP（**拒绝删共享基础库**，防连坐管理库）。
+     库名派生与建/删库在 `tenants.py`；**`_default_db_ref` 只有一份实现**——
+     早期 tenantctl/tenants/router 各写一份，postgres 分支都返回共享 DSN，
+     导致 `workflows`/`mcp_servers`/`agent_configs`（**这三张没有 tenant_id 列**）
+     跨租户互相可见。
    - **管理库**（`api/management_store.py`）：tenants/schema_versions；db_ref Fernet
      加密（AGENTFLOW_SECRET_KEY，缺省从 jwt_secret 派生并告警）；**任何 API 不回显
      DSN**。tenants.yaml 仅 bootstrap 种子（async_bootstrap_tenants），运行时以
@@ -77,9 +87,14 @@ make lint      # ruff 检查
    - **生命周期**：`python -m agentflow.tenantctl provision|deploy|upgrade|migrate|
      deprovision`（幂等 saga）；standard 租户专属分支被拒（§9.2 规则 4）；部署记录
      pin SHA 不 pin 分支名。
-   - JWT：`AGENTFLOW_JWT_SECRET` 非空=JWT 模式（claim 派生，客户端提交忽略）；
-     空=dev 回退（告警）。跨租户 run 访问 404（`_run_for_tenant`，Router 模式下
-     查不到即 404——隔离由构造保证）。RS256 暂缓（v5.3 §12）。
+   - JWT：**鉴权只有两种模式**——`AGENTFLOW_JWT_SECRET` 非空=JWT 模式（claim 派生，
+     客户端提交的 tenant 字段一律忽略）；空=dev 回退（`X-Tenant-ID`，告警）。
+     租户 claim 优先级 `tenant_id` > `org_id` > `org`；`sub`=审批人身份（JWT 模式下
+     approve/reject 的 `by` 也取它，body 不可伪造）。跨租户 run 访问 404
+     （`_run_for_tenant`，Router 模式下查不到即 404——隔离由构造保证）。
+     **RS256 已可用**（`jwt_algorithm` 是算法无关的 `pyjwt.decode`，把 PEM 公钥放进
+     `AGENTFLOW_JWT_SECRET` 即可）；缺的不是算法而是配套：JWKS 自动取钥/轮换、签发侧。
+     详见 `docs/E2E_VERIFICATION_zh-CN.md` §JWT 模式。
 8. **Git 版本冻结**（§4.6/§8.7）：`workspace/manager.py` 明确不提供 git_pull；Run 期间工作区
    HEAD 必须 == base_sha，漂移报 `FrozenVersionMismatch`。每个 Run 用 `aiops/RUN_{run_id}` 分支隔离。
 9. **工具权限**（§9.5）：`build_agent` 默认 DONT_ASK + agent 注册工具的 allow 规则。
@@ -119,19 +134,22 @@ exec_context.py、docs/DEPLOYMENT_zh-CN.md）
 
 ```
 core/        Workflow 模型 + DAG 语义 + 版本冻结（M0）
-statestore/  State Model：InMemory / SQLite（M0）
+statestore/  State Model（memory/sqlite/postgres）+ router.py（租户库路由）
 executor/    并发 DAGExecutor + 幂等 + Retry + Resume（M2）
 agents/      15-agent 编队 + AgentScope 适配 + 工具治理（M1 骨架）
-             ├ datasources.py  真实数据源适配（ES/Prometheus/kubectl，testbed）
              └ scopes.py       build_permission_context（§9.5 DONT_ASK+allow）
-workspace/   WorkspaceManager + CMDB（M3）
+                             （原 datasources.py 已在 v5.5 批3 删除，取数全部走 MCP）
+workspace/   WorkspaceManager（M3）；CMDB 已迁 MCP（v5.5.2）
 sandbox/     M4：exec 服务(纯 stdlib) + SandboxClient + Orchestrator + ActionExecutor + ToolPolicy
 approval/    M5：审批超时 Sweeper + 通知
 audit/       M5：审计日志
 queue/ lock/ 可插拔队列/锁（memory + kafka/redis 生产适配器）
-statestore/  StateStore（memory/sqlite + postgres 生产适配器）
 service.py   RunService：create / approve / resume 编排
 api/         控制面 FastAPI
+             ├ management_store.py  管理库（tenants/schema_versions + db_ref 加密）
+             ├ workflow_store.py / mcp_store.py / agent_store.py / ticket_store.py
+             │   四张控制面配置表 —— **都随租户库走**（TenantStores bundle）
+             └ tenantctl.py        租户生命周期 CLI
 workflows/   bug-fix-pipeline.yaml（§8.1）+ bug-fix-scenario2.yaml（修复闭环）
 scripts/     watch_run.py（run 逐阶段观测）+ mock_mcp_server.py + verify_sandbox.py
 docker/sandbox/  沙箱镜像（stdlib-only 离线可建）
@@ -152,7 +170,7 @@ M0 ✅ → M1 ✅（DB 驱动配置 + MCP 配置化；数据源默认 mock）→
 M3 ✅ → M4 ✅（组件级；API 认证/egress 未落地）→ M5 ✅（CAS 时间谓词）→
 M6 🟡（适配器可用，真实 broker/DB 专项待生产）→ M7 🟡（诊断真实，解决侧部分 mock）。
 多租户 v5.3 批 A/B/C ✅（管理库+Router+配置表入租户库 / 接单 CAS+topic 租户化+
-tenantctl+namespace 派生 / 共享数据源下线+repo 封堵+per-tenant MCP/配置路由，268 tests）。
+tenantctl+namespace 派生 / 共享数据源下线+repo 封堵+per-tenant MCP/配置路由，300+ tests）。
 待办：MCP 凭证加密+回显脱敏、Mock CMDB 租户维度、Orchestrator 租户 namespace 接线、
-Kafka topic 自动建、JWT RS256（暂缓）、Langfuse/OTel、沙箱 API 认证、
-真实 Kafka/PG 故障恢复专项（§14）。
+Kafka topic 自动建、**JWT JWKS**（算法 RS256 已可用，缺自动取钥/轮换）、
+Langfuse/OTel、沙箱 API 认证、真实 Kafka/PG 故障恢复专项（§14）。

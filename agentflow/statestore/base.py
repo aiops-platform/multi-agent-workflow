@@ -68,6 +68,30 @@ class StateStore(ABC):
         """租户未终态 run 数（§9.3 max_concurrent_runs 配额判定用）。"""
 
     @abstractmethod
+    async def list_runs(
+        self,
+        tenant_id: str,
+        *,
+        status: str | None = None,
+        run_ids: list[str] | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        """按租户列出 run（新→旧），供控制面 ``GET /runs`` 列表用。
+
+        - ``status``：精确过滤；None = 不过滤
+        - ``run_ids``：只取这些 id（ticket → 关联 run 的反查用）；None = 不过滤
+        - 返回带 ``inputs``/``created_at``/``updated_at`` 的完整行
+        """
+
+    @abstractmethod
+    async def list_attempts(self, run_id: str) -> list[dict]:
+        """列出某 run 的全部 node_attempts（按 node_id, attempt 升序）。
+
+        GET /runs/{id} 用它给出每个节点的重试次数与最后一次错误。
+        """
+
+    @abstractmethod
     async def cas_update_run_status(
         self, run_id: str, from_status: str, to_status: str
     ) -> bool:

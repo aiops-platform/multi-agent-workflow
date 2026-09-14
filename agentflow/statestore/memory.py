@@ -46,12 +46,16 @@ class InMemoryStateStore(StateStore):
 
     # ---- runs ----
     async def create_run(self, run_id, tenant_id, snapshot_id, inputs) -> None:
+        now = datetime.now(UTC).isoformat()
         self._runs[run_id] = {
             "run_id": run_id,
             "tenant_id": tenant_id,
             "workflow_snapshot_id": snapshot_id,
             "status": "running",
             "inputs": inputs,
+            # 与 sqlite/PG 对齐（那两边的列有 DEFAULT，这里得自己写）
+            "created_at": now,
+            "updated_at": now,
         }
 
     async def get_run(self, run_id) -> dict | None:
@@ -62,6 +66,24 @@ class InMemoryStateStore(StateStore):
         if status is not None:
             run["status"] = status
         run.update(fields)
+        run["updated_at"] = datetime.now(UTC).isoformat()
+
+    async def list_runs(
+        self, tenant_id, *, status=None, run_ids=None, limit=50, offset=0
+    ) -> list[dict]:
+        rows = [r for r in self._runs.values() if r.get("tenant_id") == tenant_id]
+        if status is not None:
+            rows = [r for r in rows if r.get("status") == status]
+        if run_ids is not None:
+            wanted = set(run_ids)
+            rows = [r for r in rows if r.get("run_id") in wanted]
+        rows.sort(key=lambda r: (r.get("created_at") or "", r["run_id"]), reverse=True)
+        return [dict(r) for r in rows[offset : offset + limit]]
+
+    async def list_attempts(self, run_id) -> list[dict]:
+        rows = [a for a in self._attempts.values() if a.get("run_id") == run_id]
+        rows.sort(key=lambda a: (a.get("node_id") or "", a.get("attempt") or 0))
+        return [dict(a) for a in rows]
 
     async def count_active_runs(self, tenant_id) -> int:
         return sum(

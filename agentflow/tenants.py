@@ -141,15 +141,149 @@ async def async_bootstrap_tenants(management, settings) -> int:
 
 
 def _default_db_ref(tenant_id: str, settings) -> dict:
-    """bootstrap 未指定 db_ref 时的默认租户库引用（§5.4 分级策略）。"""
+    """租户库引用默认策略（§5.4 分级策略）。
+
+    **两个后端都是「每租户一份」**：
+    - sqlite：``data/tenants/{tenant_id}.db``
+    - postgres：**同名实例上的独立 database**，命名 ``{基础库}-{tenant_id}``
+      （与 K8s namespace ``agentflow-{tenant}`` 同一套命名）
+
+    postgres 分支早期返回的是**共享 DSN**（所有租户指向同一个库）。后果不是"少建了个库"
+    这么简单：``workflows`` / ``mcp_servers`` / ``agent_configs`` 三张控制面表**没有
+    tenant_id 列**（设计上依赖"每租户一个库"的物理隔离），共享库下它们就成了跨租户共享 ——
+    实测用一个从未开通的租户 id 就能列出别人的 workflow。改为每租户独立库后，
+    这三张表天然落在各自的库里，物理隔离成立。
+
+    > ``isolation_level`` 不参与本函数：``strong``（"独立实例"）需要另配 DSN，
+    > 目前两种隔离都落在**同一个 PG 实例的不同 database** 上。真正的独立实例
+    > 请用 ``tenantctl provision --db-dsn`` 显式指定。
+    """
     from .config import postgres_dsn
 
     if settings.state_store == "postgres":
-        return {"backend": "postgres", "dsn": postgres_dsn(settings)}
+        base = postgres_dsn(settings)
+        return {"backend": "postgres", "dsn": dsn_with_db(base, tenant_db_name(base, tenant_id))}
     return {
         "backend": "sqlite",
         "path": str(Path(settings.state_db_path).parent / "tenants" / f"{tenant_id}.db"),
     }
+
+
+def db_name_of(dsn: str) -> str:
+    """取 DSN 里的库名（无则空串）。"""
+    from urllib.parse import urlsplit
+
+    return urlsplit(dsn).path.lstrip("/")
+
+
+def dsn_with_db(dsn: str, dbname: str) -> str:
+    """换库名。
+
+    **用 urlsplit/urlunsplit 而不是字符串拼接**：本仓的 DSN 把凭据放在 **query** 里
+    （``postgresql://host:5432/agentflow?user=…&password=…``）。早期用
+    ``prefix + "/" + name`` 把库名拼到了 query **之后**，得到一个畸形连接串 ——
+    实测报 ``password authentication failed``（整串被当作密码解析），
+    排查方向完全指错。urlunsplit 保证路径在 query 之前。
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    u = urlsplit(dsn)
+    return urlunsplit((u.scheme, u.netloc, "/" + dbname, u.query, u.fragment))
+
+
+def tenant_db_name(base_dsn: str, tenant_id: str) -> str:
+    """基础 DSN → 该租户的库名（``{基础库}-{tenant_id}``）。
+
+    PG 标识符上限 63 字节，超了直接报错而不是静默截断 —— 截断会让两个长租户名
+    撞到同一个库，又变回共享。
+    """
+    base_db = db_name_of(base_dsn)
+    name = f"{base_db}-{tenant_id}"
+    if len(name.encode()) > 63:
+        raise ValueError(
+            f"租户 {tenant_id!r} 派生的库名超过 PostgreSQL 63 字节上限：{name!r}"
+        )
+    return name
+
+
+async def ensure_tenant_database(db_ref: dict, settings) -> bool:
+    """确保 PG 租户库存在（不存在则 ``CREATE DATABASE``）。返回是否新建。
+
+    - 非 postgres / 目标是共享基础库（旧配置）→ 不做任何事，返回 False
+    - 连**基础库**做管理操作（目标库还不存在，连不上它）；``CREATE DATABASE``
+      不能在事务里跑，故用 autocommit
+    """
+    if db_ref.get("backend") != "postgres":
+        return False
+
+    from .config import postgres_dsn
+
+    dsn = db_ref["dsn"]
+    target = db_name_of(dsn)
+    base_dsn = postgres_dsn(settings)
+    base = db_name_of(base_dsn)
+    if not target or target == base:
+        return False  # 旧配置：指向共享基础库，无事可做
+
+    import psycopg
+    from psycopg import sql
+
+    admin_dsn = dsn_with_db(dsn, base)
+    conn = await psycopg.AsyncConnection.connect(admin_dsn, autocommit=True)
+    try:
+        cur = await conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (target,))
+        if await cur.fetchone():
+            return False
+        # 标识符不能参数化，用 Identifier 转义（库名含 '-' 等字符）。
+        # **必须显式 TEMPLATE template0**：默认模板 template1 **允许连接**，只要有人
+        # （哪怕是个忘了关的 psql）连着它，CREATE DATABASE 就会
+        # `ObjectInUse: source database "template1" is being accessed by other users` 失败。
+        # template0 从不接受连接，是脚本化建库的标准模板。
+        await conn.execute(
+            sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(sql.Identifier(target))
+        )
+        log.info("已创建租户库 %s", target)
+        return True
+    finally:
+        await conn.close()
+
+
+async def drop_tenant_database(db_ref: dict, settings) -> bool:
+    """删除 PG 租户库（deprovision 用）。返回是否真的删了。
+
+    **拒绝删基础库**：旧配置下所有租户的 db_ref 都指向共享基础库，
+    若无脑 DROP 会把管理库连同所有租户数据一起抹掉。
+    """
+    if db_ref.get("backend") != "postgres":
+        return False
+
+    from .config import postgres_dsn
+
+    dsn = db_ref["dsn"]
+    target = db_name_of(dsn)
+    base_dsn = postgres_dsn(settings)
+    base = db_name_of(base_dsn)
+    if not target or target == base:
+        log.warning("租户库指向共享基础库 %s，拒绝删除", base)
+        return False
+
+    import psycopg
+    from psycopg import sql
+
+    admin_dsn = dsn_with_db(dsn, base)
+    conn = await psycopg.AsyncConnection.connect(admin_dsn, autocommit=True)
+    try:
+        cur = await conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (target,))
+        if not await cur.fetchone():
+            return False
+        # WITH (FORCE) 踢掉残留连接（PG 13+）
+        await conn.execute(
+            sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(target))
+        )
+        log.info("已删除租户库 %s", target)
+        return True
+    finally:
+        await conn.close()
 
 
 def parse_db_ref(raw: str) -> dict:

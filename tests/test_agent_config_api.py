@@ -288,12 +288,14 @@ async def test_get_agents_reflects_override_and_custom(deps, monkeypatch) -> Non
     assert triage["description"] == "覆盖描述"
     custom = data[-1]
     assert custom["tools"] == []  # 自定义 agent 无 L1 函数工具（仅可绑 MCP）
-    assert set(custom) == {"name", "description", "tools", "stage"}
+    # B3 起 /agents 字段扩充（供 Agent 目录 Inspector）；断言必需键齐备而非精确集合
+    assert {"name", "description", "tools", "stage", "role", "local_tools"} <= set(custom)
 
 
 async def test_get_agents_without_resolver_stays_static_15(deps) -> None:
-    """store 空（未 init / 未 seed）→ GET /agents == 纯内置 15（既有 shape 不破）。"""
+    """store 空（未 init / 未 seed）→ GET /agents == 纯内置 15（名单与顺序不破）。"""
     async with _client() as client:
         data = (await client.get("/agents")).json()
     assert [a["name"] for a in data] == DIAGNOSE_AGENTS + FIX_AGENTS
-    assert all(set(a) == {"name", "description", "tools", "stage"} for a in data)
+    # B3 起字段扩充（供 Agent 目录 Inspector）；断言必需键齐备而非精确集合
+    assert all({"name", "description", "tools", "stage", "role"} <= set(a) for a in data)

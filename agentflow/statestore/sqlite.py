@@ -170,6 +170,50 @@ class SqliteStateStore(StateStore):
         )
         await self._c.commit()
 
+    async def list_runs(
+        self, tenant_id, *, status=None, run_ids=None, limit=50, offset=0
+    ) -> list[dict]:
+        where = ["tenant_id = ?"]
+        vals: list = [tenant_id]
+        if status is not None:
+            where.append("status = ?")
+            vals.append(status)
+        if run_ids is not None:
+            if not run_ids:
+                return []
+            where.append(f"run_id IN ({','.join('?' for _ in run_ids)})")
+            vals.extend(run_ids)
+        vals.extend([limit, offset])
+        cur = await self._c.execute(
+            f"SELECT * FROM runs WHERE {' AND '.join(where)}"
+            " ORDER BY created_at DESC, run_id DESC LIMIT ? OFFSET ?",
+            vals,
+        )
+        rows = await cur.fetchall()
+        out = []
+        for row in rows:
+            d = dict(row)
+            d["inputs"] = json.loads(d["inputs"]) if d.get("inputs") else {}
+            out.append(d)
+        return out
+
+    async def list_attempts(self, run_id) -> list[dict]:
+        cur = await self._c.execute(
+            "SELECT * FROM node_attempts WHERE run_id=? ORDER BY node_id, attempt",
+            (run_id,),
+        )
+        rows = await cur.fetchall()
+        out = []
+        for row in rows:
+            d = dict(row)
+            if isinstance(d.get("output"), str):
+                try:
+                    d["output"] = json.loads(d["output"])
+                except (TypeError, ValueError):
+                    pass
+            out.append(d)
+        return out
+
     async def count_active_runs(self, tenant_id) -> int:
         placeholders = ",".join("?" for _ in ACTIVE_RUN_STATUSES)
         cur = await self._c.execute(

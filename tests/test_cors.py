@@ -4,10 +4,26 @@
 CORSMiddleware 在 ASGI 层生效，与传输方式无关。
 """
 import httpx
+import pytest
 
+import agentflow.api.app as app_mod
+from agentflow.api.agent_store import AgentConfigStore
 from agentflow.api.app import app
+from agentflow.api.mcp_store import MCPStore
 
 FRONTEND_ORIGIN = "http://localhost:3000"
+
+
+@pytest.fixture(autouse=True)
+async def _sqlite_control_stores(tmp_path, monkeypatch):
+    """本文件用 ``/agents`` 当"简单 GET"探针，而 B3 起该端点要读控制面 store。
+
+    app.py 是在 **import 时**用当时 settings 构造模块全局 store 的 —— 本机 .env 若是
+    ``state_store=postgres``，那全局就是 Pg* 实现，测试里一碰就 ImportError（缺 psycopg）。
+    与 test_agents_api.py / test_agent_config_api.py 同款处理。
+    """
+    monkeypatch.setattr(app_mod, "agent_config_store", AgentConfigStore(tmp_path / "cfg.db"))
+    monkeypatch.setattr(app_mod, "mcp_store", MCPStore(tmp_path / "mcp.db"))
 
 
 def _client() -> httpx.AsyncClient:

@@ -182,6 +182,37 @@ class PostgresStateStore(StateStore):
         row = await cur.fetchone()
         return int(row[0])
 
+    async def list_runs(
+        self, tenant_id, *, status=None, run_ids=None, limit=50, offset=0
+    ) -> list[dict]:
+        where = ["tenant_id = %s"]
+        vals: list = [tenant_id]
+        if status is not None:
+            where.append("status = %s")
+            vals.append(status)
+        if run_ids is not None:
+            if not run_ids:
+                return []
+            where.append(f"run_id IN ({','.join('%s' for _ in run_ids)})")
+            vals.extend(run_ids)
+        vals.extend([limit, offset])
+        cur = await self._c.execute(
+            f"SELECT * FROM runs WHERE {' AND '.join(where)}"
+            " ORDER BY created_at DESC, run_id DESC LIMIT %s OFFSET %s",
+            vals,
+        )
+        rows = await cur.fetchall()
+        # inputs 为 jsonb，psycopg 已解析为 dict（与 get_run 同理，勿再 json.loads）
+        return [_row_to_dict(cur, r) for r in rows]
+
+    async def list_attempts(self, run_id) -> list[dict]:
+        cur = await self._c.execute(
+            "SELECT * FROM node_attempts WHERE run_id=%s ORDER BY node_id, attempt",
+            (run_id,),
+        )
+        rows = await cur.fetchall()
+        return [_row_to_dict(cur, r) for r in rows]
+
     async def cas_update_run_status(self, run_id, from_status, to_status) -> bool:
         cur = await self._c.execute(
             "UPDATE runs SET status=%s, updated_at=now() WHERE run_id=%s AND status=%s",

@@ -110,7 +110,7 @@ def tools_for_agent(agent_name):
 toolkit = build_toolkit(agent_name, use_mock=True, cmdb=..., datasource=..., sandbox_client=..., action_executor=...)
 
 # scopes.py:71 —— 组装 AgentScope Agent（system_prompt + model + toolkit + 权限上下文）
-agent = build_agent(agent_name, toolkit, model, max_iters=..., tenant_id="local")
+agent = build_agent(agent_name, toolkit, model, max_iters=..., tenant_id="otr")
 
 # scopes.py:93 —— 喂入输入，解析出严格 JSON（§7 输出契约）
 out = await run_agent(agent, input)
@@ -197,10 +197,11 @@ async def invoke() -> Any:
 
 分界线：**谁持有连接/传输层，谁就是重资产；谁只是引用拼装，谁就是轻壳**。
 
-- **数据源 adapter（重）**：`RealDataSourceAdapter.__init__`（`datasources.py:42`）构造时就建了一个**常驻 `httpx.AsyncClient`（连接池）**，所有工具（query_logs / query_metrics / check_infra / describe_pod / get_trace）复用它发 HTTP 到 ES/Prometheus——这也是脚本结尾要 `await ds.aclose()` 显式释放的原因。若每节点都新建 adapter：新 TCP 连接 + 重新握手、用完要逐个 aclose 否则连接泄漏、keep-alive 预热全浪费。
+- **MCP 客户端（重）**：`MCPClientManager` 持有的 `MCPClient` 是一条**常驻 MCP 会话**（Streamable HTTP），所有取数工具（`mcp__aiops-datasource__query_logs` 等）复用它。进程内**按 `(tenant, server_id)` 缓存**，正是为了不每节点重建：新连接 + 重新初始化会话、用完要逐个 close 否则泄漏、握手预热全浪费。
+  > 历史对照：改造前这个位置是 `RealDataSourceAdapter`（`agents/datasources.py`），持有一个常驻 `httpx.AsyncClient` 连接池。该文件已在 **v5.5 批3 删除**，取数全部改走 MCP —— 但"谁持有传输层谁就是重资产"这条判断**没有变**，只是持有者从 HTTP 连接池换成了 MCP 会话。
 - **model（重）**：`build_model()` 返回的 `OpenAIChatModel` 持有 DeepSeek 凭据 + LLM 传输层/连接 + AgentScope 用量统计/重试状态。重建 = 重新建连。
 - **Agent 壳（轻）**：`build_agent` 返回的 `Agent` 只是纯 Python 组合对象——`name` / `system_prompt` 字符串 + 对共享 `model` / `toolkit` 的**引用** + `ReActConfig` + 权限上下文。不持有任何 socket / 连接。
-- **Toolkit（轻）**：N 个 `FunctionTool`，内部是 `partial(getattr(datasource, ...))` 的轻闭包，真正干活时指向共享的 datasource。
+- **Toolkit（轻）**：N 个 `FunctionTool`，本地工具是 `partial(getattr(...))` 的轻闭包、MCP 工具是共享 `MCPClient` 的薄包装 —— 两者真正干活时都指向上面那个重资产。
 
 | 对象 | 持有什么 | 重建成本 |
 |---|---|---|
