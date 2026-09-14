@@ -445,6 +445,50 @@ with psycopg.connect('postgresql://…/postgres') as c:
 生产用 JWT 模式（`AGENTFLOW_JWT_SECRET` 非空）时租户来自签名 claim，不受影响。
 若仍想收紧成"未注册即拒绝"，改 `router._resolve_ref` 即可。
 
+### 6.11 ⚠ podman VM 时钟漂移 → 全链路时间戳偏移（**静默毁掉诊断**）
+
+> 2026-09-14 实测：VM 比宿主机慢 **整 1 小时**。这是**最难联想的坑**——没有任何报错，
+> 表现只是"查不到数据"。
+
+**成因**：minikube 跑在 podman machine 里（docker driver 用 podman socket），
+macOS 宿主休眠/唤醒后 VM 时钟可能不跟随，而 VM 内 `chronyd` 状态是 `active` 却
+`System clock synchronized: no`（看着正常，实际没同步）。
+
+**影响面（全链路）**：
+
+| 层 | 症状 |
+|---|---|
+| Prometheus | 所有样本时间戳落后 1 小时 → Grafana「最近 15 分钟」**全空**（但 instant 查询能查到，极易误判成"数据源坏了"） |
+| Elasticsearch | 日志 `app.@timestamp` 同样落后 → **诊断 agent 按窗口取数取不到故障日志** |
+| K8s | Pod 时间戳、事件时间全部偏移 |
+
+**症状之所以像"没问题"**：数据都在，只是**在错误的时刻**。Grafana 面板显示 No data，
+但直接 curl Prometheus 的 instant 接口能拿到值——因为它取的是"最后一个点"，不看窗口。
+
+**诊断（一条命令）**：
+
+```bash
+printf "  host: %s\n" "$(date -u '+%F %T')"
+printf "  vm  : %s\n" "$(podman machine ssh podman-machine-v5 'date -u "+%F %T"' | tr -d '\r')"
+```
+
+两者不一致就是它。
+
+**修复**：
+
+```bash
+podman machine ssh podman-machine-v5 "sudo date -s '$(date '+%Y-%m-%d %H:%M:%S')'"
+```
+
+> VM 的时区是 **UTC**（`timedatectl` 显示 `Time zone: n/a (UTC, +0000)`），但传本地时间
+> 字符串给 `date -s` 也能正确落位（实测同步后双方 `date -u` 一致）。同步完等 ~20s
+> 让 Prometheus 采到新样本。
+
+**预防**：宿主长休眠后、做 E2E 之前，先跑一次上面那条诊断。**别等"查不到数据"再回头找**
+——届时你会先怀疑数据源、查询语句、时间窗参数，最后才想到时钟。
+
+**与代码无关**：这是环境问题，仓库里没有任何东西能修它。
+
 ## 七、一键冒烟脚本
 
 ```bash
@@ -458,6 +502,17 @@ for p in 5173 8000 8300 5432 6379 19092; do
 done
 pgrep -f agentflow.worker >/dev/null || { echo "✗ Worker 未运行"; exit 1; }
 echo "✓ 依赖服务齐备"
+
+# 时钟一致性（§6.11）：VM 落后会让 Prometheus/ES 的时间戳整体偏移、
+# 窗口查询静默取不到数据。放在最前面，避免跑到最后才发现"全空"。
+if command -v podman >/dev/null; then
+  h=$(date -u +%s); v=$(podman machine ssh podman-machine-v5 'date -u +%s' 2>/dev/null | tr -d '\r')
+  if [ -n "$v" ]; then
+    d=$((h - v)); d=${d#-}
+    [ "$d" -gt 60 ] && { echo "✗ 时钟不一致：host 与 podman VM 相差 ${d}s（见 §6.11）"; exit 1; }
+    echo "✓ 时钟一致（偏差 ${d}s）"
+  fi
+fi
 
 curl -sf $B/health >/dev/null && echo "✓ API"
 curl -sf $B/workflows | grep -q '\[.\]' || { echo "✗ 库里没有 workflow"; exit 1; }
