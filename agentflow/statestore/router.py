@@ -24,7 +24,7 @@ from ..api.management_store import decrypt_db_ref
 from ..api.mcp_store import MCPStore, build_mcp_store
 from ..api.workflow_store import WorkflowStore, build_workflow_store
 from ..config import Settings
-from ..tenants import parse_db_ref
+from ..tenants import ensure_tenant_database, parse_db_ref
 from .base import StateStore
 from .memory import InMemoryStateStore
 from .postgres import PostgresStateStore
@@ -81,6 +81,9 @@ class TenantStoresRouter:
         db_ref = await self._resolve_ref(tenant_id)
         backend = db_ref.get("backend", "sqlite")
         if backend == "postgres":
+            # 租户库可能还没建（首次访问 / 未走过 provision）→ 先补建再连。
+            # 幂等：已存在时 ensure 直接返回 False，不产生额外 DDL。
+            await ensure_tenant_database(db_ref, self._settings)
             dsn = db_ref["dsn"]
             state = PostgresStateStore(dsn)
             workflow = build_workflow_store_at("postgres", dsn)
@@ -120,19 +123,18 @@ class TenantStoresRouter:
 
 
 def _default_db_ref(tenant_id: str, settings: Settings) -> dict:
-    """未注册租户的回退 db_ref（§5.4：sqlite 每租户文件 / postgres 共享 DSN / memory 共享）。
+    """未注册租户的回退 db_ref。
 
-    sqlite 路径跟随 ``settings.state_db_path``（测试 tmp 隔离；生产即配置的 data 目录）。"""
-    from ..config import postgres_dsn
-
-    if settings.state_store == "postgres":
-        return {"backend": "postgres", "dsn": postgres_dsn(settings)}
+    ``memory`` 是本模块独有的回退档（``tenants._default_db_ref`` 没有它，那是
+    给 bootstrap/provision 用的持久后端选择）；sqlite / postgres 一律转交共享实现，
+    保证「未注册租户的回退」与「provision 时写入的 db_ref」**用的是同一套规则** ——
+    早期两处各写一份，postgres 分支都返回共享 DSN，隔离就是从这里漏掉的。
+    """
     if settings.state_store == "memory":
         return {"backend": "memory"}
-    return {
-        "backend": "sqlite",
-        "path": str(Path(settings.state_db_path).parent / "tenants" / f"{tenant_id}.db"),
-    }
+    from ..tenants import _default_db_ref as _shared
+
+    return _shared(tenant_id, settings)
 
 
 def build_workflow_store_at(backend: str, dsn: str | None, settings: Settings | None = None):

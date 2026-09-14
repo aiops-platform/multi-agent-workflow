@@ -321,3 +321,81 @@ async def test_quota_lock_atomicity() -> None:
     exceeded = [r for r in results if isinstance(r, TenantQuotaExceeded)]
     assert len(ok) == 2  # 恰好配额数成功
     assert len(exceeded) == 6
+
+
+# ======================================================================
+# 每租户独立库（PG）：租户库名派生 + 建/删库的安全护栏
+# ======================================================================
+def test_pg_default_db_ref_is_per_tenant(monkeypatch) -> None:
+    """postgres 下默认 db_ref 必须是**每租户一个库**，不是共享 DSN。
+
+    早期两处 _default_db_ref 的 postgres 分支都直接返回 settings 的共享 DSN，
+    于是所有租户落进同一个库；而 workflows/mcp_servers/agent_configs 三张表
+    没有 tenant_id 列（设计上靠"每租户一库"物理隔离）→ 跨租户互相可见。
+    """
+    from agentflow.config import get_settings
+    from agentflow.tenants import _default_db_ref
+
+    s = get_settings()
+    monkeypatch.setattr(s, "state_store", "postgres")
+    monkeypatch.setattr(s, "postgres_dsn", "u:p@h:5432/agentflow")
+
+    a = _default_db_ref("team-a", s)
+    b = _default_db_ref("team-b", s)
+    assert a["backend"] == "postgres"
+    assert a["dsn"].endswith("/agentflow-team-a")
+    assert b["dsn"].endswith("/agentflow-team-b")
+    assert a["dsn"] != b["dsn"], "两个租户不能指向同一个库"
+
+
+def test_tenant_db_name_rejects_overlong(monkeypatch) -> None:
+    """库名超 PG 的 63 字节上限时报错，而不是截断 —— 截断会让两个租户撞进同一个库。"""
+    from agentflow.tenants import tenant_db_name
+
+    assert tenant_db_name("postgresql://u:p@h/db", "team-a") == "db-team-a"
+    # 边界：db- + 60 = 63 字节，正好卡在上限，允许
+    assert tenant_db_name("postgresql://u:p@h/db", "x" * 60) == "db-" + "x" * 60
+    with pytest.raises(ValueError, match="63"):
+        tenant_db_name("postgresql://u:p@h/db", "x" * 61)
+
+
+async def test_ensure_and_drop_refuse_shared_base(monkeypatch) -> None:
+    """指向**共享基础库**的 db_ref 一律拒绝：既不为它建库，也不删它。
+
+    旧配置（所有租户共享一个库）下若不设这道闸，deprovision 会把管理库连坐删掉。
+    """
+    from agentflow.config import get_settings
+    from agentflow.tenants import drop_tenant_database, ensure_tenant_database
+
+    s = get_settings()
+    monkeypatch.setattr(s, "postgres_dsn", "u:p@h:5432/agentflow")
+
+    shared = {"backend": "postgres", "dsn": "postgresql://u:p@h:5432/agentflow"}
+    # 不连库就返回 False —— 说明根本没走到 CREATE/DROP
+    assert await ensure_tenant_database(shared, s) is False
+    assert await drop_tenant_database(shared, s) is False
+
+    # 非 postgres 直接跳过
+    assert await ensure_tenant_database({"backend": "sqlite", "path": "/x"}, s) is False
+    assert await drop_tenant_database({"backend": "sqlite", "path": "/x"}, s) is False
+
+
+async def test_router_fallback_pg_is_per_tenant(monkeypatch) -> None:
+    """未注册租户的 PG 回退也走「每租户一库」，与 provision 写入的规则一致。
+
+    这是隔离洞的另一半：router._resolve_ref 曾经自己写一份、返回共享 DSN，
+    于是一个**从未开通**的租户 id 也能读到别人的数据。
+    """
+    from agentflow.config import get_settings
+    from agentflow.statestore.router import _default_db_ref as router_default
+
+    s = get_settings()
+    monkeypatch.setattr(s, "state_store", "postgres")
+    monkeypatch.setattr(s, "postgres_dsn", "u:p@h:5432/agentflow")
+
+    ref = router_default("walk-in", s)
+    assert ref["dsn"].endswith("/agentflow-walk-in")
+
+    # memory 是 router 独有的回退档，仍是 memory
+    monkeypatch.setattr(s, "state_store", "memory")
+    assert router_default("walk-in", s) == {"backend": "memory"}

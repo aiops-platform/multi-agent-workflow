@@ -28,6 +28,11 @@ from .api.management_store import (
 )
 from .config import get_settings
 from .statestore.router import TenantStoresRouter
+from .tenants import (
+    _default_db_ref,
+    drop_tenant_database,
+    ensure_tenant_database,
+)
 
 log = logging.getLogger("agentflow.tenantctl")
 
@@ -35,16 +40,8 @@ log = logging.getLogger("agentflow.tenantctl")
 SCHEMA_VERSION = "2026-09-09.1"
 
 
-def _default_db_ref(tenant_id: str, settings) -> dict:
-    """租户库引用默认策略（§5.4：sqlite 每租户文件 / postgres 共享 DSN）。"""
-    from .config import postgres_dsn
-
-    if settings.state_store == "postgres":
-        return {"backend": "postgres", "dsn": postgres_dsn(settings)}
-    return {
-        "backend": "sqlite",
-        "path": str(Path(settings.state_db_path).parent / "tenants" / f"{tenant_id}.db"),
-    }
+# 租户库引用的默认策略统一在 tenants._default_db_ref（router 回退路径与 provision
+# 必须用同一套规则 —— 早期两处各写一份，postgres 分支都返回共享 DSN，隔离就是从那漏的）。
 
 
 # ----------------------------------------------------------------------
@@ -139,7 +136,30 @@ async def provision(args) -> int:
         if args.branch and args.branch != "main" and isolation != "strong":
             print("[tenantctl] 治理规则 §9.2(4)：仅 strong 隔离租户允许专属分支，standard 固定 main")
             return 2
-        db_ref = _default_db_ref(args.tenant, settings)
+        # --db-dsn：strong 租户指向独立实例；不传则每租户一个 database（同实例）
+        if getattr(args, "db_dsn", None):
+            db_ref = {"backend": "postgres", "dsn": args.db_dsn}
+        else:
+            db_ref = _default_db_ref(args.tenant, settings)
+
+        # 重新绑定已有租户时把旧库说清楚：数据不会自动搬，旧库仍留在原处
+        if existing is not None:
+            try:
+                old = json.loads(decrypt(existing["db_ref_enc"], settings))
+            except Exception:  # noqa: BLE001 —— 旧值解不开（换过 SECRET_KEY）不影响重绑
+                old = None
+            if old and old.get("dsn") and old["dsn"] != db_ref.get("dsn"):
+                print(
+                    f"[tenantctl] ⚠ 租户 {args.tenant} 的库引用已变更：\n"
+                    f"            旧 → {old['dsn']}\n"
+                    f"            新 → {db_ref.get('dsn')}\n"
+                    f"            旧库数据**不会**自动搬迁，仍保留在原处。"
+                )
+
+        # 建库（幂等）：postgres 下每租户一个独立 database
+        if await ensure_tenant_database(db_ref, settings):
+            print(f"[tenantctl] 🆕 已创建租户库 {db_ref['dsn']}")
+
         await mgmt.upsert_tenant({
             "tenant_id": args.tenant,
             "status": "active",
@@ -164,7 +184,8 @@ async def provision(args) -> int:
             ensure_namespace(args.namespace or f"agentflow-{args.tenant}")
         print(
             f"[tenantctl] ✅ provision {args.tenant}: isolation={isolation} "
-            f"db={db_ref['backend']} namespace={args.namespace or f'agentflow-{args.tenant}'} "
+            f"db={db_ref.get('dsn') or db_ref.get('path')} "
+            f"namespace={args.namespace or f'agentflow-{args.tenant}'} "
             f"schema={SCHEMA_VERSION}"
         )
         return 0
@@ -229,8 +250,13 @@ async def migrate(args) -> int:
 
 
 async def deprovision(args) -> int:
-    """注销：停用（status=deleted）；--confirm-delete 才删数据（sqlite 删文件，
-    PG 打印 DROP 提示）。topics/namespace 清理由运维按 §10 逆向 saga 执行。"""
+    """注销：停用（status=deleted）；--confirm-delete 才删数据。
+
+    - sqlite：删租户库文件
+    - postgres：``DROP DATABASE ... WITH (FORCE)``（每租户一个库，见 ``tenants._default_db_ref``）
+      —— 指向共享基础库的**旧配置会被拒绝**，避免把管理库连坐删掉。
+    topics/namespace 清理由运维按 §10 逆向 saga 执行。
+    """
     settings = get_settings()
     mgmt = build_management_store(settings)
     await mgmt.connect()
@@ -246,8 +272,10 @@ async def deprovision(args) -> int:
             if db_ref.get("backend") == "sqlite":
                 Path(db_ref["path"]).unlink(missing_ok=True)
                 print(f"[tenantctl] 🗑  已删除租户库文件 {db_ref['path']}")
+            elif await drop_tenant_database(db_ref, settings):
+                print(f"[tenantctl] 🗑  已删除租户库 {db_ref['dsn']}")
             else:
-                print(f"[tenantctl] ⚠ PG 租户库需手工 DROP：{db_ref['dsn']}")
+                print(f"[tenantctl] ⚠ 未删除租户库（指向共享基础库或不存在）：{db_ref.get('dsn')}")
         return 0
     finally:
         await mgmt.close()
@@ -265,6 +293,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("provision", help="开通租户（幂等）")
     p.add_argument("tenant")
+    p.add_argument(
+        "--db-dsn",
+        default=None,
+        help="指定租户库 DSN（strong 隔离指向独立实例时用）。"
+        "不传则在同一实例上建独立 database：{基础库}-{tenant}",
+    )
     p.add_argument("--isolation", choices=["strong", "standard"], default=None)
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--quota", type=int, default=10, help="max_concurrent_runs")
