@@ -180,7 +180,7 @@ flowchart LR
         T1["query_logs / get_trace<br/>（时间区间必填）"]
         T2["query_metrics<br/>领域语义，非 PromQL"]
         T3["check_infra / describe_pod<br/>K8s 当前状态"]
-        T4["get_service_topology / locate_repo<br/>CMDB：静态服务目录 + 依赖拓扑"]
+        T4["get_service_topology / locate_repo / query_entity_graph / infer_candidate_services<br/>CMDB：实体图谱（cmdb-entities.json）"]
         PMAP["语义映射住在这里<br/>未知 metric → 报错，不兜底"]
         T2 --- PMAP
     end
@@ -222,12 +222,21 @@ flowchart LR
 | `query_metrics` | `start_time`/`end_time` 必填、`step_seconds` | `service` 必填、`metric` 必填（5 选 1） | Prometheus `/api/v1/query_range` |
 | `check_infra` | **无** | `namespace`、`pod`(可空=列全部) | `kubectl get pods -o json` |
 | `describe_pod` | **无** | `namespace`、`pod` 必填 | `kubectl describe pod` |
-| `get_service_topology` | **无**（静态目录） | `service` 必填、`hops`（默认 2） | 内置 CMDB 目录 + 依赖图 |
-| `locate_repo` | **无**（静态目录） | `service` 必填 | 内置 CMDB 目录 |
+| `get_service_topology` | **无**（静态图谱） | `service` 必填、`hops`（默认 2） | CMDB 实体图谱 `calls` 子图 |
+| `locate_repo` | **无**（静态图谱） | `service` 必填 | CMDB 实体图谱 |
+| `query_entity_graph` | **无**（静态图谱） | `node_types`/`portfolios`/`key_attributes`/`edge_types`、`node_id`+`hops` | CMDB 实体图谱（全 11 类边） |
+| `infer_candidate_services` | **无**（静态图谱） | `problem` 必填、`services`、`namespaces`、`max_hops`、`limit` | CMDB 实体图谱 + 推断 |
 
-> 末四个查的是**当前状态 / 静态目录**，时间维度不适用——这是设计而非疏漏。
-> 其中 CMDB 两个工具查的是「谁调谁、归属哪个团队/仓库」这类**静态服务目录**，
+> 末六个查的是**当前状态 / 静态图谱**，时间维度不适用——这是设计而非疏漏。
+> 其中 CMDB 四个工具查的是「谁调谁、归属哪个业务域/仓库、有哪些事件」这类
+> **静态实体图谱**（2026-09-15 起由 `cmdb-entities.json` 承载，见 `docs/cmdb-entities.md`），
 > 与前三者的**运行时观测数据**性质不同，但同样属于"取数"——故并入同一 server。
+
+**`query_entity_graph` 与 `get_service_topology` 在 2 跳以上给出不同结果，这是故意的。**
+前者跨全部 11 类边、聚焦时按**无向邻域**展开（因为 `portfolio_link` 等边没有方向），
+用于**探索结构**；后者只走 `calls` 一种边、方向**相对起点**定义，把"上游的其他下游"
+（兄弟节点）排除在外，用于判断**爆炸半径 / 根因**。两者在 1 跳上一致，有测试钉住
+这个包含关系（`test_focus_is_superset_of_topology_beyond_one_hop`）。
 
 **返回契约**：`query_metrics` 返回窗口内聚合 `value`（**峰值**，诊断关心"是否打满"
 而非均值）与 `min`/`max`/`avg`/`last` + 降采样 `series` + **回显 `window`**
@@ -918,4 +927,5 @@ T3+ 半自动）的唯一依据 —— 只给工具名推不出来。
 | v5.5.1 | 2026-09-11 | 原稿 §8 重构：设计局限与实施债拆分，实施债移入 `docs/TODO.md` |
 | v5.5.2 | 2026-09-11 | CMDB 并入数据面：新增 `get_service_topology` / `locate_repo` |
 | v5.6.1 | 2026-09-14 | **控制面补齐 + 租户库物理隔离修复**（见 §7.3）：① PG 模式 `provision` 真的建独立库 `agentflow-{tenant}` —— 修掉三张无 tenant_id 列的控制面表跨租户可见（实测未开通租户能列别人的 workflow）；② 工单成为一等实体（`ticket_store` + 4 端点），并纳入 `TenantStores` 路由；③ `GET /runs` 列表 + run 详情补 inputs/时间戳/节点 error·耗时·重试；④ `/agents` 富化（local_tools 带 level/needs_approval、mcp_tools、bound_servers）+ `GET /agents/{name}` + `GET /agents/stats`。均经真实 PG+Kafka 端到端验证（15 节点全绿）。未实施部分见 `docs/TODO.md` §4/§5 |
+| v5.6.2 | 2026-09-15 | **CMDB 实体图谱化**（数据面，`aiops-mcp-servers`）：`cmdb-entities.json` 成为 CMDB 唯一载体，12 类节点 / 11 类边（含本地新增 `calls`）/ 4 个筛选维度全部按 ontology 建模；新增 `query_entity_graph` 与 `infer_candidate_services`（工具 7→9）；事件走独立的可选覆盖层文件。**对外契约零改动**——`get_service_topology` / `locate_repo` 改动前后输出逐字节相同，`test_cmdb_backend.py` 零改动通过。**数据本身仍是 mock**（10 服务），本次换的是载体不是数据源，见 `docs/TODO.md` §9 |
 | **v5.6** | 2026-09-11 | **编排层 × 数据面合并版**：把 design-v5.4（编排层）与 design-v5.5（数据面）全量并入单一文档，**取代二者**；新增 §1.3 状态总览与 §1.4 旧章节号映射、§2 系统全景图、**§5 两层接缝**（新写，含 4 项开放问题）、§7 实施状态分区。数据面内容与结论**未改动**，仅重编号；编排层保持 design-only 并汇总代码级核实缺口（§4.9）。未实施部分登记于 `docs/TODO.md` §4（2026-09-11 按优先级重排后编号） |

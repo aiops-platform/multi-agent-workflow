@@ -309,7 +309,7 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 |---|---|---|
 | **Agent 配置可配置化**（v1.12 主体完成） | **tools 可见性 / 超时 / 限流**尚未纳入 DB 配置（仍硬编码在 `TOOL_REGISTRY` 的 `ToolSpec.agents`）；**按租户覆盖模型参数**（model / max_iters / 是否真实 LLM）未做 | `agents/tools.py`、`agents/registry.py`、配置加载层 |
 | **真实 node_runner 接入 executor**（`383b6b7` + v5.3 批C 完成） | **L2 沙箱工具接入真实 run**——`SandboxClient` 已可用，但 runner 在真实诊断链路中尚未调用 | `agents/runner.py`、`sandbox/orchestrator.py`、`workflows/*.yaml` |
-| **CMDB 生产化**（`b25dc4b` + `9b37cbe` 完成） | 数据仍是 mock：替换 `backends/cmdb.py` 的 `_SERVICES` / `_DEPENDS_ON` 为真实查询；<br>（可选）拓扑加显式环检测告警——当前 `direction=both` 能反映环但**不告警** | `aiops-datasource-mcp-server/backends/cmdb.py` |
+| **CMDB 生产化**（`b25dc4b` + `9b37cbe` + 实体图谱化完成） | ⚠️ **换了载体 ≠ 换了数据源**：`_SERVICES` / `_DEPENDS_ON` 字面量已删除，但实体文件里的 **10 个服务 / 13 条边仍是种子数据**——仍需接真实 CMDB 同步（文件载体、schema 校验、引用完整性、热重载都已就位，缺的只是数据来源）；<br>**两处失真由种子派生而来，录入真实数据时应一并纠正**：① Portfolio 由 `namespace` 派生——namespace 是 k8s 部署分组不是业务域，`common` 是装着两个不同 owner 服务的杂物筐；② `tier1` 标签由 `criticality==critical` 派生；<br>**Event 路径空转**：Incident / Change 节点当前为空（覆盖层机制已通，缺数据），故 `infer_candidate_services` 恒 `degraded=true`，「问题 → 事件 → 应用」这条路径尚未在真实数据上验证过；<br>（可选）拓扑加显式环检测告警——当前 `direction=both` 能反映环但**不告警**（图谱化后实体文件允许含环，此风险未变） | `aiops-datasource-mcp-server/src/.../data/cmdb-entities.json`、`docs/cmdb-entities.md` §5 |
 
 ---
 
