@@ -540,6 +540,11 @@ LLM 只在这个短名单上做判断。**这是设计能扩展的前提**，也
 {
   "intent": "fault | change | inquiry",
   "abstractions": ["打印工单", "工单管理"],
+  "matched_domains": [
+    { "type": "journey", "name": "customer-server-journey",
+      "display_name": "Customer Server Journey", "app_count": 27 }
+  ],
+  "ambiguous": false,
   "candidate_services": [
     { "service": "ticket-service",
       "confidence": "high",
@@ -548,14 +553,34 @@ LLM 只在这个短名单上做判断。**这是设计能扩展的前提**，也
       "hit_paths": 2,
       "reasons": ["journey「售后工单」命中 → 下钻",
                   "portfolio「工单打印」命中 → 下钻",
-                  "2 条独立路径交叉命中"]
+                  "2 条独立路径交叉命中"],
+      "business_paths": [
+        { "enterprise": "OTR", "journey": "Customer Server Journey",
+          "portfolio": "Work Order", "domain": null }
+      ],
+      "in_domain": true,
+      "evidence_source": "graph_match"
     }
   ],
   "primary_service": "ticket-service",
   "expand_search": false,
+  "insufficient": false,
   "summary": "..."
 }
 ```
+
+> **2026-09-17 补**：`matched_domains` / `ambiguous` / `business_paths` / `in_domain` /
+> `evidence_source` 五个字段是这次加的，起因见下面两段。
+>
+> **同名跨域**：实测 `VLMS` 同时属于 Work Order / Handover / Workshop（分属两个 journey），
+> 对「VLMS 打不开」返回的三个候选**同分、同层、reasons 一字不差**——调用方只能看名字后缀猜。
+> 把业务域路径放进输出，歧义才是**可见**的。`in_domain` 的 `null`（无域线索）与 `false`
+> （确实不在域内）**语义不同**，不能合。
+>
+> **伪归因**：`evidence_source` 针对的是一次真实事故——工单里没有服务名
+> （`bug_report.cmdb_ci` 是空的），scope 却写「症状服务 order-service **由 ticket 明确给出**」，
+> 实际是从上游 triage 的**散文摘要**里读到的。`upstream_summary` 不是不能用，
+> 是**必须如实标出来**；把它写成 `ticket_*` 会让下游把未经验证的假设当成已证实的事实。
 
 **`confidence` 与 `impact` 保持两个独立的轴**（沿用上一轮的设计）：前者是"它有关的证据
 有多强"，后者是"如果有关影响多大"。把 `tier1` 折进置信度会让一个仅凭拓扑相邻的候选

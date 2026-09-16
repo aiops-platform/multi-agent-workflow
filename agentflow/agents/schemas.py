@@ -39,6 +39,21 @@ TraceEvidenceSchema = {
     "required": ["failing_service", "summary"],
 }
 
+#: 候选的证据**来源**。加这个字段的直接起因是一次真实的伪归因：
+#: 工单里明明没有服务名（`bug_report.cmdb_ci` 是空的），scope 却写「症状服务 order-service
+#: **由 ticket 明确给出**」——它其实是从上游 triage 的**散文摘要**里读到的。
+#: 来源不明会让下游拿着一个未经验证的假设继续跑，而且说得像已证实的事实。
+#:
+#: `upstream_summary` 不是"不能用"，是**必须如实标出来**：它是弱证据，
+#: 与"工单字段里白纸黑字写着"完全不是一回事。
+CANDIDATE_EVIDENCE_SOURCES = [
+    "ticket_cmdb_ci",     # 工单 bug_report.cmdb_ci.name 明确给出
+    "ticket_text",        # 工单正文里出现的服务名
+    "graph_match",        # CMDB 图匹配（业务词命中 / app 关键词命中）
+    "topology",           # 症状服务的依赖邻居（爆炸半径 / 上游根因）
+    "upstream_summary",   # 上游 agent 的摘要里提到——**弱证据，不是工单给的**
+]
+
 CandidateServicesSchema = {
     "type": "object",
     "properties": {
@@ -46,6 +61,24 @@ CandidateServicesSchema = {
         "intent": {"enum": ["fault", "change", "inquiry"]},
         # 高层抽象：把具体现象抬到业务概念（"打印结账单没反应" → ["打印结账单", "工单处理"]）
         "abstractions": {"type": "array", "items": {"type": "string"}},
+        # **输入文本命中到的业务域**（原样取自 infer_candidate_services 的 matched_domains）。
+        # 空数组 = 输入里没有业务域线索——**如实返回空，不要编一个**。
+        "matched_domains": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {"enum": ["enterprise", "journey", "portfolio", "domain"]},
+                    "name": {"type": "string"},
+                    "display_name": {"type": ["string", "null"]},
+                    "app_count": {"type": "number"},
+                },
+                "required": ["type", "name"],
+            },
+        },
+        # 头部候选**同分却分属不同业务域** → true。
+        # 此时不要替用户挑一个：`insufficient` 置 true，并在 summary 里请他指明属于哪个业务域。
+        "ambiguous": {"type": "boolean"},
         "candidate_services": {
             "type": "array",
             "items": {
@@ -59,8 +92,28 @@ CandidateServicesSchema = {
                     "matched_layers": {"type": "array", "items": {"type": "string"}},
                     "hit_paths": {"type": "number"},
                     "reasons": {"type": "array", "items": {"type": "string"}},
+                    # 业务域路径（原样取自工具的 business_paths）。同名应用跨业务域时，
+                    # **这是唯一能区分候选的依据**——不要自己改写或省略。
+                    "business_paths": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "enterprise": {"type": ["string", "null"]},
+                                "journey": {"type": ["string", "null"]},
+                                "portfolio": {"type": ["string", "null"]},
+                                "domain": {"type": ["string", "null"]},
+                            },
+                        },
+                    },
+                    # 在不在 matched_domains 的域内。
+                    # **null ≠ false**：前者是"输入里没有域线索，无从判断"，后者是"确实不在"。
+                    "in_domain": {"type": ["boolean", "null"]},
+                    # 这条候选的证据从哪来。**必须如实标注**——把 upstream_summary
+                    # 写成 ticket_* 就是伪造证据来源。
+                    "evidence_source": {"enum": CANDIDATE_EVIDENCE_SOURCES},
                 },
-                "required": ["service", "confidence", "reasons"],
+                "required": ["service", "confidence", "reasons", "evidence_source"],
             },
         },
         # 最高置信的那个（取数节点据此决定查几个）
@@ -68,7 +121,8 @@ CandidateServicesSchema = {
         # 低置信 → true：把检索面放大到 top-N + 拓扑邻居
         "expand_search": {"type": "boolean"},
         # 信息不足以支撑后续推导 → true。**此时 candidate_services 应为空**，
-        # 并把缺什么写进 summary——不要硬凑一个服务出来（design-v5.7 §3.6）
+        # 并把缺什么写进 summary——不要硬凑一个服务出来（design-v5.7 §3.6）。
+        # `ambiguous: true` 是它的一个具体触发条件。
         "insufficient": {"type": "boolean"},
         "summary": {"type": "string"},
     },
