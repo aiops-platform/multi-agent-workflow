@@ -36,13 +36,14 @@ async def _sqlite_control_stores(tmp_path, monkeypatch):
     monkeypatch.setattr(app_mod, "_agent_config_resolver", None)
 
 
-async def test_agents_returns_all_15_in_registry_order() -> None:
+async def test_agents_returns_all_in_registry_order() -> None:
     async with _client() as client:
         resp = await client.get("/agents")
     assert resp.status_code == 200
     data = resp.json()
     assert isinstance(data, list)
-    assert len(data) == 15
+    # 数从注册表派生，不硬编码（见 test_agent_store 里的同类说明）
+    assert len(data) == len(DIAGNOSE_AGENTS) + len(FIX_AGENTS)
     assert [a["name"] for a in data] == DIAGNOSE_AGENTS + FIX_AGENTS
 
 

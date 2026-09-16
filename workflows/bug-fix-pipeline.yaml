@@ -22,24 +22,56 @@ nodes:
     params: { bug: "$.inputs.bug_report" }
     on_failure: abort
 
+  # ===== 定位问题服务（design-v5.7 §3）=====
+  # 取数之前必须先知道"查哪个服务"。**bug_report 必须单独传**——triage 的输出 schema
+  # 只有 {symptom_type, severity, summary}，`cmdb_ci.name` 在 triage 之后就丢了。
+  # 注：本 pipeline 无时间窗（早于 v5.5 的窗口要求），故 scope 也不传 start/end。
+  scope:
+    agent: service-scoper
+    join: all
+    required_edges: [triage]
+    params:
+      bug: "$.nodes.triage.output.summary"
+      bug_report: "$.inputs.bug_report"
+    on_failure: abort
+
+  # ⚠️ 四个取数节点：`join: all` + `required_edges: [triage, scope]`。
+  # 默认 `join: any` 会让它们在 triage 一完成就调度——此时 scope 还没跑，
+  # `candidate_services` 是 None（executor/dag_executor.py:259）。
   logs:
     agent: log-analyst
-    params: { bug: "$.nodes.triage.output.summary" }
+    join: all
+    required_edges: [triage, scope]
+    params:
+      bug: "$.nodes.triage.output.summary"
+      services: "$.nodes.scope.output.candidate_services"
     on_failure: continue
 
   trace:
     agent: trace-analyst
-    params: { bug: "$.nodes.triage.output.summary" }
+    join: all
+    required_edges: [triage, scope]
+    params:
+      bug: "$.nodes.triage.output.summary"
+      services: "$.nodes.scope.output.candidate_services"
     on_failure: abort
 
   metrics:
     agent: metrics-analyst
-    params: { bug: "$.nodes.triage.output.summary" }
+    join: all
+    required_edges: [triage, scope]
+    params:
+      bug: "$.nodes.triage.output.summary"
+      services: "$.nodes.scope.output.candidate_services"
     on_failure: continue
 
   infra:
     agent: infra-locator
-    params: { bug: "$.nodes.triage.output.summary" }
+    join: all
+    required_edges: [triage, scope]
+    params:
+      bug: "$.nodes.triage.output.summary"
+      services: "$.nodes.scope.output.candidate_services"
     on_failure: continue
 
   locate:
@@ -63,6 +95,8 @@ nodes:
       infra: "$.nodes.infra.output.summary"
       code: "$.nodes.locate.output.summary"
       know: "$.nodes.know.output.summary"
+      # design-v5.7 §6：scope 的定位与 trace 的 failing_service 一起交给根因节点交叉判断
+      scope_primary: "$.nodes.scope.output.primary_service"
     on_failure: abort
 
   plan:
@@ -142,10 +176,17 @@ nodes:
 # ===== 边定义（when 条件边 + skip 传播）=====
 edges:
   # 诊断链
+  - { from: triage, to: scope }
+  # 四个取数节点各有两条入边（triage + scope）：`_check_join_consistency`
+  # （core/dag.py:212）要求 required_edges 必须是**直接**上游，传递上游不算。
   - { from: triage, to: logs }
   - { from: triage, to: trace }
   - { from: triage, to: metrics }
   - { from: triage, to: infra }
+  - { from: scope, to: logs }
+  - { from: scope, to: trace }
+  - { from: scope, to: metrics }
+  - { from: scope, to: infra }
   - { from: triage, to: locate }
   - { from: triage, to: know }
   - { from: trace, to: locate }

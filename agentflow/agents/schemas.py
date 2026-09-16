@@ -39,6 +39,42 @@ TraceEvidenceSchema = {
     "required": ["failing_service", "summary"],
 }
 
+CandidateServicesSchema = {
+    "type": "object",
+    "properties": {
+        # 问题类型——决定"找什么"：故障处置找异常服务、变更升级找影响范围
+        "intent": {"enum": ["fault", "change", "inquiry"]},
+        # 高层抽象：把具体现象抬到业务概念（"打印结账单没反应" → ["打印结账单", "工单处理"]）
+        "abstractions": {"type": "array", "items": {"type": "string"}},
+        "candidate_services": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "service": {"type": "string"},
+                    "confidence": {"enum": ["high", "medium", "low"]},
+                    "impact": {"enum": ["high", "medium", "low"]},
+                    # 命中的层次（app / domain / portfolio / journey / enterprise）与
+                    # 独立路径数——分层匹配的产物，也是 confidence 的可核对依据
+                    "matched_layers": {"type": "array", "items": {"type": "string"}},
+                    "hit_paths": {"type": "number"},
+                    "reasons": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["service", "confidence", "reasons"],
+            },
+        },
+        # 最高置信的那个（取数节点据此决定查几个）
+        "primary_service": {"type": "string"},
+        # 低置信 → true：把检索面放大到 top-N + 拓扑邻居
+        "expand_search": {"type": "boolean"},
+        # 信息不足以支撑后续推导 → true。**此时 candidate_services 应为空**，
+        # 并把缺什么写进 summary——不要硬凑一个服务出来（design-v5.7 §3.6）
+        "insufficient": {"type": "boolean"},
+        "summary": {"type": "string"},
+    },
+    "required": ["intent", "candidate_services", "summary"],
+}
+
 MetricsEvidenceSchema = {
     "type": "object",
     "properties": {

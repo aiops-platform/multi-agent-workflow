@@ -152,9 +152,14 @@ async def test_delete_returns_hit() -> None:
     await store.close()
 
 
-async def test_seed_empty_table_writes_15_builtins() -> None:
+async def test_seed_empty_table_writes_all_builtins() -> None:
+    """空表 seed → 内置 agent 全量落库。
+
+    **断言数从注册表派生**（`len(BUILTIN_15)`），不硬编码——否则每加一个 agent 都要
+    回来改一遍数字，改着改着就会有人把断言删掉，这个名字带「15」的测试就是前车之鉴。
+    """
     store = AgentConfigStore(":memory:")
-    assert await seed_builtin_agent_configs(store) == 15
+    assert await seed_builtin_agent_configs(store) == len(BUILTIN_15)
     rows = await store.list()
     assert {r["name"] for r in rows} == set(BUILTIN_15)
     by_name = {r["name"]: r for r in rows}
@@ -182,9 +187,9 @@ async def test_seed_non_empty_only_custom_no_builtin_skips() -> None:
 
 
 async def test_seed_empty_then_idempotent() -> None:
-    """先 seed（空表 15 条，默认全物化）再 seed → 第二次 0。"""
+    """先 seed（空表全量落库，默认全物化）再 seed → 第二次 0。"""
     store = AgentConfigStore(":memory:")
-    assert await seed_builtin_agent_configs(store) == 15
+    assert await seed_builtin_agent_configs(store) == len(BUILTIN_15)
     assert await seed_builtin_agent_configs(store) == 0
     await store.close()
 

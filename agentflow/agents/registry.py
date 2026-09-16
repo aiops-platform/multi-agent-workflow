@@ -24,6 +24,7 @@ class AgentSpec:
 # 诊断侧（只读，全部 L1）
 DIAGNOSE_AGENTS = [
     "triage",
+    "service-scoper",
     "log-analyst",
     "trace-analyst",
     "metrics-analyst",
@@ -46,6 +47,7 @@ FIX_AGENTS = [
 # 一句话职责描述（依据 prompts.py SYSTEM_PROMPTS 提炼，供 API /agents 列表展示）
 AGENT_DESCRIPTIONS: dict[str, str] = {
     "triage": "对 bug ticket 做症状分类（hang/crash/slow/degraded）",
+    "service-scoper": "由 ticket 定位相关服务（关键词分层匹配 + 业务域下钻 + 拓扑扩展），给出带置信度的候选集",
     "log-analyst": "分析日志定位异常类型",
     "trace-analyst": "分析 trace 重建调用链，定位故障 span 与失败服务",
     "metrics-analyst": "分析 Prometheus 指标定位异常（CPU/内存/磁盘/延迟/错误率）",
@@ -65,6 +67,9 @@ AGENT_DESCRIPTIONS: dict[str, str] = {
 # 流水线阶段（供 API 控制面 /agents 前端舰队分组展示：detect→diagnose→fix→verify→deliver→learn）
 AGENT_STAGES: dict[str, str] = {
     "triage": "detect",
+    # scope 在 triage 之后、取数之前——它定的「查哪个服务」是后续所有取数的前提。
+    # 归 detect 段而非 diagnose：它不判定根因，只给候选集。
+    "service-scoper": "detect",
     "log-analyst": "detect",
     "trace-analyst": "detect",
     "metrics-analyst": "detect",

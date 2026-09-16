@@ -283,7 +283,8 @@ async def test_get_agents_reflects_override_and_custom(deps, monkeypatch) -> Non
     async with _client() as client:
         data = (await client.get("/agents")).json()
     assert [a["name"] for a in data] == DIAGNOSE_AGENTS + FIX_AGENTS + ["custom-x"]
-    assert len(data) == 16
+    # 数从注册表派生，不硬编码（否则每加一个内置 agent 都要回来改数字）
+    assert len(data) == len(DIAGNOSE_AGENTS) + len(FIX_AGENTS) + 1
     triage = next(a for a in data if a["name"] == "triage")
     assert triage["description"] == "覆盖描述"
     custom = data[-1]
@@ -292,8 +293,8 @@ async def test_get_agents_reflects_override_and_custom(deps, monkeypatch) -> Non
     assert {"name", "description", "tools", "stage", "role", "local_tools"} <= set(custom)
 
 
-async def test_get_agents_without_resolver_stays_static_15(deps) -> None:
-    """store 空（未 init / 未 seed）→ GET /agents == 纯内置 15（名单与顺序不破）。"""
+async def test_get_agents_without_resolver_stays_static_builtins(deps) -> None:
+    """store 空（未 init / 未 seed）→ GET /agents == 纯内置全量（名单与顺序不破）。"""
     async with _client() as client:
         data = (await client.get("/agents")).json()
     assert [a["name"] for a in data] == DIAGNOSE_AGENTS + FIX_AGENTS

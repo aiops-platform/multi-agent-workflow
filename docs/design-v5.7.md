@@ -1,15 +1,21 @@
 # design-v5.7 — CMDB 业务域分层 + 诊断链「定位问题服务」环节
 
-> 状态：**设计稿**，**§7.1 本体部分已实施**（其余仍未做，逐项状态见 §7.1 表格）
+> 状态：**§7.1 与 §7.2 均已实施并 E2E 验证**（逐项状态见各自表格）
 > 基线：`design-v5.6.md`（编排层 × 数据面合并版）
 > 前置：CMDB 实体图谱化已完成（`aiops-mcp-servers` `af3e88a`，见 `docs/cmdb-entities.md`）
-> 日期：2026-09-15
+> 日期：2026-09-15 起，2026-09-16 实施完成
 >
-> **已实施**：CMDB 本体修订（删 `cross_journey_hub`、加 `domain`、边加 `layer`、business 层禁
-> app—app、`app.kind`、`refs`→`app_codebase` 边、节点加 `description`/`keywords`）
-> —— 落在 `aiops-mcp-servers` 的 `e6c7a34`，对外契约零改动。
-> **未实施**：编排层全部（`scope` 节点 / `service-scoper` agent / 四个取数节点改 `join`），
-> 以及意图分类与「召回为空 → 全量给 LLM」的兜底。
+> **已实施**（两部分）：
+> - **CMDB 本体**（`aiops-mcp-servers` `e6c7a34`）：删 `cross_journey_hub`、加 `domain`、
+>   边加 `layer`、business 层禁 app—app、`app.kind`、`refs`→`app_codebase` 边、
+>   节点加 `description`/`keywords` —— **对外契约零改动**
+> - **编排层**（`service-scoper` agent + `scope` 节点 + 四个取数节点改 `join` + `rca` 交叉核对）
+>   —— 全链 E2E 跑通至审批节点
+>
+> **未实施**：① 意图分类只落到了 `scope` 的**输出字段**（`intent`），尚未按它分支路由召回策略；
+> ② §3.6 的「信息不足 → 停止让用户补充」——`scope` 会输出 `insufficient` 供下游判断，
+> 但**流程不会真的停下来**（`kind: clarification` 节点与 `WAITING_INPUT` 状态都没建）；
+> ③ 「召回为空 → 全量给 LLM」的兜底在 agentflow 侧未实现。
 
 ---
 
@@ -707,14 +713,42 @@ LLM 只在这个短名单上做判断。**这是设计能扩展的前提**，也
 > 这 5 个缺陷解释了为什么「加字段」在修复前**一点效果都没有**——字段加了，
 > 但读它的代码要么没写、要么写错了键、要么被别的守卫挡掉。
 
-### 7.2 `multi-agent-workflow`（编排层）
+### 7.2 `multi-agent-workflow`（编排层）—— ✅ **已实施并 E2E 验证（2026-09-16）**
 
-| 项 | 改动 |
-|---|---|
-| 新 agent | `service-scoper`（提示词 + 输出 schema） |
-| workflow | 新增 `scope` 节点；`logs`/`trace`/`metrics`/`infra` 四个节点加 `join: all` + `required_edges: [triage, scope]` |
-| `rca` | params 加 `scope_primary`；提示词加「`scope` 与 `trace` 不一致时如何裁决」 |
-| prompt | 各 analyst 提示词改为**按置信度档位**决定查几个服务 |
+| 项 | 改动 | 状态 |
+|---|---|---|
+| 新 agent | `service-scoper`（提示词 + `CandidateServicesSchema`），注册进 `DIAGNOSE_AGENTS` / `AGENT_STAGES`(detect) / `AGENT_DESCRIPTIONS` | ✅ |
+| workflow | 新增 `scope` 节点；`logs`/`trace`/`metrics`/`infra` 加 `join: all` + `required_edges: [triage, scope]`；**两个 pipeline 都改了** | ✅ |
+| `rca` | params 加 `scope_primary`；提示词加「`scope` 与 `trace` 不一致时如何裁决」 | ✅ |
+| prompt | 四个取数 agent 加 `_SERVICES_RULE`（按置信度档位取用候选；为空才退回宽查询） | ✅ |
+
+#### 实现时踩到、值得记住的三点
+
+1. **`required_edges` 必须是「直接」上游，传递上游不算**。`_check_join_consistency`
+   （`core/dag.py:212`）拿 `node.upstreams`（= in_edges 的 source）做子集判断。
+   `logs` 声明 `required_edges: [triage, scope]` 就必须**同时有** `triage → logs`
+   与 `scope → logs` **两条直接边**——只写后者会报
+   `required_edges 不是其上游: ['triage']`。（这正是 `join: all` 那个坑的另一半：
+   前者是"不声明会过早调度"，后者是"声明了但没有对应边会加载失败"。）
+2. **新 agent 默认没有任何 MCP 工具**。`agent_configs.mcp_server_ids` 是两态语义
+   （NULL/`[]` = 无 server）。加完 agent 必须显式绑定：
+   `PUT /agent-configs/service-scoper -d '{"mcp_server_ids":["<mid>"]}'`
+   ——对内置 agent 是 upsert，不传的文本字段回退内置默认，不会覆盖提示词。
+3. **run 用的是库里保存的 workflow，不是仓库里的 YAML**。改完 YAML 必须写回：
+   `PUT /workflows/{wid} -d '{"name":..., "yaml":...}'`，否则 run 跑的还是旧流程
+   （本次就差点漏掉——库里那份是改之前保存的）。
+
+#### E2E 实测（工单「订单服务打印结账单无反应」，租户 `otr`）
+
+- `scope` 节点 `done`，12.7s，**调用了 `infer_candidate_services`**，输出
+  `intent=fault`、`primary_service=order-service`、`expand_search=true`，
+  候选含 order-service(high) + 9 个拓扑邻居(medium)，并给出 5 条 `abstractions`
+- **join 语义实测有效**：`scope` 于 `02:41:58` 结束，四个取数节点**统一在
+  `02:42:00` 启动**——若 `join` 未生效它们会在 triage 结束（`02:41:45`）就启动，早 15 秒
+- `rca` 明确做了交叉核对：*"`scope_primary=order-service` 与工单语义一致"*
+- 全链跑通至审批节点（13 done / 1 `waiting_approval`），817k tokens / $0.07
+- **诚实度符合预期**：`scope` 主动标注"1 跳映射为**静态拓扑而非运行时观测**"；
+  `rca` 在证据缺失时写"窗口内全服务日志 0 条…**不可当作 0**"而非编造
 
 ### 7.3 验收判据
 
