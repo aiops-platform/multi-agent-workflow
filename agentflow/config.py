@@ -91,6 +91,15 @@ class Settings(BaseSettings):
     prometheus_staleness_sec: float = 60.0
     # 快照短缓存（秒）。0 = 禁用。只缓存成功结果，失败不缓存。
     app_indicators_cache_ttl: float = 2.0
+    # 展示元数据（owner/type/agentName）从 K8s Deployment 的 label 读
+    # （service_meta.py）。这些字段没有实测来源，label 是**声明配置**而非指标。
+    # 读取失败只让这三个字段留空 + 记 warning，不影响指标。
+    service_meta_enabled: bool = True
+    # 读 label 的 namespace；空 = 沿用 prometheus_namespace。
+    service_meta_namespace: str = ""
+    # label 缓存（秒）。Deployment label 极少变，没必要每 5 秒轮询都打 K8s API。
+    service_meta_cache_ttl: float = 60.0
+
     # status 判定阈值（%）。与前端 metricClass 的 ≥90 红 / ≥70 黄对齐，
     # 避免「数字绿色但徽章红色」。
     app_indicators_warn_cpu: float = 70.0

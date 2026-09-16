@@ -166,7 +166,10 @@ agents/      15-agent 编队 + AgentScope 适配 + 工具治理（M1 骨架）
                              （原 datasources.py 已在 v5.5 批3 删除，取数全部走 MCP）
 datasource/  ⚠️ 架构例外：Prometheus 直连（仅服务遗留前端 Smart Inspection）
              ├ prometheus.py      薄 HTTP 客户端（查询 + JSON + 并发，零业务语义）
-             └ app_indicators.py  发现→查询→DTO→信封；纯函数与 I/O 分离
+             ├ app_indicators.py  发现→查询→DTO→信封；纯函数与 I/O 分离
+             └ service_meta.py    owner/type/agentName ← Deployment 的 aiops/* label
+                                  （声明配置非实测值；读失败只留空 + warning，不影响指标。
+                                   type 在页面列头显示为 "Squad"；agentName 前端已不展示）
 workspace/   WorkspaceManager（M3）；CMDB 已迁 MCP（v5.5.2）
 sandbox/     M4：exec 服务(纯 stdlib) + SandboxClient + Orchestrator + ActionExecutor + ToolPolicy
 approval/    M5：审批超时 Sweeper + 通知
@@ -195,6 +198,8 @@ docker/sandbox/  沙箱镜像（stdlib-only 离线可建）
   百分比非有限守卫、status 判定、信封、缓存与降级
 - `tests/test_app_indicators_api.py`：`/app-indicators` **不鉴权**（回归锁定）、
   失败仍 200、CORS
+- `tests/test_service_meta.py`：Deployment label → owner/type/agentName 映射、
+  空值/label 缺失处理、**K8s 读失败不上升**、缓存
 - demo 用脚本化 runner（无真实 LLM）；真实模型见 `agents/scopes.py:build_model`
 
 ## 里程碑

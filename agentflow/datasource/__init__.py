@@ -20,11 +20,14 @@ from __future__ import annotations
 
 from .app_indicators import AppIndicatorsService, build_app_indicators_service
 from .prometheus import DataSourceError, PrometheusClient, build_prometheus_client
+from .service_meta import K8sServiceMetaSource, build_service_meta_source
 
 __all__ = [
     "AppIndicatorsService",
     "DataSourceError",
+    "K8sServiceMetaSource",
     "PrometheusClient",
     "build_app_indicators_service",
     "build_prometheus_client",
+    "build_service_meta_source",
 ]

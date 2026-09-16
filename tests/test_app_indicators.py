@@ -243,6 +243,32 @@ def test_build_rows_null_fields_are_honest_not_fabricated() -> None:
     assert r["alertCount"] is None
 
 
+def test_build_rows_fills_meta_from_deployment_labels() -> None:
+    """owner/type/agentName 来自 Deployment label（声明配置），有则填、无则 null。"""
+    meta = {
+        "order-service": {"owner": "h.a.hu", "type": "sales"},
+        "warranty-service": {"owner": "bo.gong", "type": "aftersales",
+                             "agentName": "InspectAgent-1"},
+    }
+    rows = build_rows(_services(), _outcomes(), set(PODS.values()), _settings(), meta)
+    by = {r["serviceName"]: r for r in rows}
+    assert by["order-service"]["owner"] == "h.a.hu"
+    assert by["order-service"]["serviceType"] == "sales"
+    assert by["order-service"]["agentName"] is None      # 没配就是 null，不给空串
+    assert by["warranty-service"]["agentName"] == "InspectAgent-1"
+    # gateway 刻意没配 owner（不属于任何业务线）→ null
+    assert by["gateway-service"]["owner"] is None
+    assert by["gateway-service"]["serviceType"] is None
+
+
+def test_build_rows_meta_absent_is_all_null() -> None:
+    """完全没传 service_meta（K8s 不可用）时三个字段仍为 null，指标不受影响。"""
+    rows = build_rows(_services(), _outcomes(), set(PODS.values()), _settings(), None)
+    for r in rows:
+        assert r["owner"] is None and r["serviceType"] is None and r["agentName"] is None
+        assert r["cpuUsage"] is not None and r["status"] == "HEALTHY"
+
+
 def test_build_rows_excludes_dead_pods() -> None:
     """已销毁 pod 的陈旧样本不得计入（Prometheus staleness 会滞留约 5 分钟）。
 

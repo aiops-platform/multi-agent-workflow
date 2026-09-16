@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 
 from ..config import Settings
 from .prometheus import PrometheusClient, QueryOutcome
+from .service_meta import K8sServiceMetaSource
 
 logger = logging.getLogger("agentflow.datasource")
 
@@ -256,6 +257,7 @@ def build_rows(
     outcomes: dict[str, QueryOutcome],
     live_pods: set[str],
     settings: Settings,
+    service_meta: dict[str, dict] | None = None,
 ) -> list[dict]:
     """服务清单 + 查询结果 → DTO 列表。"""
     names = list(services)
@@ -304,15 +306,19 @@ def build_rows(
             total = (read_rate or 0.0) + (write_rate or 0.0)
             block_io = format_rate(total)
 
+        # 展示元数据来自 Deployment label（声明配置，不是实测值）。
+        # 没有对应 label 的服务照样返回 null —— 不编造，也不因为"配置里没有"就把它从列表里藏掉。
+        meta = (service_meta or {}).get(name) or {}
+
         rows.append({
             "serviceId": service_id(name),
             "serviceName": name,
-            # 以下六项 agentflow 无数据源，诚实返回 null（前端渲染为 "-"）。
-            # TODO(v5.7): 接 MCP CMDB 后补 agentName/serviceType/owner/description；
+            "agentName": meta.get("agentName"),
+            "serviceType": meta.get("type"),
+            "owner": meta.get("owner"),
+            # 以下三项仍无数据源，诚实返回 null（前端渲染为 "-"）。
+            # TODO(v5.7): 接 MCP CMDB 后补 description；
             #             kube-state-metrics 部署后可补 restartCount；告警规则挂载后可补 alertCount。
-            "agentName": None,
-            "serviceType": None,
-            "owner": None,
             "description": None,
             "restartCount": None,
             "alertCount": None,
@@ -369,9 +375,15 @@ def failure(message: str) -> dict:
 class AppIndicatorsService:
     """单次快照：发现 → 查询 → 组装。带短缓存与两处降级重查。"""
 
-    def __init__(self, client: PrometheusClient, settings: Settings) -> None:
+    def __init__(
+        self,
+        client: PrometheusClient,
+        settings: Settings,
+        meta_source: K8sServiceMetaSource | None = None,
+    ) -> None:
         self._client = client
         self._settings = settings
+        self._meta_source = meta_source
         self._cache: tuple[float, dict] | None = None
 
     async def snapshot(self) -> dict:
@@ -412,10 +424,17 @@ class AppIndicatorsService:
         if not services:
             return envelope([], self._meta(0, 0, warnings))
 
+        # 展示元数据（owner/type/agentName）：失败只记 warning，指标照常返回
+        service_meta: dict[str, dict] = {}
+        if self._meta_source is not None:
+            service_meta, meta_warning = await self._meta_source.fetch()
+            if meta_warning:
+                warnings.append(meta_warning)
+
         pod_regex = build_pod_regex(services)
         outcomes, live_pods = await self._collect(pod_regex, warnings)
 
-        rows = build_rows(services, outcomes, live_pods, s)
+        rows = build_rows(services, outcomes, live_pods, s, service_meta)
         return envelope(rows, self._meta(len(services), len(live_pods), warnings))
 
     async def _collect(
@@ -489,5 +508,8 @@ class AppIndicatorsService:
 
 def build_app_indicators_service(settings: Settings) -> AppIndicatorsService:
     from .prometheus import build_prometheus_client
+    from .service_meta import build_service_meta_source
 
-    return AppIndicatorsService(build_prometheus_client(settings), settings)
+    return AppIndicatorsService(
+        build_prometheus_client(settings), settings, build_service_meta_source(settings)
+    )
