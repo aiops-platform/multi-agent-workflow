@@ -72,6 +72,32 @@ class Settings(BaseSettings):
     # 名称保留是为了不破坏既有 .env；新代码请按"repos 直传开关"理解。
     shared_datasources: bool = False
 
+    # ---- App Indicators（Smart Inspection 数据面）----
+    # ⚠️ **架构例外**：本组配置支撑 `datasource/` 直连 Prometheus。既定姿态是
+    # 「数据面查询全部走租户 MCP」（design-v5.6，见 CLAUDE.md 关键设计约束 §7）。
+    # 本次为让遗留前端 Smart Inspection 跑通显式破例，TODO(v5.7) 收编进
+    # aiops-datasource-mcp-server 后删除本组配置。
+    # Prometheus 基址（不含 /api/v1）。测试床用 kubectl port-forward 的固定映射。
+    prometheus_url: str = "http://localhost:19090"
+    # 服务自动发现所用的 job：up{job=...} 的 service 标签即服务清单。
+    prometheus_job: str = "app-metrics"
+    # cAdvisor 指标的 namespace 过滤；空串 = 不过滤（跨命名空间汇总）。
+    prometheus_namespace: str = "order"
+    # 单次 PromQL 查询超时（秒）。
+    prometheus_timeout_sec: float = 5.0
+    # 容器活跃判定阈值（秒）：container_last_seen 早于 now-该值 的样本视为已销毁 pod，
+    # 不参与聚合（Prometheus staleness 会滞留旧样本约 5 分钟，不过滤会把上个 pod
+    # 死前的 CPU 算进来）。
+    prometheus_staleness_sec: float = 60.0
+    # 快照短缓存（秒）。0 = 禁用。只缓存成功结果，失败不缓存。
+    app_indicators_cache_ttl: float = 2.0
+    # status 判定阈值（%）。与前端 metricClass 的 ≥90 红 / ≥70 黄对齐，
+    # 避免「数字绿色但徽章红色」。
+    app_indicators_warn_cpu: float = 70.0
+    app_indicators_crit_cpu: float = 90.0
+    app_indicators_warn_mem: float = 70.0
+    app_indicators_crit_mem: float = 90.0
+
     # ---- 配置热载（Worker）----
     # Worker 独立进程看不到 API 的内存状态，按「库内指纹」判定 agent 配置 / MCP server
     # 是否变过（`agents/config_sync.py`）。本值 = 两次查库检查之间的**最小间隔**（秒）：

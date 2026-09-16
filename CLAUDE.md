@@ -89,6 +89,16 @@ make lint      # ruff 检查
      `PUT /agent-configs/{name}` 的 `mcp_server_ids` 绑定），**进程内直连实现已删除**
      （原 `agents/datasources.py`）。本地只读工具仅剩 `locate_code`（CMDB 映射）
      与 `search_knowledge`（占位）。详见 `docs/design-v5.6.md` §3。
+   - ⚠️ **例外：`datasource/` 直连 Prometheus**（唯一一处，2026-09 引入）。遗留前端
+     Smart Inspection 页面（`service-intelligence-platform-ui/js/app.js`）要的是**瞬时值
+     + UI 形状的信封**，而 MCP 侧 `backends/prometheus.py` 是面向 LLM 证据的
+     `query_range`（只 5 个领域语义指标，无 instant query、无网络/磁盘 IO）。两者目标
+     不同，硬套两头别扭，故显式破例。**裁决边界**：本例外只服务
+     `GET /app-indicators` 一个端点；agent 取数一律仍走 MCP。
+     **收编时注意**：MCP 侧 `_sel()` 用 `container!="POD"`，在测试床集群上**会算错**
+     （sandbox 序列的 `container` 标签是缺失的，该写法会把 pod 级 + sandbox + 应用容器
+     三条序列全留下，CPU 接近翻倍）；正确写法是 `container!=""`。
+     见 `agentflow/datasource/__init__.py` 与 `app_indicators.build_queries`。
    - **`AGENTFLOW_SHARED_DATASOURCES` 语义已收窄**：内置共享数据源工具没了，此开关
      如今**只剩一个作用**——是否放行 `inputs.repos` 直传（默认 0=封堵）。名称保留是
      为了不破坏既有 .env，新代码请按「repos 直传开关」理解。
@@ -154,6 +164,9 @@ executor/    并发 DAGExecutor + 幂等 + Retry + Resume（M2）
 agents/      15-agent 编队 + AgentScope 适配 + 工具治理（M1 骨架）
              └ scopes.py       build_permission_context（§9.5 DONT_ASK+allow）
                              （原 datasources.py 已在 v5.5 批3 删除，取数全部走 MCP）
+datasource/  ⚠️ 架构例外：Prometheus 直连（仅服务遗留前端 Smart Inspection）
+             ├ prometheus.py      薄 HTTP 客户端（查询 + JSON + 并发，零业务语义）
+             └ app_indicators.py  发现→查询→DTO→信封；纯函数与 I/O 分离
 workspace/   WorkspaceManager（M3）；CMDB 已迁 MCP（v5.5.2）
 sandbox/     M4：exec 服务(纯 stdlib) + SandboxClient + Orchestrator + ActionExecutor + ToolPolicy
 approval/    M5：审批超时 Sweeper + 通知
@@ -178,6 +191,10 @@ docker/sandbox/  沙箱镜像（stdlib-only 离线可建）
 - `tests/test_resume.py`：SQLite 断点续跑 + RunService 端到端
 - `tests/test_idempotency.py`：external_operation_id 复用 / retry / 负证据
 - `tests/test_workspace.py`：base_sha 冻结 / 分支隔离 / 幂等 / 无 pull（file:// 本地源）
+- `tests/test_app_indicators.py`：PromQL 构造（RE2 转义、`container!=""`、陈旧样本剔除）、
+  百分比非有限守卫、status 判定、信封、缓存与降级
+- `tests/test_app_indicators_api.py`：`/app-indicators` **不鉴权**（回归锁定）、
+  失败仍 200、CORS
 - demo 用脚本化 runner（无真实 LLM）；真实模型见 `agents/scopes.py:build_model`
 
 ## 里程碑

@@ -32,6 +32,7 @@ from ..approval.sweeper import ApprovalSweeper
 from ..config import Settings, get_settings
 from ..core.dag import WAITING_APPROVAL, WorkflowDAGError
 from ..core.workflow import Workflow
+from ..datasource import build_app_indicators_service
 from ..executor.dag_executor import ApprovalRaceError
 from ..lock import build_lock
 from ..queue import build_queue
@@ -68,6 +69,7 @@ async def lifespan(_: FastAPI):
     yield
     await mcp_manager.close_all()
     await ticket_store.close()
+    await app_indicators_service.aclose()
 
 
 app = FastAPI(title="agentflow 控制面", version="0.1.0", lifespan=lifespan)
@@ -85,6 +87,9 @@ mcp_store = build_mcp_store(settings)
 agent_config_store = build_agent_config_store(settings)
 # 运行时 MCP client 管理器（持有同一个 store 引用，读取 enabled=1 配置）
 mcp_manager = MCPClientManager(mcp_store)
+# Smart Inspection 数据面（**架构例外**：直连 Prometheus，详见 datasource/__init__.py）。
+# 构造不做 I/O（httpx.AsyncClient 惰性建），测试可 monkeypatch 模块全局替换。
+app_indicators_service = build_app_indicators_service(settings)
 # AgentSpec 配置解析器（DB 覆盖 + 内置静态回退）：init()/CRUD 后经 _reload_agent_config_resolver 重建，
 # 并重接 mcp_manager.server_ids_for（agent→MCP server 绑定，server 粒度）。
 _agent_config_resolver: AgentConfigResolver | None = None
@@ -1572,6 +1577,26 @@ async def agent_detail(
             "schema": (raw or {}).get("schema"),
         },
     }
+
+
+@app.get("/app-indicators")
+async def app_indicators() -> dict:
+    """Smart Inspection（遗留前端）的服务指标快照。
+
+    **两点故意的设计，改动前请先读这里：**
+
+    1. **不鉴权**。调用方是未迁移的遗留页面（``service-intelligence-platform-ui/js/app.js``），
+       发的是不带任何头的裸 ``fetch``。加 ``Depends(get_tenant_context)`` 会让它整页失效。
+    2. **数据面失败也返回 HTTP 200**（``success:false``）。前端先判 ``if (!res.ok) throw``
+       并丢弃 body，只有 200 才能把 ``error`` 文案送到页面的错误条上。
+
+    返回的信封 ``{success,data,error}`` / ``SimplePage`` 形状是**为兼容该遗留前端**而设，
+    **不是** agentflow 的通用约定，不要泛化到其它接口。
+
+    指标来自 Prometheus（架构例外，见 ``datasource/__init__.py``）；取不到真值的字段
+    一律 ``null``，前端渲染为 ``-``。
+    """
+    return await app_indicators_service.snapshot()
 
 
 @app.get("/health")

@@ -22,6 +22,9 @@ dependencies = [
     "python-dotenv>=1.0",
     "fastapi>=0.111",
     "uvicorn>=0.30",
+    # HTTP 客户端：Smart Inspection 数据面（datasource/prometheus.py）运行时依赖；
+    # 原先只在 dev extra 里（测试用），接口上线后运行期也需要，故移到主依赖。
+    "httpx>=0.27",
     # JWT 租户派生（§9.1；生产由 API Gateway 签发，控制面只做校验）
     "pyjwt>=2.8",
     # db_ref/凭证加密（v5.3 §5.3 管理库凭证保护）
@@ -40,7 +43,6 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "httpx>=0.27",
     "ruff>=0.5",
     "fakeredis>=2.23",
 ]
