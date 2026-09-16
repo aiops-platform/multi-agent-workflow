@@ -14,7 +14,7 @@ flowchart TB
     end
 
     subgraph L2["② 工作流定义层"]
-        WF["workflows/*.yaml<br/>声明式 DAG（节点+边）<br/>inputs 含 window_start/window_end"]
+        WF["workflow 存数据库（workflows 表）<br/>声明式 DAG（节点+边）<br/>POST /workflows 存 · run 时从库读"]
         CORE["core/workflow.py 版本冻结<br/>core/dag.py join/skip 语义<br/>core/expressions.py when 条件"]
     end
 

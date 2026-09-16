@@ -7,7 +7,7 @@
 ```bash
 make install   # 创建 venv + 安装依赖
 make test      # 跑 pytest（M0/M2 语义 + 幂等 + Resume）
-make demo      # 脚本化跑通 bug-fix-pipeline 全链路
+make demo      # （已移除，见下方「工作流的真源」）
 make api       # 控制面 FastAPI（:8000/docs）
 make lint      # ruff 检查
 ```
@@ -34,6 +34,21 @@ make lint      # ruff 检查
    cp 的冗余投影——GET /runs 读列、Resume 读 cp）。只写列不写 cp 曾导致审批超时后
    Resume 永卡 waiting_approval（回归测试 `test_approval_timeout_resume_converges_sqlite`）。
 6. **版本冻结**（`core/workflow.py`）：Run 用 `workflow_hash` 复用 snapshot，Resume 只读原 snapshot。
+
+6.0 ⚠️ **工作流的真源是数据库，不是仓库文件**（2026-09-16 起明确）
+   - **存**：`POST /workflows` → `workflow_store.py` 的 `INSERT INTO workflows(id,name,yaml,created_at)`
+   - **用**：run 时从库读——`api/app.py:697` `cs.workflow.list()` → `:704` `get(wid)`
+     → `:398` `Workflow.load_yaml(wf_row["yaml"])`
+   - **仓库里的 `workflows/*.yaml` 已于 2026-09-16 删除**，`agentflow/demo.py` 与
+     `make demo` 一并删除——它们读的是仓库文件，**会让人以为改 YAML 就生效**。
+     实际改了仓库 YAML 而没同步到库时，run 跑的还是旧流程，**且没有任何提示**。
+   - **要改 workflow**：`PUT /workflows/{wid}`（或 `POST /workflows` 新建），改完立即生效
+     （已发起的 run 不受影响——它们用 snapshot 冻结）。
+   - 原设计的 DAG 形态（节点类型 / when / join / 审批门禁）见 `docs/design-v5.6.md` §8.1；
+     当前两条流程的节点结构见 `docs/design-v5.7.md` §7.2。
+   - **新租户的坑**：`tenantctl provision` 只建库建表、**不播种 workflow**，新租户
+     `workflows` 表是空的 → `POST /tickets/{tid}/run` 直接 400。见 `docs/TODO.md` §13。
+
 6.1 **Worker/双队列**（§6/§8.6，`AGENTFLOW_RUN_MODE`）：`inline`（默认，进程内直跑）|
    `queue`（API 只发布 run.trigger.{tenant} / run.command.{tenant}，Worker 消费；
    memory=进程内 WorkerPool 自动接 active 租户，kafka=`python -m agentflow.worker`
@@ -150,7 +165,8 @@ api/         控制面 FastAPI
              ├ workflow_store.py / mcp_store.py / agent_store.py / ticket_store.py
              │   四张控制面配置表 —— **都随租户库走**（TenantStores bundle）
              └ tenantctl.py        租户生命周期 CLI
-workflows/   bug-fix-pipeline.yaml（§8.1）+ bug-fix-scenario2.yaml（修复闭环）
+workflows/   ⚠️ **已删除**（2026-09-16）——workflow 的真源是数据库，不是仓库文件。
+             见下方「工作流的真源」。原设计的 DAG 形态留在 docs/design-v5.6.md §8.1。
 scripts/     watch_run.py（run 逐阶段观测）+ mock_mcp_server.py + verify_sandbox.py
 docker/sandbox/  沙箱镜像（stdlib-only 离线可建）
 ```

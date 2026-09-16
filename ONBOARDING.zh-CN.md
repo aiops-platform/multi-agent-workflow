@@ -19,7 +19,12 @@ flowchart LR
 ## 心智模型
 把它理解为一个包裹 AI 智能体的确定性工作流编排器。
 
-一个工作流（`workflows/*.yaml`）就是一个 DAG：节点是带类型的步骤（agent/invoke/tool/approval），边可携带 `when` 条件，join 为 `any|all`。创建 Run 时，工作流通过 `workflow_hash` 快照（版本冻结）并由 DAG 执行器运行。
+一个工作流就是一个 DAG：节点是带类型的步骤（agent/invoke/tool/approval），边可携带 `when` 条件，join 为 `any|all`。创建 Run 时，工作流通过 `workflow_hash` 快照（版本冻结）并由 DAG 执行器运行。
+
+> ⚠️ **工作流的真源是数据库，不是仓库文件。** 存：`POST /workflows`（→ `workflows` 表）；
+> 用：run 时从库读。仓库里**没有** `workflows/*.yaml`——原先那三个文件已于 2026-09-16 删除，
+> 因为它们不在运行时链路上，留着会让人以为改 YAML 就生效（实际改了不同步到库，
+> run 跑的还是旧流程且无提示）。
 
 状态存放在可插拔的 StateStore（InMemory/SQLite/Postgres），并发由可插拔的 Queue/Lock（memory/Kafka/Redis）承担，全部由配置驱动。
 
@@ -32,8 +37,8 @@ Agent 运行在 AgentScope（锁定 2.0.3，模型 DeepSeek deepseek-v4-flash）
 真实 testbed 联调时，同一套工具签名直接切换为 ES/Prometheus/kubectl 适配器，因此 mock↔真实 只换 adapter。控制面是一个 FastAPI 应用，提供 Run 的 create/approve/resume 以及审计查询。
 
 ## 建议阅读顺序
-- `README.md` — 里程碑总览（M0-M7）、快速开始（make install/test/demo/api）、目录结构，以及沙箱与 testbed 联调脚本。先读它建立全局认识。
-- `workflows/bug-fix-pipeline.yaml` — 标准工作流定义（design §8.1）。展示其余代码所要执行的 DAG 形态：节点类型、when 条件、join、审批门禁。
+- `README.md` — 里程碑总览（M0-M7）、快速开始（make install/test/api）、目录结构，以及沙箱与 testbed 联调脚本。先读它建立全局认识。
+- `docs/design-v5.6.md` §8.1 + `docs/design-v5.7.md` §7.2 — 标准工作流的 DAG 形态：节点类型、when 条件、join、审批门禁。（原 `workflows/bug-fix-pipeline.yaml` 已删，见上）
 - `agentflow/core/dag.py` — DAG 语义：带 `when` 的边、join any|all、全 INACTIVE → SKIPPED 级联、审批节点参与 skip。这是语义上最重要的文件。
 - `agentflow/statestore/base.py` — 状态模型 + 审批 CAS + 终态不可变。动任何状态转移前必读——绕过 CAS 是被禁止的。
 - `agentflow/executor/dag_executor.py` — 执行引擎：并发跑节点、param 解析、幂等、重试，以及审批挂起时仅当 ready 集为空才释放 worker。
@@ -72,10 +77,11 @@ Agent 运行在 AgentScope（锁定 2.0.3，模型 DeepSeek deepseek-v4-flash）
 - 何时可跳过：除非你在跑 testbed 联调或端到端修复闭环。
 
 ### Workflows
-- 职责：声明的 YAML 工作流：标准 bug-fix 流水线（§8.1）与场景2 完整修复闭环（诊断 → 修复 → 审批 → PR）。
-- 位置：`workflows/**`
-- 入口：`workflows/bug-fix-pipeline.yaml`
+- 职责：声明式 YAML 工作流：标准 bug-fix 流水线（§8.1）与场景2 完整修复闭环（诊断 → 修复 → 审批 → PR）。
+- **位置：数据库的 `workflows` 表**（原先的 `workflows/**` 目录已于 2026-09-16 删除——不在运行时链路上）
+- 入口：`POST /workflows`（存）/ `PUT /workflows/{wid}`（改）；`GET /workflows` 列出
 - 何时可跳过：除非你在编写或扩展工作流定义。
+- ⚠️ 新租户 provision 后 `workflows` 表是空的，**发不了 run**——见 `docs/TODO.md` §13
 
 ### Docker
 - 职责：沙箱镜像：纯 stdlib http.server 的 exec 服务（零 pip 依赖、离线可建），带可选 `WITH_JDK` 构建参数以支持 Java 编译。

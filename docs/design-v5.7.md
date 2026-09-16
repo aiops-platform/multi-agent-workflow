@@ -375,7 +375,7 @@ logs:
   required_edges: [triage, scope]
 ```
 
-这正是 `bug-fix-scenario2.yaml` 里 `locate` 节点**已经踩过**的坑，YAML 注释原话：
+这正是标准流水线里 `locate` 节点**已经踩过**的坑（该 YAML 已于 2026-09-16 随 `workflows/` 一并删除，原注释见 git 历史；节点定义现只存在于租户库的 `workflows` 表），原话：
 
 > 默认 join: any 会让它在 triage 一完成就被调度（trace 尚未跑完 → failing_service 为 null，
 > 导致 code-locator 只能按 ticket 的 subcategory 猜服务，可能定位错仓库）

@@ -6,7 +6,7 @@
 > 把「方向选择」折叠进计划自带的 `decisions[]` + 「带方向驳回重写」反馈，不在引擎里发明新节点类型。
 > 关联：`docs/todos/WORKFLOW_V2_REVIEW_GATES_zh-CN.md`（其 §4 `on_reject.rerun` 打回闭环 = 本方案引擎前置）、
 > `agentflow/agents/prompts.py`、`agentflow/api/app.py`、`agentflow/agents/agent_config.py`、`tests/test_agent_config.py`、
-> `workflows/git-search-approval.yaml`（真实可跑链：diagnose→root-cause→**remediation-planning-analyst→approval**）。
+> `git-search-approval` 这张 workflow（真实可跑链：diagnose→root-cause→**remediation-planning-analyst→approval**）——⚠️ 原 `workflows/git-search-approval.yaml` 文件已于 2026-09-16 删除，现在它只存在于租户库的 `workflows` 表里（`GET /workflows` 可见）。
 
 ---
 
@@ -111,7 +111,7 @@ CRUD 热载只重绑了模块全局 + `mcp_manager.server_ids_for`，**没回指
 
 ### 3.3 Workflow 固化（可选，走查即可）
 
-- [ ] 现有 `workflows/git-search-approval.yaml` 已是 `diagnose→root-cause→remediation-planning-analyst→approval`，
+- [ ] 现有 `git-search-approval`（租户库 `workflows` 表）已是 `diagnose→root-cause→remediation-planning-analyst→approval`，
       把 remediation 计划 + decisions 作为审批卡内容即闭环；如需「决策分歧重写」E2E，等 3.1/3.2 落地后
       在 run 里真跑一次「改选方向 → 驳回 → 计划重写 → 再审批通过」。
 

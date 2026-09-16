@@ -308,7 +308,7 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 | 源项 | 仍未做 | 涉及文件 |
 |---|---|---|
 | **Agent 配置可配置化**（v1.12 主体完成） | **tools 可见性 / 超时 / 限流**尚未纳入 DB 配置（仍硬编码在 `TOOL_REGISTRY` 的 `ToolSpec.agents`）；**按租户覆盖模型参数**（model / max_iters / 是否真实 LLM）未做 | `agents/tools.py`、`agents/registry.py`、配置加载层 |
-| **真实 node_runner 接入 executor**（`383b6b7` + v5.3 批C 完成） | **L2 沙箱工具接入真实 run**——`SandboxClient` 已可用，但 runner 在真实诊断链路中尚未调用 | `agents/runner.py`、`sandbox/orchestrator.py`、`workflows/*.yaml` |
+| **真实 node_runner 接入 executor**（`383b6b7` + v5.3 批C 完成） | **L2 沙箱工具接入真实 run**——`SandboxClient` 已可用，但 runner 在真实诊断链路中尚未调用 | `agents/runner.py`、`sandbox/orchestrator.py`、租户库的 `workflows` 表 |
 | **CMDB 生产化**（`b25dc4b` + `9b37cbe` + 实体图谱化完成） | ⚠️ **换了载体 ≠ 换了数据源**：`_SERVICES` / `_DEPENDS_ON` 字面量已删除，但实体文件里的 **10 个服务 / 13 条边仍是种子数据**——仍需接真实 CMDB 同步（文件载体、schema 校验、引用完整性、热重载都已就位，缺的只是数据来源）；<br>**两处失真由种子派生而来，录入真实数据时应一并纠正**：① Portfolio 由 `namespace` 派生——namespace 是 k8s 部署分组不是业务域，`common` 是装着两个不同 owner 服务的杂物筐；② `tier1` 标签由 `criticality==critical` 派生；<br>**Event 路径空转**：Incident / Change 节点当前为空（覆盖层机制已通，缺数据），故 `infer_candidate_services` 恒 `degraded=true`，「问题 → 事件 → 应用」这条路径尚未在真实数据上验证过；<br>（可选）拓扑加显式环检测告警——当前 `direction=both` 能反映环但**不告警**（图谱化后实体文件允许含环，此风险未变） | `aiops-datasource-mcp-server/src/.../data/cmdb-entities.json`、`docs/cmdb-entities.md` §5 |
 
 ---
@@ -407,12 +407,20 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 
 ### 要做
 
-1. **`provision` 时播种 workflow**：从仓库 `workflows/*.yaml` 导入，按 `name` **幂等 upsert**
-   （与 `agents` 的 seed 同思路）
+1. **`provision` 时播种 workflow** —— ⚠️ **播种源需要先定**，因为仓库里的
+   `workflows/*.yaml` 已于 2026-09-16 **删除**（见 §13 开头：它们不在运行时链路上）。
+   三个候选，**选之前不要动手**：
+   - **(a) 显式 seed 目录**：如 `agentflow/seed/workflows/*.yaml`，**命名上就要让人看出
+     它是种子不是真源**。代价：又多了一处 YAML，仍可能被误读成"改了生效"。
+   - **(b) 租户间复制**：从一个"参考租户"导出（`GET /workflows` → 另一个库 `POST /workflows`）。
+     好处：**只有一份真源（数据库）**，不引入第二载体。代价：需要有个 reference 租户当样板。
+   - **(c) 由运维显式导入**：provision 只报错提示"库里没有 workflow，请先 POST /workflows"。
+     最小改动，但没有解决"新租户开箱不可用"。
+   > **倾向 (b)**：它与"真源唯一"的原则一致——(a) 会把刚删掉的第二载体又请回来。
 2. **数据面绑定也要播种**：`mcp_servers` 注册 + 各 agent 的 `mcp_server_ids`。
    ⚠️ 这部分 **URL 是环境相关的**（每租户一个 MCP server，见 v5.3 部署模型），
    不能硬编码进代码——需要在 `tenants.yaml` 里声明该租户的数据面 server 列表
-3. **补一个「同步」动作**：改完 YAML 后一条命令推给目标租户，而不是手工 `PUT`
+3. **补一个「同步」动作**：改完 workflow 后一条命令推给目标租户，而不是手工 `PUT`
 
 ### 涉及文件
 

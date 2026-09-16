@@ -193,7 +193,7 @@ npm run dev                                        # :5173
 cd <repo>/backend
 $PY -c "
 import json,pathlib,urllib.request
-y=pathlib.Path('workflows/bug-fix-scenario2.yaml').read_text()
+y=pathlib.Path('<workflow 的 YAML 文本文件>.yaml').read_text()  # 仓库 workflows/ 已删（2026-09-16），YAML 文本请自备或从 GET /workflows 取
 req=urllib.request.Request('http://localhost:8000/workflows',
   data=json.dumps({'name':'bug-fix-scenario2','yaml':y}).encode(),
   headers={'Content-Type':'application/json','X-Tenant-ID':'otr'})

@@ -308,7 +308,7 @@ edges:
 - `agentflow/core/dag.py` — DAG 语义（join/skip/审批节点）
 - `agentflow/statestore/base.py` / `sqlite.py` — 表结构 + get_run 原始记录
 - `agentflow/executor/dag_executor.py` — 节点状态 `{status, output, params}`
-- `workflows/bug-fix-pipeline.yaml` — 本仓库 YAML 示例（kind: approval 模型）
+- ~~`workflows/bug-fix-pipeline.yaml`~~ — 本仓库 YAML 示例（kind: approval 模型）；**已于 2026-09-16 删除**（workflow 真源是数据库）
 
 ---
 

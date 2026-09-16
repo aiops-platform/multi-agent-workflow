@@ -11,7 +11,6 @@
 |---|---|---|
 | 安装依赖 | `make install` | 首次必须 |
 | 跑测试（72 个） | `make test` | 验证安装正确 |
-| 脚本化 demo | `make demo` | 无 LLM 跑通 bug-fix-pipeline 全链路（create_run → 审批 → done） |
 | **API 控制面** | `make api` | 起 FastAPI 服务，`http://localhost:8000/docs` |
 | 数据源 MCP server | `uv run python -m aiops_datasource_mcp_server`（独立仓库 aiops-mcp-servers） | 真实 ES/Prometheus/K8s 查询，供诊断链取数（:8300） |
 | 观测 run | `scripts/watch_run.py --recent --traces` | 逐阶段看节点状态/输出/审批/工具明细 |
@@ -56,7 +55,7 @@ cp .env.dev .env
 说明：
 
 - **DEEPSEEK_API_KEY 只在"真实 LLM 推理"时需要**（诊断脚本 / 节点契约测试）。
-- 不填也能跑：`make demo` / `make test` / API 控制面都能起，
+- 不填也能跑：`make test` / API 控制面都能起，
   `build_model()`（`agents/scopes.py`）会回退到 `ScriptedJsonModel`（确定性输出，供无 Key / CI）。
 - 其余配置默认即本地 MVP：`AGENTFLOW_STATE_STORE=sqlite`、`AGENTFLOW_QUEUE=memory`、
   `AGENTFLOW_LOCK=memory`。SQLite 库会自动建到 `data/agentflow.db`（目录自动创建）。
@@ -68,12 +67,11 @@ cp .env.dev .env
 ```bash
 # 跑全部测试（M0-M7 语义，约 72 个）
 make test
-
-# 脚本化 demo：诊断 → 修复 → 合并审批 → 提交，全部用确定性输出
-make demo
 ```
 
-看到 `✅ 全链路完成: DONE` 说明核心编排可用。
+> 注：原先的 `make demo`（无 LLM 跑通 bug-fix-pipeline 全链路）已删除——它读的是仓库里的
+> `workflows/bug-fix-pipeline.yaml`，而 **workflow 的真源是数据库**（`POST /workflows`）。
+> 留着一个读文件的 demo 会让人以为改 YAML 就生效。见 `CLAUDE.md` §6.0。
 
 ## 六、启动 API 控制面
 
@@ -114,7 +112,7 @@ API 端点一览（`/docs` 有 Swagger）：
 | GET | `/health` | 健康检查 |
 
 > 注：审批端点需要 workflow 里有 `kind: approval` 节点才会触发 `WAITING_APPROVAL`
-> （参考 `workflows/bug-fix-pipeline.yaml` 的 `approve-changes`）。M0-M2 形态是**进程内直接执行**，
+> （DAG 形态见 `docs/design-v5.6.md` §8.1 的 `approve-changes`）。M0-M2 形态是**进程内直接执行**，
 > 审批返回后同进程继续跑。
 
 ## 七、（可选）真实诊断场景：接 testbed
@@ -173,6 +171,6 @@ bash fault-inject/scenario2-recover.sh
 
 ## 九、下一步建议
 
-1. 先 `make test` + `make demo` + `make api` 确认基础可用；
-2. 按 `DIAGNOSE_TEST_GUIDE.md` 建 `workflows/diagnose-only.yaml` 和三层测试骨架；
+1. 先 `make test` + `make api` 确认基础可用；
+2. 按 `DIAGNOSE_TEST_GUIDE.md` 用 `POST /workflows` 建诊断专用 workflow 和三层测试骨架；
 3. 接 testbed 跑场景 1/2 验证真实诊断链路。

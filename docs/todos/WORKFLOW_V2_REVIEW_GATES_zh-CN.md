@@ -2,7 +2,7 @@
 
 > 状态：**设计稿 / 待评审**（2026-09-07，分支 `demo_0831`）
 > 范围：仅设计文档 + YAML 定义，**未动引擎代码**。落地上线前需评审 §4 的引擎扩展。
-> 关联：`workflows/bug-fix-scenario2.yaml`（M7 可跑闭环，本稿基线）、`workflows/bug-fix-pipeline.yaml`、`workflows/git-search-approval.yaml`、`docs/TODO.md`。
+> 关联：`bug-fix-scenario2`（M7 可跑闭环，本稿基线）、`bug-fix-pipeline`、`git-search-approval` 三张 workflow —— ⚠️ **它们现在只存在于租户库的 `workflows` 表**（原 `workflows/*.yaml` 文件已于 2026-09-16 删除，因为不在运行时链路上）；另见 `docs/TODO.md` §13。
 
 ---
 
@@ -49,7 +49,7 @@
 
 ## 2. Workflow 完整定义（目标 YAML）
 
-> 命名候选：`bug-fix-review-v2` → 落库文件 `workflows/bug-fix-review-v2.yaml`。
+> 命名候选：`bug-fix-review-v2` → **经 `POST /workflows` 落库**（租户库 `workflows` 表）。
 > 注：`[扩展]` 标记的行是 §4 打回闭环所需、**当前引擎尚未支持**；去掉这些行即当前引擎可加载版本。
 
 ```yaml
@@ -277,7 +277,7 @@ approve-plan:
 - [ ] `high_risk` 风险来源：调用方入参 or rca 输出 or 新增风险评估 agent？
 
 **当前即可做（不动引擎）**
-- [ ] 把 §2「去掉 [扩展]」版本作为 `workflows/bug-fix-review-v2.yaml` 落库（happy-path：双门、拒绝→recap），E2E 走通 计划门 / 证据门 的 通过→commit 与 拒绝→recap 两路；
+- [ ] 把 §2「去掉 [扩展]」版本经 `POST /workflows` 以 `bug-fix-review-v2` 落库（happy-path：双门、拒绝→recap），E2E 走通 计划门 / 证据门 的 通过→commit 与 拒绝→recap 两路；
 - [ ] 补测试：计划门被拒（abort 路径）不调 fix；证据门拒绝不触发 commit（幂等锚点）——对齐既有 S-010b 审批参与 skip 语义；
 - [ ] 文档 §3 布尔表达式（`!= false`、None 缺省）若实现风险分级，加回归用例。
 

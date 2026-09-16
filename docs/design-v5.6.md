@@ -542,10 +542,10 @@ catalog = 租户 `workflows` 表。现状 schema 仅 `id/name/yaml/created_at`
 - **参数填充**：`inputs.bug_report` ← 归一后的事件对象；`repos` 不走直传
   （v5.3 §7.3 封堵仍生效），由租户 CMDB/MCP 提供。
 - **追加审批**：命中 `draft` 或事件风险 > workflow `max_risk` 时，注入 approval 节点
-  （对齐现有 `bug-fix-pipeline.yaml` 的 `approve-changes`/`approve-commit` 结构）——
+  （对齐现有 `bug-fix` 流水线的 `approve-changes`/`approve-commit` 结构，见 §8.1）——
   把"该不该放手"做成图内节点，进审计、可跳过、可超时。
 - **删负证据**：severity=low / 单服务时，可把诊断侧的负证据节点（metrics/infra 的
-  `on_failure: continue`，见 `bug-fix-pipeline.yaml` 结构）标记跳过以省成本——
+  `on_failure: continue`，见 §8.1 的节点结构）标记跳过以省成本——
   由 compiler 统一做，规则先行。
 
 ### 4.5 动态合成（L3）Plan-as-DAG

@@ -6,9 +6,12 @@
 
 ---
 
-## 1. 工作流定义 `workflows/diagnose-only.yaml`
+## 1. 工作流定义 `diagnose-only`
 
-创建该文件（内容与 `bug-fix-pipeline.yaml` 的诊断段一致，去掉修复/提交部分）：
+> ⚠️ **workflow 存数据库，不是仓库文件**（原 `workflows/**` 目录已于 2026-09-16 删除）。
+> 用 `POST /workflows {"name":"diagnose-only","yaml":"<下面的内容>"}` 建，不要建文件。
+
+内容参考标准流水线的**诊断段**（`docs/design-v5.6.md` §8.1），去掉修复/提交部分：
 
 ```yaml
 # ===== 仅诊断链路：服务报错 → trace → 根因分析 =====
@@ -299,7 +302,7 @@ DEEPSEEK_API_KEY=sk-xxx ./venv/bin/pytest tests/test_diagnose_nodes.py -q
 RUN_E2E=1 ./venv/bin/pytest tests/e2e/test_diagnose_e2e.py -q
 ```
 
-> 若尚未创建 `workflows/diagnose-only.yaml`，第①层也可改为直接内联加载：
+> 若尚未在库里建 `diagnose-only`，第①层也可改为直接内联加载：
 > `Workflow.load_yaml("{ 上方的 YAML 文本 }")`（`load_yaml` 支持内联 YAML 字符串）。
 
 ---

@@ -31,10 +31,8 @@ cp .env.example .env            # 填 DEEPSEEK_API_KEY（design §16.3 模型 de
 # 3. 跑测试（300+ tests：DAG 语义 + 幂等 + Resume + Worker/队列 + 多租户路由/隔离）
 make test
 
-# 4. 跑脚本化 demo（create_run → 审批 → done）
-make demo
-
-# 5. 控制面 API
+# 4. 控制面 API
+# ⚠️ workflow 存**数据库**，仓库里没有 YAML 文件——先 POST /workflows 建一条才能发 run
 make api                        # http://localhost:8000/docs
 ```
 
@@ -115,9 +113,10 @@ agentflow/
 │   └── management_store.py # v5.3 §5.2：管理库（tenants/schema_versions，db_ref 加密）
 ├── statestore/router.py # v5.3 §5.3：TenantStoresRouter（tenant_id → 租户库 bundle，LRU）
 └── service.py         # RunService：create / approve / resume / pause / stop（inline|queue 双模式）
-workflows/
-├── bug-fix-pipeline.yaml   # design §8.1 完整示例
-└── bug-fix-scenario2.yaml  # 场景2 完整修复工作流（诊断→修复→审批→PR，§3.5）
+workflows/               # ⚠️ 2026-09-16 已删除——**workflow 的真源是数据库，不是仓库文件**
+                         #    存：POST /workflows → workflows 表(id,name,yaml,created_at)
+                         #    用：run 时从库读（api/app.py:697 → :704 → :398）
+                         #    DAG 形态见 docs/design-v5.6.md §8.1、docs/design-v5.7.md §7.2
 scripts/
 ├── watch_run.py            # run 逐阶段观测（节点状态/输出/token/审批/工具明细）
 ├── mock_mcp_server.py      # MCP 配置页测试用 mock server（mcp v1 FastMCP）
@@ -174,7 +173,7 @@ curl -X PUT localhost:8000/agent-configs/metrics-analyst \
 
 # 3. 跑一次 run（时间窗必填），并用 watch_run.py 逐阶段观测
 curl -X POST localhost:8000/run -H 'Content-Type: application/json' \
-  -d '{"workflow_yaml":"<bug-fix-scenario2.yaml 内容>",
+  -d '{"workflow_yaml":"<workflow 的 YAML 文本（仓库里已无文件，先 POST /workflows 存一份）>",
        "inputs":{"bug_report":{...},
                  "window_start":"2026-09-10T08:30:00",
                  "window_end":"2026-09-10T10:30:00"}}'

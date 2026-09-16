@@ -227,7 +227,7 @@ async def invoke() -> Any:
 | 1 | `agents/registry.py` | 名字加进 `DIAGNOSE_AGENTS` / `FIX_AGENTS` |
 | 2 | `agents/prompts.py` | 加 `SYSTEM_PROMPTS[name]`（角色提示词）+ `AGENT_SCHEMAS[name]`（输出契约） |
 | 3 | `agents/tools.py`（可选） | 在某个 `ToolSpec.agents` 里加上它，或新增 `ToolSpec` |
-| 4 | `workflows/*.yaml`（使用方） | 节点 `agent:` 指向新名字 |
+| 4 | 租户库的 `workflows` 表（使用方） | 节点 `agent:` 指向新名字 |
 
 ---
 

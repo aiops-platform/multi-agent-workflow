@@ -17,11 +17,11 @@ Legend:
 Every edge above is verified by static analysis. Edges the tool couldn't verify are omitted, not guessed.
 
 ## Mental model
-Think of it as a deterministic workflow orchestrator wrapped around AI agents. A workflow (workflows/*.yaml) is a DAG: nodes are typed steps (agent/invoke/tool/approval), edges carry optional `when` conditions, joins are `any|all`. When a Run is created, the workflow is snapshotted via `workflow_hash` (version freeze) and executed by the DAG executor. State lives in a pluggable StateStore (InMemory/SQLite/Postgres), concurrency in a pluggable Queue/Lock (memory/Kafka/Redis), all selected by config. Side effects are idempotency-guarded by `execution_id` + `external_operation_id`. Approval transitions use CAS and terminal states are immutable. Agents run on AgentScope (locked to 2.0.3, DeepSeek deepseek-v4-flash) with a tool registry and permission context; code-execution side effects are pushed into a sandbox pod with a whitelist of actions. Real testbed integration swaps the same tool signatures to ES/Prometheus/kubectl adapters, so mock↔real is only an adapter swap. The control plane is a FastAPI app exposing run create/approve/resume plus audit reads.
+Think of it as a deterministic workflow orchestrator wrapped around AI agents. A workflow is a DAG: nodes are typed steps (agent/invoke/tool/approval), edges carry optional `when` conditions, joins are `any|all`. When a Run is created, the workflow is snapshotted via `workflow_hash` (version freeze) and executed by the DAG executor. State lives in a pluggable StateStore (InMemory/SQLite/Postgres), concurrency in a pluggable Queue/Lock (memory/Kafka/Redis), all selected by config. Side effects are idempotency-guarded by `execution_id` + `external_operation_id`. Approval transitions use CAS and terminal states are immutable. Agents run on AgentScope (locked to 2.0.3, DeepSeek deepseek-v4-flash) with a tool registry and permission context; code-execution side effects are pushed into a sandbox pod with a whitelist of actions. Real testbed integration swaps the same tool signatures to ES/Prometheus/kubectl adapters, so mock↔real is only an adapter swap. The control plane is a FastAPI app exposing run create/approve/resume plus audit reads.
 
 ## Reading order
-- `README.md` - Milestone overview (M0-M7), quick start (make install/test/demo/api), directory map, and the sandbox + testbed integration recipes. Read first for the big picture.
-- `workflows/bug-fix-pipeline.yaml` - The canonical workflow definition (design §8.1). Shows the DAG shape, node types, when-conditions, joins, and approval gate that everything else executes.
+- `README.md` - Milestone overview (M0-M7), quick start (make install/test/api), directory map, and the sandbox + testbed integration recipes. Read first for the big picture.
+- `docs/design-v5.6.md` §8.1 + `docs/design-v5.7.md` §7.2 - The canonical workflow's DAG shape: node types, when-conditions, joins, and the approval gate. (The former `workflows/bug-fix-pipeline.yaml` was deleted on 2026-09-16 — workflows live in the database, see `CLAUDE.md` §6.0.)
 - `agentflow/core/dag.py` - DAG semantics: edges with `when`, join any|all, all-INACTIVE to SKIPPED cascade, and approval nodes participating in skip. The single most important semantic file.
 - `agentflow/statestore/base.py` - State model + approval CAS + terminal-state immutability. Read before touching any state transitions — bypassing CAS is forbidden.
 - `agentflow/executor/dag_executor.py` - The execution engine: concurrent node running, param resolution, idempotency, retry, and how approval suspension releases only when the ready set is empty.
@@ -60,10 +60,11 @@ Entry point: `POST /run` (workflow `bug-fix-scenario2`) + observe with `scripts/
 Skip unless: Skip unless you are running testbed integration or the end-to-end fix loop.
 
 ### Workflows
-What it does: Declared YAML workflows: the canonical bug-fix pipeline (§8.1) and the scenario-2 full repair loop (diagnosis → fix → approval → PR).
-Where it lives: `workflows/**`
-Entry point: `workflows/bug-fix-pipeline.yaml`
+What it does: Declarative YAML workflows: the canonical bug-fix pipeline (§8.1) and the scenario-2 full repair loop (diagnosis → fix → approval → PR).
+Where it lives: **the `workflows` table in the database** (the former `workflows/**` directory was deleted on 2026-09-16 — it was never on the runtime path)
+Entry point: `POST /workflows` (create) / `PUT /workflows/{wid}` (update); `GET /workflows` to list
 Skip unless: Skip unless you are authoring or extending workflow definitions.
+⚠️ A freshly provisioned tenant has an **empty** `workflows` table and cannot start a run — see `docs/TODO.md` §13.
 
 ### Docker
 What it does: Sandbox image: pure-stdlib http.server exec service (zero pip deps, offline-buildable), with an optional WITH_JDK build arg for Java compilation.

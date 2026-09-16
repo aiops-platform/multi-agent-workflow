@@ -21,7 +21,7 @@ flowchart TB
     T --> R
 
     subgraph LOAD["② Workflow 加载（建 Run）"]
-        Y["workflows/*.yaml<br/>nodes.{id}: {agent, params, join, on_failure, …}"]
+        Y["租户库 workflows 表<br/>nodes.{id}: {agent, params, join, on_failure, …}"]
         N["DAG.build → Node{id,kind,agent,params,…}<br/>core/dag.py"]
     end
     Y --> N
