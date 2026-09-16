@@ -373,3 +373,51 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 - ~~工单落共享库~~ → ✅ 2026-09-14（`166c5e4`）：`ticket` 纳入 `TenantStores` 路由
 - ~~`_agent_config_provider` 作用域错误~~ → ✅ 2026-09-14（`5ab1494`）：
   Router 模式下任何 agent 节点都因 NameError 失败（**main 上既有 bug**）
+
+---
+
+## 13. ⭐ 新租户初始化缺「播种」：workflow 与数据面绑定
+
+> 2026-09-16 记录。做 scope 节点的 E2E 时踩到：**改完 workflow YAML，run 跑的还是旧流程**。
+
+### 现状（源码事实）
+
+**workflow 的唯一真源是数据库，不是仓库里的 YAML**：
+
+| 动作 | 路径 | 证据 |
+|---|---|---|
+| 存 | `POST /workflows` → `workflow_store.py` | `INSERT INTO workflows(id, name, yaml, created_at)` |
+| 用 | run 时从库读 | `app.py:697` `cs.workflow.list()` → `:704` `get(wid)` → `:398` `Workflow.load_yaml(wf_row["yaml"])` |
+| 仓库 `workflows/*.yaml` | **完全不参与运行时** | 全仓 grep `workflows/*.yaml` / `glob` / `seed_workflow` → **零命中**；Makefile、`scripts/` 里也没有导入动作 |
+
+而 `tenantctl provision` **只建库建表、不播种任何数据**：
+`ensure_tenant_database`（建 database）→ `mgmt.upsert_tenant`（管理库记录）→
+`router.get()`（连接触发幂等建表）——到此为止。
+
+### 影响
+
+- **新租户起不来诊断**：`workflows` 表为空 → `POST /tickets/{tid}/run` 直接 400
+  （"库里没有已保存的 workflow，无法发起诊断"）
+- **改 workflow 会静默不生效**：改了仓库 YAML 却忘了 `PUT /workflows/{wid}`，
+  run 跑的还是旧流程——**没有任何提示**。本次就差点如此：YAML 改完、加载校验通过、
+  agent 也加好了，唯独库里那份是旧的，跑出来会**像"新功能没生效"**，而真因是流程里
+  根本没有那个节点
+- **同样的问题在数据面**：`mcp_servers` 表空 + `agent_configs.mcp_server_ids` 未绑定
+  → agent 拿不到任何工具（`mcp_server_ids` 是两态语义：NULL/`[]` = 无 server）
+
+### 要做
+
+1. **`provision` 时播种 workflow**：从仓库 `workflows/*.yaml` 导入，按 `name` **幂等 upsert**
+   （与 `agents` 的 seed 同思路）
+2. **数据面绑定也要播种**：`mcp_servers` 注册 + 各 agent 的 `mcp_server_ids`。
+   ⚠️ 这部分 **URL 是环境相关的**（每租户一个 MCP server，见 v5.3 部署模型），
+   不能硬编码进代码——需要在 `tenants.yaml` 里声明该租户的数据面 server 列表
+3. **补一个「同步」动作**：改完 YAML 后一条命令推给目标租户，而不是手工 `PUT`
+
+### 涉及文件
+
+`agentflow/tenantctl.py`（`provision`）、`agentflow/api/workflow_store.py`、
+`agentflow/api/mcp_store.py`、`agentflow/api/agent_store.py`
+
+> **与版本冻结的关系**：run 用 snapshot，改 YAML **不影响已发起**的 run（这是对的）；
+> 但新租户 / 新建的库必须有一份初始的——缺的就是这一步。
