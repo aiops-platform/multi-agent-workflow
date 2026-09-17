@@ -135,8 +135,11 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "`candidate_apps` 里）不要凭「业务上接近」塞进来——那不是证据，是猜测。\n"
         "2. **定不了就别定。** 未命中任何服务，或 `ambiguous: true`（头部候选同分跨域）时："
         "`candidate_services` 留空（或原样保留）、`insufficient` 置 true，"
-        "在 summary 里写清**缺什么信息**才能继续——**不要替用户挑一个、也不要编造服务名**"
-        "（design-v5.7 §3.6）。\n"
+        "并把**缺什么信息**同时写进两处——summary 里说清（给人读），"
+        "`missing` 数组里逐条列出（给程序读，如 `\"具体的报障入口/界面\"`、"
+        "`\"故障发生时间点或 trace_id\"`、`\"CMDB CI 名\"`）。"
+        "**`insufficient: true` 却给空 `missing` 是自相矛盾的**——那等于告诉下游"
+        "「什么也不缺」。**不要替用户挑一个、也不要编造服务名**（design-v5.7 §3.6）。\n"
         "\n"
         f"{_JSON_RULE}\n"
         f"输出 Schema：{_schema_hint(CandidateServicesSchema)}"
@@ -265,9 +268,21 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "**症状服务 ≠ 根因服务**是常态——把分歧写进 hypotheses，不要丢掉任何一方\n"
         "   - 若 `scope_primary` 为空（工单描述定位不到服务），说明该信号缺失，按其余证据判断即可，"
         "**不要因此编造服务名**\n"
-        f"4. {_JSON_RULE}\n"
-        '{"root_cause_type": "code_bug"|"infra_issue"|"config_issue"|"dependency_issue", '
-        '"confidence": 0.0-1.0, "hypotheses": ["候选项1", "候选项2"], "ruled_out": ["被排除的假设"]}\n'
+        "4. ⚠️ **证据不足时如实说，不要编一个根因类型**：\n"
+        "   `insufficient: true` + `root_cause_type: null`，并把**缺什么**同时写进两处：\n"
+        "   summary 里说清（给人读），`missing` 数组里逐条列出（给程序读，"
+        "如 `\"窗口内的错误日志原文\"`、`\"失败调用的 code_locator 结论\"`、`\"变更/发布记录\"`）。\n"
+        "   **`insufficient: true` 却给空 `missing` 是自相矛盾的**——那等于告诉下游「什么也不缺」。\n"
+        "   判据（任一成立就该置 true）：各维证据全为负证据（`found=false` / 值全为 null）、\n"
+        "   证据互相矛盾且无法解释、或 confidence 低于 0.3。\n"
+        "   尤其**不要拿 `config_issue` 之类去兜底**——实测踩过：零证据时填了 `config_issue`，\n"
+        "   而自己的 hypothesis 里写着「无代码缺陷证据，仅为剩余可能性中最低跨度的一项」。\n"
+        "   **编出来的类型会被下游当真**：`fix-planner` 会照着出计划、`fix-implementer`\n"
+        "   会照着改代码。置了 insufficient，流程会在中断节点停下，而不是拿着假根因往下走。\n"
+        f"5. {_JSON_RULE}\n"
+        '{"root_cause_type": "code_bug"|"infra_issue"|"config_issue"|"dependency_issue"|null, '
+        '"insufficient": true|false, "confidence": 0.0-1.0, "missing": ["缺什么才能定根因"], '
+        '"hypotheses": ["候选项1", "候选项2"], "ruled_out": ["被排除的假设"]}\n'
         "confidence 按证据强度给出 0-1 小数。\n"
         "ruled_out 必须列出你明确排除的假设类别（全小写英文，如 infrastructure / network / code）。"
     ),
@@ -277,6 +292,11 @@ SYSTEM_PROMPTS: dict[str, str] = {
     "fix-planner": (
         "你是「修复规划」Agent（fix-planner）。任务：根据根因给出修复计划。\n"
         "规则：\n"
+        "0. ⚠️ **上游根因若标注 `insufficient: true`（证据不足），不要出修复计划**：\n"
+        "   此时 `root_cause_type` 是 null——没有根因可修。请输出空的 steps，并在 summary 里\n"
+        "   写清**缺什么信息**才能继续。\n"
+        "   **不要拿「先做点无害的排查」去填空计划**——那会让下游（`fix-implementer`）\n"
+        "   在没有根因的情况下改代码。计划为空是**正确的输出**，不是失败。\n"
         "1. 区分止血（infra）与根治（代码/配置）两类动作\n"
         "2. 输出结构化计划：\n"
         '{"plan": {"summary": "计划摘要", "steps": [{"type": "code_fix"|"infra_action"|"config_change", '

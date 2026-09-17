@@ -521,9 +521,6 @@ nodes:
     agent: recap
   halt:
     kind: halt
-    params:
-      reason: "$.nodes.scope.output.summary"
-      missing: "受影响服务、发生时间、错误原文"
 edges:
   - { from: scope, to: probe, when: "$.nodes.scope.output.insufficient == false" }
   - { from: probe, to: recap }
@@ -540,6 +537,7 @@ async def _run_halt_case(insufficient: bool):
         calls[node.id] = calls.get(node.id, 0) + 1
         if node.agent == "scope":
             return {"summary": "无法定位到具体服务", "insufficient": insufficient,
+                    "missing": ["受影响服务", "发生时间", "错误原文"],
                     "candidate_services": []}
         return {"summary": f"{node.agent}-out"}
 
@@ -596,17 +594,66 @@ async def test_halt_output_carries_reason_and_missing() -> None:
     out = ex.node_states["halt"]["output"]
     assert out["halted"] is True
     assert "无法定位" in out["reason"]
-    assert out["missing"] == ["受影响服务、发生时间、错误原文"]
+    assert out["missing"] == ["受影响服务", "发生时间", "错误原文"]
+    assert out["triggered_by"] == ["scope"]
+
+
+async def test_halt_reason_comes_from_the_triggering_upstream() -> None:
+    """halt 的理由取自**触发它的那条边**的上游，而不是图里写死的某个节点。
+
+    实测踩过：params 原先写死指向 `scope`，加了 `rca → halt` 之后，rca 触发的 run
+    把 **scope 的 summary** 当成了中断理由——而那次 scope 是成功的，它在讲自己
+    定位到的服务，读起来完全误导。这里用两个触发点把"取错源"钉死。
+    """
+    yaml_text = """
+name: halt-two-triggers
+version: "1.0.0"
+inputs:
+  bug: { type: object, required: true }
+nodes:
+  scope:
+    agent: scope
+  rca:
+    agent: rca
+    params: { s: "$.nodes.scope.output.summary" }
+  halt:
+    kind: halt
+edges:
+  - { from: scope, to: rca, when: "$.nodes.scope.output.insufficient == false" }
+  - { from: scope, to: halt, when: "$.nodes.scope.output.insufficient == true" }
+  - { from: rca, to: halt, when: "$.nodes.rca.output.insufficient == true" }
+"""
+
+    async def runner(node, params):
+        if node.agent == "scope":
+            return {"summary": "定位到 order-service", "insufficient": False,
+                    "missing": [], "candidate_services": []}
+        # 取证节点全负证据 → rca 说不出根因
+        return {"summary": "各维证据全为负证据，无法确定根因类型",
+                "insufficient": True, "missing": ["窗口内的错误日志原文", "故障 trace"],
+                "root_cause_type": None, "confidence": 0.1,
+                "hypotheses": [], "ruled_out": []}
+
+    wf = Workflow.load_yaml(yaml_text)
+    ex = DAGExecutor("run_t", "tenant-a", wf.dag, InMemoryStateStore(), node_runner=runner)
+    await ex.run()
+
+    out = ex.node_states["halt"]["output"]
+    assert ex.get_status("halt") == DONE
+    assert out["triggered_by"] == ["rca"]
+    # ⚠️ 这正是修之前会拿到 scope 那句"定位到 order-service"的地方
+    assert "负证据" in out["reason"]
+    assert "定位到 order-service" not in out["reason"]
+    assert out["missing"] == ["窗口内的错误日志原文", "故障 trace"]
 
 
 async def test_halt_missing_normalized_to_list() -> None:
     """`missing` 归一成 `list[str]`——上游给的是字符串还是列表都收。"""
-    wf = Workflow.load_yaml(HALT_YAML)
-    ex = DAGExecutor("r", "t", wf.dag, InMemoryStateStore(), node_runner=make_runner())
-    assert ex._halt_output({"missing": "只有一个"})["missing"] == ["只有一个"]
-    assert ex._halt_output({"missing": ["a", "b"]})["missing"] == ["a", "b"]
-    assert ex._halt_output({"missing": None})["missing"] == []
-    assert ex._halt_output({})["missing"] == []
+    assert DAGExecutor._as_str_list("只有一个") == ["只有一个"]
+    assert DAGExecutor._as_str_list(["a", "b"]) == ["a", "b"]
+    assert DAGExecutor._as_str_list(["a", " "]) == ["a"]
+    assert DAGExecutor._as_str_list(None) == []
+    assert DAGExecutor._as_str_list("") == []
 
 
 #: 模拟"漏 gate 的那条边"：`side` 的入边是**无条件**的（对应实测里的 `know → rca`——

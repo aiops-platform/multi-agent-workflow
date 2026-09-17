@@ -222,20 +222,46 @@ class DAGExecutor:
         return all(st["status"] in TERMINAL for st in self.node_states.values())
 
     @staticmethod
-    def _halt_output(params: dict) -> dict:
-        """halt 节点的产出（确定性组装）。``missing`` 归一成 ``list[str]``。"""
-        missing = params.get("missing")
-        if isinstance(missing, str):
-            missing = [missing] if missing.strip() else []
-        elif isinstance(missing, list):
-            missing = [str(m) for m in missing if str(m).strip()]
-        elif missing is None:
-            missing = []
-        else:
-            missing = [str(missing)]
+    def _as_str_list(value: Any) -> list[str]:
+        """把 ``missing`` 归一成 ``list[str]``（模型有时给字符串、有时给数组）。"""
+        if isinstance(value, str):
+            return [value] if value.strip() else []
+        if isinstance(value, list):
+            return [str(m) for m in value if str(m).strip()]
+        if value is None:
+            return []
+        return [str(value)]
+
+    def _halt_output(self, node: Node) -> dict:
+        """halt 节点的产出：**从触发它的那个上游搬运判据**，不自己编。
+
+        为什么不把 ``reason`` / ``missing`` 写在图里（``halt.params``）：这跟"逐条
+        gate 边"是同一个脆弱面——**图作者每加一个触发点都得记得回来改 params**。
+        实测踩过：halt 的 params 原先写死指向 ``scope``，后来加了第二个触发点
+        ``rca → halt``，于是 rca 触发的 run 把 **scope 的 summary**（那次 scope 是
+        成功的、在讲它定位到的服务）当成了本次中断的理由，读起来完全误导。
+
+        "触发我的是谁"这个事实 executor 本来就知道（``_edge_active`` 求的就是它），
+        不需要图来转述——所以由执行器统一裁决，与 halt 全局跳过同一条原则。
+        """
+        triggers = [e.source for e in node.in_edges if self._edge_active(e)]
+        reason: str | None = None
+        missing: list[str] = []
+        for src in triggers:
+            out = self.node_states.get(src, {}).get("output")
+            if not isinstance(out, dict):
+                continue
+            if reason is None:
+                text = out.get("summary") or out.get("reason")
+                if text:
+                    reason = str(text)
+            if not missing:
+                missing = self._as_str_list(out.get("missing"))
         return {
             "halted": True,
-            "reason": str(params.get("reason") or "上游判定证据不足，流程在此中断"),
+            # 谁把流程停下的——给人看的诊断入口，也是"reason 到底转述了谁"的凭据。
+            "triggered_by": triggers,
+            "reason": reason or "上游判定证据不足，流程在此中断",
             "missing": missing,
         }
 
@@ -563,10 +589,10 @@ class DAGExecutor:
         try:
             if node.is_halt:
                 # halt 节点**不经 runner**（不调 LLM、不重试、不做幂等）。
-                # 它要做的事只有一件：把"为什么停、缺什么"如实带出去——那是对入参的
-                # 搬运，没有需要模型判断的地方。花一次 LLM 调用做这件事既慢又可能不
-                # 听话，而"中断"恰恰是最不该出岔子的那条路。
-                output = self._halt_output(params)
+                # 它要做的事只有一件：把"为什么停、缺什么"如实带出去——那是对**触发它的
+                # 上游输出**的搬运，没有需要模型判断的地方。花一次 LLM 调用做这件事既慢
+                # 又可能不听话，而"中断"恰恰是最不该出岔子的那条路。
+                output = self._halt_output(node)
             else:
                 output = await self._run_with_retry(
                     node, params, external_operation_id=self._external_operation_id(node, ctx)

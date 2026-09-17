@@ -848,3 +848,89 @@ cd <backend> && nohup ./venv/bin/python -m agentflow.worker --tenant otr > /tmp/
 
 `agentflow/agents/config_sync.py`（指纹计算）、`agentflow/agents/agent_config.py`
 （resolver 构建）
+
+## 19. `rca` 的 `join: any` 让「根因节点」拿不到任何取证输出
+
+> 2026-09-17 记录。**严重**：这不是"偶尔漏一条"，而是**每一次 run 都漏**——
+> 从有这两条 workflow 起就没生效过。发现路径：给 `rca → halt` 接线后做 E2E 验证，
+> 顺手核对 halt.reason 来自谁，结果发现 rca 的入参**全是 None**。
+
+### 现象（实测数据）
+
+`order-service-quotation-print-fail` 的一次正常 run（`run_8df33e75f4`），
+各节点 `cp.started_at`：
+
+| 节点 | started_at | ended_at |
+|---|---|---|
+| know | 09:23:20.064 | 09:23:24.410 |
+| **infra / logs / metrics / rca / trace** | **09:23:27.677**（同一微秒） | — |
+| trace | 〃 | 09:23:29.291 |
+| infra | 〃 | 09:23:29.822 |
+| logs | 〃 | 09:23:30.122 |
+| metrics | 〃 | 09:23:30.394 |
+| **rca** | 〃 | **09:23:38.203** |
+| locate | 09:23:38.216 | 09:23:43.195 |
+
+`rca` 与它的四个取证上游**同波启动**——rca 完成时它们才刚跑完一半。
+rca 落库的 `params` 印证了这一点（`run_8df33e75f4` / `run_70d386bbac` / `run_8bd...`）：
+
+```
+logs None · trace None · metrics None · infra None · code None · know [ok] · scope_primary None
+```
+
+**五个取证维度全 None，只有 `know` 有值。**
+
+### 成因
+
+```yaml
+  rca:
+    agent: root-cause
+    # ← 没有 join: all / required_edges
+edges:
+  - { from: logs,  to: rca }
+  - { from: trace, to: rca }
+  ...
+  - { from: know,  to: rca }   # ← know 只依赖 triage，早一波就绪
+```
+
+`join` 默认 `any`（`core/dag.py:66`），而 `know` 的入边是 `triage → know`——
+`triage` 一完成，`know` 就绪并跑掉，于是 `rca` 在**下一波**就被判定为 ready，
+与 `logs/trace/metrics/infra` **同波并发**。`params` 在节点启动时解析，
+此刻四大取数节点还是 PENDING → 全部解析成 `None`。
+
+### 为什么一直没被发现
+
+`root-cause` 自己**带全部 5 个数据工具**（YAML 注释：「root-cause 也会自行取证」），
+所以它自己又查了一遍，结论看起来仍然合理——**只是那条「把五维摘要交给 rca 做交叉判断」
+的设计从来没生效过**。没有任何报错、没有任何日志。
+
+同图里的 `locate` 恰恰做了正确示范（`join: all` + `required_edges`，注释还写明了
+「默认 join: any 会让它在 triage 一完成就被调度」）——**同一个坑，一个躲过了，一个没躲过**。
+
+### 影响面
+
+1. **诊断质量**：rca 无法交叉验证五维证据，也无法做 design-v5.7 §6 的
+   「scope 定位 vs trace failing_service」交叉判断（`scope_primary` 也是 None）。
+2. **冗余取数**：五维证据查了两遍（取证节点一遍、rca 自己又一遍），token 与时延双付。
+3. **与 halt 叠加**：`rca → halt` 现在**能中断整条 run**，而这个判据正是由这个
+   "看不见证据的 rca"给出的——判对了是运气（它自己查到了负证据），判错了代价很大。
+
+### 目标
+
+两条 workflow 的 `rca` 都补上（`locate` 已是这个形状）：
+
+```yaml
+  rca:
+    agent: root-cause
+    join: all
+    required_edges: [logs, trace, metrics, infra, locate, know]
+```
+
+注意 `join: all` 后，scope 判 `insufficient` 的路径上四个取数节点是 SKIPPED
+→ rca 入边不全 ACTIVE、但 sources 全终态 → **rca 判 SKIPPED**（而不是像现在这样跑一遍），
+正好与 `halt` 汇合。这需要重跑两个场景的 E2E 确认，不能只改 YAML 就收工。
+
+### 涉及文件
+
+workflow 的**真源是数据库**（见 CLAUDE.md §6.0），改完要 `PUT /workflows/{wid}`。
+仓库侧无文件——这也是它长期没被 review 发现的原因之一。

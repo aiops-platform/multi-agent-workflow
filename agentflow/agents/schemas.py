@@ -150,6 +150,12 @@ CandidateServicesSchema = {
         # 并把缺什么写进 summary——不要硬凑一个服务出来（design-v5.7 §3.6）。
         # `ambiguous: true` 是它的一个具体触发条件。
         "insufficient": {"type": "boolean"},
+        # 缺什么才能继续（结构化，与 `insufficient: true` 配套）。
+        # halt 节点就是靠它把"缺什么"带给人的——原先这个字段在图里被引用
+        # （`$.nodes.scope.output.missing`）却**从没进过 schema**，于是永远解析成
+        # None、halt 输出恒为 `missing: []`：读起来像"什么也不缺"，与同一份输出里
+        # 的 `insufficient: true` 自相矛盾。
+        "missing": {"type": "array", "items": {"type": "string"}},
         "summary": {"type": "string"},
     },
     "required": ["intent", "candidate_services", "summary"],
@@ -208,15 +214,27 @@ KnowledgeEvidenceSchema = {
 RootCauseSchema = {
     "type": "object",
     "properties": {
+        #: **证据不足时为 null，不要编一个。**
+        #:
+        #: 它原先在 required 里、且只有四个取值——实测踩过：零证据的一条 run 里 rca 填了
+        #: `config_issue`，而它自己的 hypothesis 写着「无代码缺陷证据，仅为剩余可能性中
+        #: 最低跨度的一项」。**编出来的类型会被下游当真**：plan 会照着出修复计划、
+        #: fix 会照着改代码。
         "root_cause_type": {
-            "enum": ["code_bug", "infra_issue", "config_issue", "dependency_issue"],
+            "type": ["string", "null"],
+            "enum": ["code_bug", "infra_issue", "config_issue", "dependency_issue", None],
         },
+        #: **必填**——它是"这份结论可不可信"的唯一结构化出口（与 `service-scoper` 的
+        #: `insufficient` 同形）。true 时 `root_cause_type` 应为 null。
+        "insufficient": {"type": "boolean"},
+        #: 缺什么才能定根因（与 `insufficient: true` 配套）。halt 转发给人与程序。
+        "missing": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number"},
         "hypotheses": {"type": "array", "items": {"type": "string"}},
         "ruled_out": {"type": "array", "items": {"type": "string"}},
         "summary": {"type": "string"},
     },
-    "required": ["root_cause_type", "confidence", "hypotheses", "ruled_out"],
+    "required": ["insufficient", "confidence", "hypotheses", "ruled_out"],
 }
 
 # 解决侧 Schema（M1 初版）
