@@ -651,3 +651,98 @@ curl -s -o /dev/null -w "%{http_code}\n" localhost:8000/workflows     # → 401
 
 > **建议**：先完成存量租户的库迁移（§一「存量租户需迁移」）再切 JWT。
 > 否则"哪个租户"同时受「旧库绑定」与「claim 派生」两层影响，排查会很难。
+
+---
+
+## 九、双场景 agent 行为验证（2026-09-17）
+
+> 目的：不只看"run 是否 success"，而是**逐节点核对它有没有按设计的方式工作**。
+> 两个场景连跑，每次记录每个节点的行为与判定。
+
+**跑法**：工单从 `POST /tickets` 建 → `POST /tickets/{tid}/run` 触发 → 读
+`GET /runs/{id}/traces` 逐节点核对（`kind=node` 的 `payload` 里有 `input`/`output`/
+`tool_steps`，`kind` 其它的是工具调用记录）。
+
+### 9.1 数据形状决定了考什么
+
+| | 场景 1 | 场景 2 |
+|---|---|---|
+| 故障 | 报价单打印失败（单服务基础设施） | 结账无响应（**跨服务代码故障**） |
+| ES 里谁报错 | order-service 16 条 | **warranty-service 2 条** |
+| **症状服务自己报错吗** | 报 | **不报**（order-service 挂起，零 ERROR） |
+| 工单 `cmdb_ci` | **空**（考 scope 的图定位） | `order-service`（症状服务，**考交叉判断**） |
+
+> ⚠️ **切换场景前必须清 ES 窗口**（`curl -X DELETE :19200/app-logs`），
+> 否则上一次的日志会污染这一次——两个场景的症状完全不同，混在一起没法判断谁是谁。
+
+### 9.2 结果：**全部关键路径按预期工作**
+
+| 节点 | 验证点 | 场景 1 | 场景 2 |
+|---|---|---|---|
+| `triage` | 零工具调用、`summary` 不含服务名/根因 | ✅ `tool_steps: 0` | ✅ |
+| `scope` | 定位到正确服务 | ✅ 靠 CMDB 关键词「报价」命中（工单没给服务名） | ✅ 用 `cmdb_ci`，且**只调图工具** |
+| `log-analyst` | 挑对错误（根因类，非症状） | ✅ `IOException: No space left on device` | ✅ **跨服务找到根因**：逐个查候选服务，在 warranty-service 找到 `IllegalArgumentException: 必填参数 fin 没有传` |
+| `trace-analyst` | 用工单的 `trace_id` | ✅ | ✅ 且写明「feign 超时只是表面症状」 |
+| `rca` | 交叉判断 `scope_primary` vs `failing_service` | ✅ 明写「**两者一致，相互印证**」 | ✅ 明写「**症状服务定位分歧**」——正确定根因在 warranty-service |
+| 输出契约 | 13 个节点对各自 schema | ✅ 12 个合规 | ⚠️ 同左（只有 `scope` 违反） |
+
+**最有价值的一条**：场景 2 里 `order-service` **自己零错误日志**，
+`log-analyst` 是靠"逐个查上游给的候选服务"把 warranty-service 的那条稀有根因捞出来的；
+`rca` 随后明确识别出「症状服务 ≠ 根因服务」。**这是 design-v5.7 §6 想要的交叉验证，
+实测成立。**
+
+### 9.3 ⚠️ 未解决的：agent 越界调用工具
+
+prompt 里写了"不要做 X"，**模型照样做 X**——因为它的工具列表里有 X。
+
+| 场景 | 越界行为 |
+|---|---|
+| 1 | `trace-analyst` 调 `query_metrics`（那是 `metrics-analyst` 的职责） |
+| 2 | `log-analyst` 调 `get_trace`（那是 `trace-analyst` 的职责） |
+| 2 | `trace-analyst` 仍先调 `query_logs`（prompt 明写"不要为了找 trace_id 先查日志"），且是**不带 service 的宽查询** |
+
+**对照实验**（同一批改动里）：
+
+| | 结果 |
+|---|---|
+| `triage` 禁止查数据 | ✅ **禁住了**——因为它 **`mcp_server_ids` 被解绑**，手上没有工具 |
+| `trace-analyst` 禁止先查日志 | ❌ **没禁住**——它手上有全部 9 个工具 |
+
+> **结论：靠 prompt 禁止一个行为是无效的，得靠工具面。**
+> 根因是 MCP 工具绑定**只有 server 级粒度**，而 9 个工具全在同一个 server 上——
+> 要么全给、要么全不给。详见 `TODO.md` §16。
+
+### 9.4 另一个未解决：`scope` 不输出新契约字段
+
+`CandidateServicesSchema` 新增的 `evidence_source`（**必填**）、`business_paths`、
+`matched_domains`、`ambiguous`，**两个场景都没输出**：
+
+```
+evidence_source : None      ← 必填却缺
+business_paths  : 无
+matched_domains : null
+```
+
+而 **13 个节点里 12 个合规，只有 `scope` 违反**——所以不是系统性问题，也不是配置没生效
+（`GET /agents/service-scoper` 能查到新 prompt 与新 schema）。
+
+**推测**：scope 的 prompt 已经很长（3609 字符 / 6 条规则 / 规则 3 有 8 个子项），
+新字段埋在规则 3 的第 7 个子项里，被淹没了。
+
+> ⚠️ schema 只是塞进 prompt 的**提示**，`scopes.py` 的 `run_agent` 只做 `json.loads`，
+> **没有 schema 硬校验**。所以"字段是必填的"只对模型构成请求，不构成约束。
+
+### 9.5 偶发的 LLM API 连接失败（非 agent 问题）
+
+场景 2 的前两次 run 都失败，但**错误各不相同**，且都是连接层：
+
+```
+run_44de89c97d  scope  [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] ...
+run_f7f1801d95  triage Request timed out.（3 次重试全超时）
+```
+
+判定依据：**DeepSeek API 直连测 3/3 成功（~1s）**，且场景 1 那次（带全部改动）成功过。
+第 3 次 run 就通了，两个场景的其余节点全部正常。
+
+**排障提示**：见到这类错误先直连测一次 API，别急着怀疑 agent 逻辑——
+`grep "执行失败" <worker 日志>` 能直接看到是哪个节点、什么错。

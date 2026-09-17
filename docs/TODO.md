@@ -24,6 +24,7 @@
 | 14 | 分层：API ↔ Service ↔ Repository | 债，不阻塞。已有一处**重复实现**与一处**反向依赖** |
 | 15 | `datasource/` 例外：保留但立规矩 | 例外**合理**；含一个**无鉴权端点**（只读低危） |
 | 16 | MCP 工具绑定只有 **server 级**粒度 | 实现不了「scope 只拿图工具、取数节点只拿数据工具」 |
+| 17 | `scope` 不输出业务域消歧字段 | 加的结构化字段没到下游 → 相当于白做 |
 
 ---
 
@@ -654,6 +655,26 @@ AgentScope 的 `Toolkit(mcps=[...])` **没有按工具过滤的入口**；`ToolP
 **triage 解绑**（`mcp_server_ids` → NULL）——它本就不该有工具（症状分类只看工单文本），
 所以"全不给"恰好就是正确答案。配套改了 prompt 与 `_SERVICES_RULE`。
 
+### 实测证据（2026-09-17，双场景 E2E）
+
+**prompt 禁止不住行为，只有工具面能禁。** 同一批改动里的对照实验：
+
+| | 结果 |
+|---|---|
+| `triage` 禁止查数据 | ✅ **禁住了**——因为它 `mcp_server_ids` 被解绑，手上没有工具 |
+| `trace-analyst` prompt 明写"不要为了找 trace_id 先查日志" | ❌ **没禁住**——它手上有全部 9 个工具 |
+
+实测的三次越界：
+
+| 场景 | 越界行为 |
+|---|---|
+| 1 | `trace-analyst` 调 `query_metrics`（`metrics-analyst` 的职责） |
+| 2 | `log-analyst` 调 `get_trace`（`trace-analyst` 的职责） |
+| 2 | `trace-analyst` 仍先调 `query_logs`，且是**不带 service 的宽查询** |
+
+> 这不是模型不听话——**它的工具列表里有那个工具，prompt 只是在请求，不是在限制**。
+> 详见 `docs/E2E_VERIFICATION_zh-CN.md` §9.3。
+
 ### 缺口
 
 `service-scoper` **该有**图工具（design-v5.7 §3.5 点名 `query_entity_graph` +
@@ -674,3 +695,53 @@ AgentScope 的 `Toolkit(mcps=[...])` **没有按工具过滤的入口**；`ToolP
 
 `agentflow/agents/mcp.py`（`build_toolkit`）、`agentflow/api/agent_store.py`（如需加列）、
 `aiops-mcp-servers/servers/aiops-datasource-mcp-server/server.py`（拆实例）
+
+---
+
+## 17. `scope` 不输出业务域消歧字段
+
+> 2026-09-17 记录。做双场景 E2E 时实测：新加的结构化字段**一个都没输出**。
+
+### 现状
+
+`CandidateServicesSchema` 新增的字段，**两个场景都没出现在 scope 的输出里**：
+
+```
+evidence_source : None      ← **必填**字段却缺
+business_paths  : 无
+matched_domains : null
+ambiguous       : null
+in_domain       : null
+```
+
+而 **13 个节点里 12 个合规，只有 `scope` 违反**——所以不是系统性问题，也不是配置没生效
+（`GET /agents/service-scoper` 能查到新 prompt 与新 schema，`agent_configs` 两列都是 NULL
+走代码回退）。
+
+**后果**：所有"业务域消歧"的工作（`business_paths` / `matched_domains` / `in_domain` /
+`ambiguous`）**全部止步于 scope，没有到达任何下游**。相当于白做。
+
+### 两个原因（都要处理）
+
+1. **prompt 太长，新字段被淹没。** scope 的 prompt 已 3609 字符 / 6 条规则，
+   其中规则 3 有 8 个子项，新字段的要求埋在第 7 个子项里。
+   → 应把**输出契约**从流程规则里**拎出来单独成段**，不与"怎么做"混在一起。
+
+2. **schema 没有硬校验。** `scopes.py` 的 `run_agent` 只做 `json.loads`，
+   **不校验 required**。所以"必填"只对模型构成**请求**，不构成**约束**。
+   → 要么加校验（注意 `scope` 的 `on_failure: abort`，校验失败会挂整个 run，
+   需要配 `retry` 才合理），要么承认 schema 只是提示、别在 required 里放关键字段。
+
+> ⚠️ 加校验前先想清楚失败策略：`scope` 现在是 `abort`，一个字段没填就整条 run 挂掉，
+> 代价可能大过收益。**建议先做 1（改 prompt 结构），观察是否解决。**
+
+### 另一处相邻问题：`scope` 会自造零证据候选
+
+场景 1 里它输出过一个 `hit_paths: 0` 的候选，reasons 里自己写着
+「**非工具输出**：由图谱探索补出的同域节点…」。prompt 说"工具返回的是事实，直接采信"，
+但**没明说"不许自己加"**。→ prompt 补一句即可。
+
+### 涉及文件
+
+`agentflow/agents/prompts.py`（`service-scoper` 段）、`agentflow/agents/scopes.py`
+（若要加校验）
