@@ -20,6 +20,9 @@
 | 10 | 清预置 lint / 测试债 | 不阻塞，但债会让回归信号不可信 |
 | 11 | 其余小项 | 观察项 / 长期项 |
 | 12 | 已完成（留痕） | 无正文，只记 commit 与结论 |
+| 13 | 新租户缺「播种」 | 新租户直接起不来诊断（`/tickets/{tid}/run` 400） |
+| 14 | 分层：API ↔ Service ↔ Repository | 债，不阻塞。已有一处**重复实现**与一处**反向依赖** |
+| 15 | `datasource/` 例外：保留但立规矩 | 例外**合理**；含一个**无鉴权端点**（只读低危） |
 
 ---
 
@@ -429,3 +432,195 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 
 > **与版本冻结的关系**：run 用 snapshot，改 YAML **不影响已发起**的 run（这是对的）；
 > 但新租户 / 新建的库必须有一份初始的——缺的就是这一步。
+
+---
+
+## 14. 分层：API ↔ Service ↔ Repository（+ 执行引擎）
+
+> 2026-09-17 记录。**分层定义（本项目采用）**：
+>
+> | 层 | 定义 | 判据 |
+> |---|---|---|
+> | **API** | 带 FastAPI、**经外部 HTTP 访问**的接口 | 文件里有 `from fastapi` |
+> | **Service** | **进程内**调用，只做逻辑组装，**不含 FastAPI** | 无 fastapi、无 `api/` |
+> | **Repository** | 数据访问 | 被 service 调用，不反向依赖 |
+>
+> 调用方向：**API → Service → Repository**。
+>
+> ⚠️ 本项前两版分别基于「未 pull 的副本」与「执行侧 vs 网页侧」两种框子，**均已作废**。
+> 本版按上面的分层定义重做，全部结论有实测支撑。
+
+### 一、现状分类（实测）
+
+**① 谁真的带 FastAPI**——全包只有 **2 个文件**：
+
+```
+api/app.py     5 处   ← 37 个端点全在这
+api/auth.py    2 处   ← 租户上下文依赖
+```
+
+（`datasource/*` 里那两处是**注释**——`prometheus.py` 原文就写着"本模块零 FastAPI 依赖"。
+不能靠 grep 字符串判层，得看是不是真的 import。）
+
+**② 各层现状**：
+
+| 层 | 现状 | 判定 |
+|---|---|---|
+| API | `api/app.py`、`api/auth.py` | ✅ 干净 |
+| Service | `service.py`（RunService） | ✅ 干净——不 import fastapi，也不 import `api/` |
+| Repository | `statestore/*`（含 `router.py`）、**`api/*_store.py` ×5** | ❌ 一半被错放在 `api/` 下 |
+| （三层之外）执行引擎 | `executor/`、`agents/`、`workspace/`、`sandbox/`、`core/` | 不在这个分层里，见下 |
+
+### 二、四处违反（按真实程度排序）
+
+**① （最大）API 层直接编排一切。** `api/app.py`（1600+ 行）import 了 **11 个顶层包**：
+
+```
+agents approval config core datasource executor lock queue service statestore tenants worker
+```
+
+其中包括 `from ..worker import WorkerPool`——`queue=memory` 模式下 API 内联拉起 worker
+（这是设计，见 README），**但也说明这个文件同时在当端点层与当编排层**。
+它 import 了 `service`，可大量编排逻辑仍写在端点文件里。
+
+> **判据 1「`api/` 只 import service 与 fastapi」当前被大面积违反。**
+> 危害不是"难看"：端点文件里混着执行编排，任何改执行语义的人都要在 1600 行里翻。
+
+**② Repository 被放在 API 层**（`api/*_store.py` ×5）：
+
+```
+api/app.py                37 端点   ← API 层
+api/auth.py                0 端点   ← API 层（FastAPI 依赖）
+api/agent_store.py         0 端点   ← Repository
+api/management_store.py    0 端点   ← Repository
+api/mcp_store.py           0 端点   ← Repository
+api/ticket_store.py        0 端点   ← Repository
+api/workflow_store.py      0 端点   ← Repository
+```
+
+后果是**依赖方向反了**：`statestore/router.py`（Repository）→ `api/`（API 层）。
+今天零代价，但锁死未来——哪天某个 store 需要 import `app.py` 里的东西，
+Worker 进程就会被真的拖上整个 web 栈（FastAPI / starlette / uvicorn），**且不会有任何提示**。
+
+**③ Worker 绕过 Service，直接调 Repository + 执行引擎**——而且**已经造成重复实现**：
+
+`service.py:231` 与 `worker.py:212` 各有一份 `_mark_cancelled`，**逐行近乎相同**
+（唯一差别是 Worker 那版自己 `resume_executor` 重建 executor）：
+
+```python
+for nid, st in ex.node_states.items():
+    if st.get("status") in TERMINAL: continue
+    ex.node_states[nid] = {"status": "cancelled", "output": None}
+    await store.put_node(run_id, tenant_id, nid, ex.node_states[nid])
+await store.update_run(run_id, status="cancelled")
+```
+
+Worker 那版的 docstring 自己写着「**与 RunService.stop_run 同语义**」——**两处要同步维护**。
+这是分层被绕过的**实际代价**，不是理论担忧。
+
+**④ API 层直接做数据访问**：`api/app.py` 的 `/app-indicators` 直接调 `datasource/`，
+跳过了 Service。按定义 `datasource/` 是取数适配器（repository 性质），
+而 API 应只调 Service。
+
+> 这条是**边界情况**：该端点就是个纯透传快照，为它加一层 service 可能只是仪式。
+> 要么补一层，要么在 §15 里显式记为"已知例外"。**不要**默认它没问题。
+
+### 三、与「进程归属」的关系（两把尺子，都要用）
+
+分层（角色）与进程归属（跑在哪）**是正交的两件事**，同一模块两个答案都要对：
+
+| 模块 | 层 | 跑在 |
+|---|---|---|
+| `api/app.py`、`api/auth.py` | API | 仅 API 进程 |
+| `service.py` | Service | **两个进程都要**（Worker 也必须经它，见违反 ③） |
+| `statestore/*`、5 个 `*_store.py` | Repository | 两个进程都要 |
+| `executor/`、`agents/`、`workspace/`、`sandbox/` | 执行引擎（三层之外） | 仅 Worker |
+| `datasource/` | 取数适配器 | 仅 API 进程 |
+
+> 实测方法（可复核）：按入口点做传递导入闭包。当前 **Worker 加载的包是 API 的真子集**，
+> 且 Worker 会加载 `api` 包（违反 ② 的直接证据）。
+
+### 四、目标
+
+```
+agentflow/
+  api/          ← 只放 FastAPI 端点 + 认证依赖
+  service/      ← 逻辑组装（RunService + 执行编排）
+  repository/   ← 数据访问（statestore/* + 5 个 *_store.py 迁入）
+  (其余不变)     ← 执行引擎 / 基建，不属于三层
+```
+
+**强制判据**（可写成测试，比约定可靠）：
+
+1. `api/` **只** import service 与 fastapi
+2. `service/` 与 `repository/` **不得** import fastapi，也**不得** import `api/`
+3. Worker **必须经 service**，不得直接调 repository（违反 ③）
+4. Repository **不得**依赖 service / api（违反 ②）
+
+### 五、分两批
+
+- **批 A（小、对症）**：5 个 store 从 `api/` 挪到 repository 层；把 Worker 的
+  `_mark_cancelled` 换成调用 service —— 违反 ② ③ 一起消。约 20 处 import。
+- **批 B（大、表达意图）**：按上面的目标建目录。**只有批 A 做完、且确有更多
+  越界出现时才值得做**——单纯为了好看搬 `core/` / `agents/`，diff 与收益不成比例。
+
+> **不要**顺手拆 `app.py`。37 个端点挤一个文件确实大，但拆它没有分层收益、
+> 只有 review 噪音——那是另一件事。
+
+### 涉及文件
+
+批 A：`agentflow/api/{agent,management,mcp,ticket,workflow}_store.py`、
+`agentflow/statestore/router.py`、`agentflow/worker.py`、`agentflow/service.py`、
+`agentflow/api/app.py`，以及对应的 8 个测试文件
+
+---
+
+## 15. `datasource/` 架构例外：**保留，但要立规矩**
+
+> 2026-09-17 记录。前身是 §14 首版里对它的批评，**那些批评基于未 pull 的旧副本，已作废**。
+> 重新核实后结论反转：**例外是合理的。**
+
+### 为什么合理（三个结构性差异，不是"少几个指标"）
+
+`GET /app-indicators` 的真实消费者是遗留前端 Smart Inspection 页面
+（`js/app.js:initSmartInspection`，`76e9adc` 起走相对路径 `/agentflow`，5 秒轮询）。
+
+| | MCP（`aiops-datasource-mcp-server`） | 这个页面要的 |
+|---|---|---|
+| 形态 | `query_range` **时序** | **瞬时快照**，一次拉全表 |
+| 指标 | 5 个领域语义（cpu/memory/**disk_percent**/error_rate/p95） | 还要 **blockIO / netIO / netIn / netOut** |
+| 元数据 | — | `owner` / `serviceType` 来自 K8s Deployment label |
+
+⚠️ **注意 `disk` 那一列是 `disk: item.blockIO`**——页面显示的其实是**块设备 IO**，
+不是 MCP 的 `disk_percent`（容量）。**同名不同物**，硬套会更糟。
+
+### 与 §14 的关系
+
+本包**只被 `api/app.py` 调用**——即 **API 层直接做数据访问，跳过了 Service**
+（§14 违反 ④）。要么补一层 service，要么把"这是已知例外"写在这里，**不要默认它没问题**。
+
+### 三个仍然成立的问题
+
+1. **端点无鉴权**（`app.py:1582`）。JWT 模式下其余 34 个端点都要 `get_tenant_context`，
+   只有它不要——而 `tests/test_app_indicators_api.py` 还专门写了一条测试把它
+   **「回归锁定」**（第 56 行"刻意不带任何 Header / Token"）。
+   **把一个安全缺口锁成了不可回退的约定。** 加了真实消费者之后这条更值得处理。
+2. **收编期限没有正文条目**：代码里三处 `TODO(v5.7)`，`docs/TODO.md` 里搜不到。
+   例外会因此永久化。
+3. **重复实现已知会分叉**：`container!="POD"` 在测试床集群上算错（sandbox 序列的
+   `container` 标签缺失，CPU 接近翻倍），正解是 `container!=""`。
+   同一件事两处实现，一边对一边错——**而且错的是 MCP 侧（我们自己）**。
+
+### 目标
+
+- **保住例外**（它服务的是 MCP 覆盖不了的需求），但**立规矩**：
+  - 端点鉴权：要么加 token（并同步改遗留页面），要么在部署侧限制来源；
+    **至少不要用测试把"无鉴权"锁死**
+  - 把内联的 `TODO(v5.7)` 变成 TODO 列表里看得见的一条
+- **顺手修 MCP 侧的 `container!=""`**（与例外无关，是我们自己的缺陷）
+
+### 涉及文件
+
+`agentflow/api/app.py`（`/app-indicators`）、`agentflow/datasource/*`、
+`tests/test_app_indicators_api.py`；
+MCP 侧 `backends/prometheus.py`（`_sel()`）

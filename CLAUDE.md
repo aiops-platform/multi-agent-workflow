@@ -154,6 +154,50 @@ make lint      # ruff 检查
     **场景复现需干净日志窗口**：连续跑两场景会互相污染，切换前
     `curl -X DELETE :19200/app-logs` 清窗。
 
+11. **分层：API ↔ Service ↔ Repository**（2026-09-17 定）。**新增/移动模块前先定它属于哪层。**
+
+    | 层 | 定义 | 判据 |
+    |---|---|---|
+    | **API** | 带 FastAPI、**经外部 HTTP 访问**的接口 | 文件里真的 `from fastapi import …` |
+    | **Service** | **进程内**调用，只做逻辑组装，**不含 FastAPI** | 无 fastapi、无 `api/` |
+    | **Repository** | 数据访问 | 被 service 调用，**不反向依赖** |
+
+    调用方向 **API → Service → Repository**，**不可跳层**。
+
+    ⚠️ **判层不能 grep 字符串**——`datasource/*.py` 的 docstring 里就写着 "FastAPI"，
+    而它零依赖。看 `import`，不看注释。
+
+    **四条判据**（应当写成测试，比约定可靠）：
+
+    1. `agentflow/api/` **只** import service 与 fastapi
+    2. `service/` 与 `repository/` **不得** import fastapi，也**不得** import `api/`
+    3. **Worker 必须经 service**，不得直接调 repository / executor
+    4. Repository **不得**依赖 service / api
+
+    ⚠️ **当前代码有四处已知违反，别把现状当范本**（整改计划见 `docs/TODO.md` §14）：
+
+    - **（最大）API 层直接编排一切**：`api/app.py`（1600+ 行）import 了 **11 个顶层包**
+      —— `agents approval config core datasource executor lock queue service statestore
+      tenants worker`，其中包括 `from ..worker import WorkerPool`（`queue=memory` 模式
+      下 API 内联拉起 worker，这是设计，但也说明这个文件同时在当端点与当编排层）。
+      **它 import 了 `service`，可大量编排逻辑仍写在端点文件里**——新增端点时请把逻辑
+      放进 Service，别继续往这个文件里堆。
+    - **`api/*_store.py` ×5 是 Repository，却放在 API 层** → `statestore/router.py`
+      （Repository）反向依赖 `api/`。今天零代价，但它锁死未来：哪天某个 store 要
+      import `app.py` 的东西，**Worker 进程就会被拖上整个 web 栈**（FastAPI/starlette/
+      uvicorn），且不会有任何提示。
+    - **Worker 绕过 Service**（`worker.py` 直接调 executor + repository），
+      **已经造成重复实现**：`service.py:231` 与 `worker.py:212` 各有一份逐行近乎相同的
+      `_mark_cancelled`，Worker 那版的 docstring 自己写着「与 RunService.stop_run 同语义」。
+      **两处要同步维护**——这就是跳层的实际代价。
+    - **`/app-indicators` 由 API 层直接调 `datasource/`**（跳过 Service），
+      是已知边界情况，见 `docs/TODO.md` §15。
+
+    > **分层（角色）与进程归属（跑在哪）是正交的两把尺子，同一模块两个答案都要对**：
+    > `api/app.py` = API 层 + 仅 API 进程；`service.py` = Service 层 + **两个进程都要**；
+    > `statestore/` = Repository + 两个进程都要；`executor/` `agents/` `sandbox/`
+    > = 执行引擎（不属三层）+ 仅 Worker。
+
 ## 结构速览（v5.3 新增：api/management_store.py、statestore/router.py、tenantctl.py、
 exec_context.py、docs/DEPLOYMENT_zh-CN.md）
 
@@ -175,12 +219,15 @@ sandbox/     M4：exec 服务(纯 stdlib) + SandboxClient + Orchestrator + Actio
 approval/    M5：审批超时 Sweeper + 通知
 audit/       M5：审计日志
 queue/ lock/ 可插拔队列/锁（memory + kafka/redis 生产适配器）
-service.py   RunService：create / approve / resume 编排
-api/         控制面 FastAPI
-             ├ management_store.py  管理库（tenants/schema_versions + db_ref 加密）
-             ├ workflow_store.py / mcp_store.py / agent_store.py / ticket_store.py
-             │   四张控制面配置表 —— **都随租户库走**（TenantStores bundle）
-             └ tenantctl.py        租户生命周期 CLI
+service.py   RunService：create / approve / resume 编排          ← Service 层（约束 §11）
+api/         ⚠️ 按约束 §11 **只应放 API 层**，当前**混入了一层 Repository**：
+             ├ app.py / auth.py                     ← API 层（37 端点 / 租户上下文依赖）
+             └ management_store.py / workflow_store.py / mcp_store.py /
+               agent_store.py / ticket_store.py     ← **实为 Repository，放错了层**：
+                 管理库（tenants/schema_versions + db_ref 加密）与四张控制面配置表
+                 （**都随租户库走**，TenantStores bundle）。它们被 `statestore/router.py`
+                 与 `worker.py` 依赖 —— **反向依赖**，整改见 `docs/TODO.md` §14
+tenantctl.py 租户生命周期 CLI（**在顶层**，不在 api/ 下）
 workflows/   ⚠️ **已删除**（2026-09-16）——workflow 的真源是数据库，不是仓库文件。
              见下方「工作流的真源」。原设计的 DAG 形态留在 docs/design-v5.6.md §8.1。
 scripts/     watch_run.py（run 逐阶段观测）+ mock_mcp_server.py + verify_sandbox.py
