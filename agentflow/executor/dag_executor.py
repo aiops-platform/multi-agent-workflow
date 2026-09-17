@@ -53,8 +53,15 @@ SIDE_EFFECT_AGENTS = frozenset({"committer", "infra-remediator"})
 
 
 class WorkflowNodeFailed(Exception):
-    def __init__(self, node_id: str, cause: Exception) -> None:
-        super().__init__(f"节点 {node_id} 执行失败（重试耗尽）: {cause}")
+    """节点失败 → run 判 failed。
+
+    ``message`` 可覆盖默认措辞：默认那句「执行失败（重试耗尽）」只对**真跑挂**的节点成立，
+    而审批被驳回（on_reject: abort）压根没重试过——照搬会输出
+    「执行失败（重试耗尽）: 审批被驳回」这种自相矛盾的行（实测踩过）。
+    """
+
+    def __init__(self, node_id: str, cause: Exception, *, message: str | None = None) -> None:
+        super().__init__(message or f"节点 {node_id} 执行失败（重试耗尽）: {cause}")
         self.node_id = node_id
         self.cause = cause
 
@@ -280,6 +287,40 @@ class DAGExecutor:
             if node.is_halt and self.node_states.get(nid, {}).get("status") == DONE:
                 return True
         return False
+
+    def rejected_abort_node(self) -> str | None:
+        """有审批被驳回、且该节点声明 ``on_reject: abort`` → 返回该节点 id。
+
+        **判据必须是"状态"，不能是"动作"**——实测踩过：最早写在 :meth:`approve` 里
+        （驳回时 append 到 ``self.failed``），inline 模式能中止，**queue 模式不能**：
+        Worker 是经 :meth:`from_checkpoint` 重建 executor 后直接 ``run()`` 的，
+        **压根不会调 ``approve()``**（API 侧已 CAS 落库，恢复时该节点就是 REJECTED）。
+        于是驳回后 run 照样报 `done`，只有下游被 SKIPPED 掉——**看着像"正常结束"**。
+
+        按状态判定则两条路径同构：inline 的 ``approve()`` 与 queue 的 checkpoint
+        恢复都只是把节点置成 REJECTED，判定逻辑只有一份。
+
+        ``on_reject`` 的语义（§8.1；取值见 design-v5.0 §7.3.2 状态机
+        「rejected → 终止/失败」与 `# 或 "continue"`）：
+
+        - ``abort``（默认）：驳回 = **中止整条 run**（run 判 failed）；
+        - ``continue``：沿图上 ``when: approved == false`` 的边路由。
+
+        ⚠️ 这个字段此前是**死的**——`core/dag.py` 解析进 Node 模型之后全仓没有消费方
+        （`grep -rn "on_reject" --include=*.py` 只有解析那三行）。图上写 `abort` 的节点
+        实际一直走"沿拒绝边路由"，**窄的那条静默胜出**。
+
+        **超时**（``REJECTED_CANCELED``，sweeper 置）不走这里——那是 `on_timeout`
+        的语义，本轮未实现，仍按既有行为沿拒绝边级联。
+        """
+        for nid, node in self.dag.nodes.items():
+            if (
+                node.is_approval
+                and node.on_reject == "abort"
+                and self.node_states.get(nid, {}).get("status") == REJECTED
+            ):
+                return nid
+        return None
 
     def is_releasable(self) -> bool:
         """§8.6：仅当 ready 集为空时才释放 Worker。"""
@@ -647,6 +688,18 @@ class DAGExecutor:
                     break
             if self.failed:
                 raise WorkflowNodeFailed(self.failed[0], RuntimeError("上游节点失败"))
+            # 审批被驳回且声明了 on_reject: abort → 中止整条 run。
+            # 与"节点跑挂了"分开报：驳回是"有人做了决定"，不是执行出错。
+            rejected = self.rejected_abort_node()
+            if rejected is not None:
+                raise WorkflowNodeFailed(
+                    rejected,
+                    RuntimeError("审批被驳回"),
+                    message=(
+                        f"审批节点 {rejected} 被驳回，且声明了 on_reject: abort "
+                        f"——整条 run 中止（这不是执行出错，是人工决策）"
+                    ),
+                )
             if self._pause_requested and not self.all_terminal():
                 return "paused"
             ready = self._ready_nodes()
@@ -702,6 +755,7 @@ class DAGExecutor:
         }
         await self._persist(nid)
         log.info("[%s] approval %s -> %s by %s", self.run_id, nid, to_status, by)
+
         return output
 
     # ==================================================================

@@ -28,6 +28,7 @@
 | 18 | **改代码不热载**：Worker 只认库内指纹 | 每次改 prompt/schema 都会静默用旧版——已在实测中骗过一次 |
 | 19 | ~~`rca` 的 `join: any`~~ | ✅ 已修——**根因节点从来没拿到过取证输出**（五维摘要恒为 None），见下 |
 | 20 | ~~缺 `trace_id` 的工单炸整条 run~~ | ✅ 已修——把"证据缺失"表达成了"执行失败"；修完暴露了下游无守卫，一并补 `locate → halt` |
+| 21 | ~~`plan → fix` 无人拍板 + `on_reject` 死配置~~ | ✅ 已修——修复计划没有任何决策点；且 queue 模式下中止逻辑压根不生效 |
 
 > **中断语义（halt）不在本清单里**——它已实施并实测通过（`8841d20` / `2821ac5`），
 > 约定见 `CLAUDE.md` 约束 3 与 `docs/E2E_VERIFICATION_zh-CN.md` §四验收点。
@@ -1099,3 +1100,96 @@ halt 的 `reason` 正是要的那句：「入参 target_service 为空，本节�
 原因是 `locate` 的 params 只有 `{bug, target_service}`，**根本收不到时间窗**，
 模型于是把它当成"工单没提供"。措辞不准，但结论（取不到）是对的。
 要修就是给 `locate` 补 `start_time`/`end_time` 入参——影响很小，未做。
+
+## 21. ~~`plan → fix` 直连（修复计划无人拍板）+ `on_reject` 是死配置~~ ✅ 已修复（2026-09-18）
+
+> 用户报的：「plan 的结果还没有等待审批通过就走了后续 fix」。查下来是**两条独立的缺陷**
+> 叠在一起，都在同一条路径上。
+
+### 缺陷 ①：修复计划没有任何决策点
+
+`plan → fix` 是**无条件直连**，而代码路上唯一的审批 `approve-commit` 在
+`fix → test → review` **之后**、且只 gate `commit`。于是"修复计划"这个人本该拍板的东西，
+流程里没有它的位置。
+
+**实测代价**（`run_b156f65142`）——plan 自己就写着：
+
+> 第 3、4 步落地前**必须先核对**代码中清理分支与实际生效配置，**否则可能修错位置**
+
+而第 3、4 步正是 `code_fix`。日志显示它们已经跑完了：
+
+```
+00:41:50  done plan
+00:41:50  ⭐ approval approve-remediate -> waiting_approval
+00:42:38  done fix          ← 审批还挂着，代码已经改了
+00:42:58  done test
+00:43:09  done review
+00:43:09  ⭐ approval approve-commit -> waiting_approval   ← 同时挂起两个审批
+```
+
+**同一时刻挂两个审批**：人看到的第一个是"审批基础设施止血动作"，而代码那条路早已走完。
+
+> 图作者未必是无意的——`approve-remediate` 的 `name` 写明「审批基础设施**止血动作**」、
+> 注释「止血要动生产环境，前置审批」，审批点确实放在"离开沙箱"的动作之前
+> （发 PR、动 K8s）。**但 v5.6 §4.6.2 的风险表写的是**
+> 「沙箱内代码修复 + 测试」= **medium** → 「注入 approval 节点」——
+> 按设计，fix 前面**应该**有审批。
+
+### 缺陷 ②：`on_reject` 从来没人读
+
+两个审批节点都写了 `on_reject: abort`，但全仓消费方为零：
+
+```
+$ grep -rn "on_reject" --include="*.py" . | grep -v .venv
+agentflow/core/dag.py:71    on_reject: str = "abort"   # 解析进 Node 模型
+agentflow/core/dag.py:135   on_reject = spec.pop(...)
+agentflow/core/dag.py:159   on_reject=on_reject,
+                            ↑ 到此为止
+```
+
+实际走向由 `when: approved == false` 边决定。而 `approve-remediate` **同时**写了
+`on_reject: abort` 与 `approved == false → recap` 边——**两条矛盾的意图，窄的那条静默胜出**。
+
+`on_reject` 从 design-v5.0 的 YAML 示例就有，v5.1 注释里有「走 on_reject 逻辑」，
+`docs/AGENTFLOW_UI_INTEGRATION_RESEARCH` 还把它列为**节点字段**。
+**设计里有、实现里没有、测试里零覆盖。**
+
+### 修复
+
+**① 图**（两图都改）：在 `plan` 之后插入 `approve-plan` 审批节点，
+`plan **不**直达 fix`；场景 1 的止血路也改挂到 `approve-plan` 之后：
+
+```yaml
+  - { from: plan, to: approve-plan }
+  - { from: approve-plan, to: fix, when: "$.nodes.approve-plan.output.approved == true" }
+  - { from: approve-plan, to: approve-remediate, when: "...approved == true" }   # 场景1
+```
+
+**② `on_reject` 落地**（`rejected_abort_node()`）：`abort` = 驳回中止整条 run；
+`continue` = 沿拒绝边路由。取值照 design-v5.0 §7.3.2 状态机的
+「rejected → 终止/失败」与 `# 或 "continue"`。
+
+**判据必须是状态、不能是动作**——这是实现时踩的第二个坑：第一版写在 `approve()` 里
+（驳回时 append 到 `self.failed`），**inline 模式能中止，queue 模式不能**。
+Worker 是 `from_checkpoint` 重建 executor 后直接 `run()` 的，**压根不调 `approve()`**
+（API 侧已 CAS 落库，恢复时该节点就是 REJECTED）。实测现象：驳回后 run 照样报 `done`，
+只有下游被 SKIPPED——**看着像"正常结束"**。改成按状态判定后两条路径同构。
+
+**③ 三处 `WorkflowNodeFailed` 措辞**：默认那句「执行失败（重试耗尽）」对驳回不成立
+（驳回压根没重试过），照搬会输出「执行失败（重试耗尽）: 审批被驳回」这种自相矛盾的行。
+
+### 实测
+
+| 场景 | 结果 |
+|---|---|
+| 跑到 plan 完成 | 挂 `approve-plan`，**`fix` 未执行**（改前：48s 后 fix 就跑完了） |
+| 批准 | `fix → test → review → approve-commit` 依次执行（两图都验） |
+| 驳回 | `status=failed`，`approve-plan=rejected`，下游全 `skipped`，错误信息写明"这不是执行出错，是人工决策" |
+
+测试 +3（含一条**恢复路径**的回归——正是刚才骗过我的那条），全量 376 通过。
+
+### 残留
+
+- `approve-remediate` / `approve-commit` 仍用 `on_reject: continue`（它们有显式 recap 边）。
+  要不要改成 `abort` 是产品选择，未动。
+- **超时**（`REJECTED_CANCELED`）不走 `on_reject`——那是 `on_timeout` 的语义，尚未实现。

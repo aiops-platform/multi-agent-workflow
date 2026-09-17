@@ -37,6 +37,9 @@ nodes:
     kind: approval
     approvers: [lead-engineer]
     timeout: 3600
+    # 驳回 → commit 因 `approved == true` 不满足而 SKIPPED，run 照常收敛（不中止）。
+    # `on_reject` 默认 `abort`，故须显式声明。
+    on_reject: continue
     params: { summary: "$.nodes.triage.output.summary" }
   commit:
     agent: committer

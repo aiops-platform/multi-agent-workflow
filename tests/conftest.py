@@ -71,6 +71,9 @@ nodes:
     kind: approval
     approvers: ["lead"]
     timeout: 3600
+    # 显式声明：本图驳回**不中止整条 run**，而是沿下面的 `approved == false` 边路由到 recap。
+    # `on_reject` 默认是 `abort`（core/dag.py）——不写就是"驳回即中止 run"。
+    on_reject: continue
     params: { diff: "$.nodes.trace.output" }
   test:
     agent: tester

@@ -253,11 +253,34 @@ curl -s -X POST localhost:8000/runs/$rid/approve -H 'Content-Type: application/j
 | 1 | Kafka 真的在用 | Worker 日志有 `Worker 接单（trigger）` | `grep 接单 /tmp/worker.log` |
 | 2 | 落库是 PG | `runs` 表有该 run | 见下方 SQL |
 | 3 | 取数走 MCP | Worker 日志无 `list_tools 失败` | `grep list_tools` |
-| 4 | 审批链路 | 通过后 `commit` 节点执行 | 前端 / `GET /runs/{id}` |
+| 4 | 审批链路 | 通过后下游节点才执行；**驳回中止**（见下） | 前端 / `GET /runs/{id}` |
 | 5 | 全流程成功 | `status=success`，15/15 done | 同上 |
 | 6 | 界面完整 | 见下表 | 前端 |
 | 7 | **租户库隔离** | 每个租户只看得到自己的配置 | 见下 |
 | 8 | **中断可区分** | 证据不足时 `outcome=halted` 而非"跑完了" | 见下 |
+
+**审批验收**（`on_reject` + 计划审批，2026-09-18 实施）：
+
+两条流程现在都是「诊断 → `plan` → **`approve-plan`** → 修复」，即**计划必须先获批**
+才动手。逐条核对：
+
+```bash
+curl -s -H "X-Tenant-ID: otr" localhost:8000/runs/$rid | $PY -c "
+import sys,json;d=json.load(sys.stdin)
+print(d['status'], [a['node_id'] for a in (d.get('pending_approvals') or [])])
+print({k:v['status'] for k,v in d['nodes'].items() if k.startswith('approve') or k in ('fix','plan')})
+"
+```
+
+| 动作 | 期望 |
+|---|---|
+| run 跑到 plan 完成 | 挂起在 **`approve-plan`**；`fix` **尚未执行**（不是 done，也不该有 diff） |
+| 批准 `approve-plan` | `fix` → `test` → `review` 才依次执行；随后挂 `approve-commit` |
+| **驳回** `approve-plan` | run `status=failed`，报「审批节点 approve-plan 被驳回，且声明了 on_reject: abort ——整条 run 中止（这不是执行出错，是人工决策）」；`approve-plan` 状态为 `rejected`，下游全 `skipped` |
+
+> ⚠️ **驳回在中止不是"沿拒绝边路由"**——这是 `on_reject` 决定的（`abort` | `continue`）。
+> `approve-plan` 用 `abort`；`approve-remediate` / `approve-commit` 用 `continue`，
+> 沿各自的 `approved == false → recap` 边收尾。
 
 **中断验收**（`halt` 节点，2026-09-17 实施）：
 

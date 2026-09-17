@@ -5,7 +5,7 @@ import asyncio
 
 import pytest
 
-from agentflow.core.dag import DONE, SKIPPED, WAITING_APPROVAL
+from agentflow.core.dag import DONE, REJECTED, SKIPPED, WAITING_APPROVAL
 from agentflow.core.workflow import Workflow
 from agentflow.executor.dag_executor import DAGExecutor, WorkflowNodeFailed
 from agentflow.statestore.memory import InMemoryStateStore
@@ -120,6 +120,75 @@ async def test_approval_reject_routes_to_recap() -> None:
     assert outcome == "done"
     assert ex.get_status("test") == SKIPPED
     assert ex.get_status("recap") == DONE
+
+
+async def test_approval_reject_aborts_run_when_on_reject_abort() -> None:
+    """`on_reject: abort` → 驳回**中止整条 run**，而不是沿拒绝边路由。
+
+    与 test_approval_reject_routes_to_recap 是一对：同一个图、同样的驳回，
+    只因 `on_reject` 取值不同而走向完全相反 —— 一个是"沿边路由到 recap"，
+    一个是"整条 run 失败"。少了任一条，另一条都分不清"到底读没读这个字段"。
+
+    背景：`on_reject` 此前是**死配置**——`core/dag.py` 解析进 Node 模型之后
+    全仓没有消费方。图上写 `abort` 的节点实际一直走"沿拒绝边路由"，
+    窄的那条静默胜出。
+    """
+    yaml_text = PARALLEL_YAML.replace("on_reject: continue", "on_reject: abort")
+    assert "on_reject: abort" in yaml_text  # 防止 fixture 改名后本测试静默失效
+
+    ex, _, _, _ = build_executor(yaml_text)
+    await ex.run()
+    await ex.approve("approve", approved=False, by="lead", comment="方案不合规")
+
+    with pytest.raises(WorkflowNodeFailed) as exc:
+        await ex.run()
+    # 措辞要能区分"有人做了决定"与"节点跑挂了"
+    assert "驳回" in str(exc.value)
+    # 节点状态仍是 REJECTED（保留"谁驳的、理由是什么"），不是 failed
+    assert ex.get_status("approve") == REJECTED
+    assert ex.get_status("recap") != DONE
+
+
+async def test_approval_reject_aborts_on_resume_path_too() -> None:
+    """驳回中止必须在**恢复路径**上同样成立——queue 模式下只有这条路。
+
+    回归背景（实测踩过）：`on_reject` 第一版写在 `approve()` 里（驳回时 append 到
+    `self.failed`），inline 模式能中止，**queue 模式不能**——Worker 是
+    `from_checkpoint` 重建 executor 后直接 `run()`，**压根不调 `approve()`**
+    （API 侧已 CAS 落库，恢复时该节点就是 REJECTED）。
+    实测现象：驳回后 run 照样报 `done`，只有下游被 SKIPPED——**看着像"正常结束"**。
+
+    所以判据必须是**状态**（`rejected_abort_node()`）而不是**动作**。
+    本测试刻意**不调 approve()**，直接把节点置成 REJECTED 后 run —— 与 Worker 同构。
+    """
+    yaml_text = PARALLEL_YAML.replace("on_reject: continue", "on_reject: abort")
+    wf = Workflow.load_yaml(yaml_text)
+    store = InMemoryStateStore()
+    runner, _ = make_runner()
+    ex = DAGExecutor("run_resume_reject", "t", wf.dag, store, node_runner=runner, inputs={})
+
+    # 模拟 Worker 恢复时的起点：上游已 done，审批已被 API 侧 CAS 置为 REJECTED
+    for nid in wf.dag.nodes:
+        ex.node_states[nid] = {"status": "pending", "output": None}
+    ex.node_states["triage"] = {"status": DONE, "output": {"summary": "x"}}
+    for nid in ("logs", "trace"):
+        ex.node_states[nid] = {"status": DONE, "output": {"summary": "x"}}
+    ex.node_states["rca"] = {"status": DONE, "output": {"summary": "x"}}
+    ex.node_states["approve"] = {
+        "status": REJECTED, "output": {"approved": False, "comment": "计划不接受"},
+    }
+
+    with pytest.raises(WorkflowNodeFailed) as exc:
+        await asyncio.wait_for(ex.run(), timeout=5)
+    assert "驳回" in str(exc.value)
+
+
+async def test_approval_reject_does_not_abort_by_default_continue() -> None:
+    """`on_reject: continue` 下驳回**不中止** run —— 与上面那条互为对照。"""
+    ex, _, _, _ = build_executor(PARALLEL_YAML)
+    await ex.run()
+    await ex.approve("approve", approved=False, by="lead", comment="ok")
+    assert await ex.run() == "done"  # 不抛
 
 
 async def test_approval_cas_prevents_double_approve() -> None:
