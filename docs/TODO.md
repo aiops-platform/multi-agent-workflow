@@ -27,6 +27,7 @@
 | 17 | ~~`scope` 不输出消歧字段~~ | ✅ 已解决——**真因是 Worker 未重启**，不是 prompt |
 | 18 | **改代码不热载**：Worker 只认库内指纹 | 每次改 prompt/schema 都会静默用旧版——已在实测中骗过一次 |
 | 19 | ~~`rca` 的 `join: any`~~ | ✅ 已修——**根因节点从来没拿到过取证输出**（五维摘要恒为 None），见下 |
+| 20 | **缺 `trace_id` 的工单炸整条 run** | 把"证据缺失"表达成了"执行失败"——正是 halt 想消灭的那种含混 |
 
 > **中断语义（halt）不在本清单里**——它已实施并实测通过（`8841d20` / `2821ac5`），
 > 约定见 `CLAUDE.md` 约束 3 与 `docs/E2E_VERIFICATION_zh-CN.md` §四验收点。
@@ -986,3 +987,59 @@ props - set(re.findall(r'"([a-z_][a-z0-9_]*)"\s*:', prompt))   # 应为空
 
 补上后实测：`summary` 正常输出，且正是它把交叉判断的结论讲清楚了
 （「根因在 warranty-service 的 checkWarranty/queryWarrantyPeriod……order-service 的超时只是症状，非根因」）。
+
+## 20. 无 `trace_id` 的工单会**整条 run 失败**（`locate` 重试耗尽 + `on_failure: abort`）
+
+> 2026-09-17 记录，**未修**。发现路径：改 `rca.join` 后自己造工单做 E2E 验证，
+> 一开始忘了带 `correlation_hint.trace_id` → `run_a3d6e9cf55` 直接 failed。
+
+### 现象
+
+`run_a3d6e9cf55`（场景 1，工单**没带** `trace_id`）：
+
+```
+triage done · know done · scope done · trace done · logs done · metrics done · infra done
+locate **failed**      ← 其余全部正常
+→ run failed（locate 声明了 on_failure: abort）
+```
+
+`locate` 的失败信息：
+
+```
+节点 locate 执行失败（重试耗尽）: agent code-locator 未输出合法 JSON（§7 输出契约未满足）:
+'Executed maximum iterations of reasoning-acting loop without finishing the task.'
+```
+
+### 成因链
+
+```
+工单 correlation_hint.trace_id 缺失
+  → trace-analyst 无链路可分析，如实报 found=false（**这个行为是对的**，它没编 trace_id）
+  → locate 的 target_service = $.nodes.trace.output.failing_service = null
+  → code-locator 拿不到目标服务，只能自己翻来覆去地找 → 迭代耗尽 → 输出契约不满足
+  → on_failure: abort → 整条 run failed
+```
+
+### 为什么这是个问题
+
+**它把"证据缺失"表达成了"执行失败"**，而这两者在这套设计里是**明确区分**的：
+其余四个取数节点遇到负证据都是 `found=false` + 如实说明，然后照常往下走；
+`halt` 更是专门为"证据不足"设的出口。唯独 `locate` 会**炸掉整条 run**。
+
+表现在运维侧就是：一个信息不全的工单（真实世界里很常见）不会得到"缺什么"的中断结论，
+而是得到一个红色 failed ——**恰恰是 halt 想消灭的那种含混**。
+
+### 目标（二选一）
+
+1. **`code-locator` 学 `trace-analyst`**：`target_service` 为空时直接输出负证据
+   （`found=false` + "缺 failing_service，无法定位仓库"）并正常返回，与其余取证节点同形。
+2. **`locate` 的 `on_failure` 改 `continue`**：失败时不再 abort。
+   ——但这只是把"炸"换成"带个空洞往下走"，不如方案 1 诚实。
+
+倾向 1。`on_failure: abort` 本身有理由（定位错仓库会让 `fix` 改错代码），
+**但那该由"输出负证据 → 下游无输入"来兜，而不是靠 abort。**
+
+### 顺带：这是操作手册的坑
+
+场景 1 / 场景 2 的工单**都必须带** `correlation_hint.trace_id`，否则就会踩到上面这条。
+已补进 `docs/E2E_VERIFICATION_zh-CN.md` §9.1。
