@@ -23,8 +23,9 @@
 | 13 | 新租户缺「播种」 | 新租户直接起不来诊断（`/tickets/{tid}/run` 400） |
 | 14 | 分层：API ↔ Service ↔ Repository | 债，不阻塞。已有一处**重复实现**与一处**反向依赖** |
 | 15 | `datasource/` 例外：保留但立规矩 | 例外**合理**；含一个**无鉴权端点**（只读低危） |
-| 16 | ~~MCP 工具绑定只有 server 级粒度~~ | **先不做**——首版证据已被推翻（那些越界是旧 prompt 所致）；且 `enable_tools` 已能实现工具级过滤 |
+| 16 | ~~MCP 工具绑定只有 server 级粒度~~ | **先不做**——首版证据已被推翻；复核只剩 2 处零星越界，**先改 prompt 即可** |
 | 17 | ~~`scope` 不输出消歧字段~~ | ✅ 已解决——**真因是 Worker 未重启**，不是 prompt |
+| 18 | **改代码不热载**：Worker 只认库内指纹 | 每次改 prompt/schema 都会静默用旧版——已在实测中骗过一次 |
 
 ---
 
@@ -672,20 +673,38 @@ AgentScope 的 `Toolkit(mcps=[...])` **没有按工具过滤的入口**；`ToolP
 ### 所以本项降级：**先不做**
 
 原理仍然站得住（工具面是**强制**，prompt 是**请求**；`triage` 那次确实是靠**解绑 server**
-禁住的，而它的 prompt 当时明确要它查数据）。**但"prompt 不够用"现在没有实测证据**——
-本轮观测到的越界，是在正确执行旧 prompt。
+禁住的，而它的 prompt 当时明确要它查数据）。但在拿不出"新 prompt 下仍需强制"的实例之前，
+拆 server 的代价（两个 FastMCP 实例 + 路径 + lifespan + 测试，且让边界变成部署问题）
+换不回可验证的收益。
 
-在拿不出"新 prompt 下仍越界"的实例之前，拆 server 的代价（两个 FastMCP 实例 + 路径 +
-lifespan + 测试，且会让边界变成部署问题）**换不回可验证的收益**。
+### 新 prompt 下的复核（2026-09-17，2 次 run）
 
-**若将来确实要拆**，下面两条路都可行——**且注意 `enable_tools` 那条更省**：
+**越界仍存在，但形态与严重度完全变了：**
 
-> 💡 **先看这条**：`mcp_servers` 表**已经有 `enable_tools` / `disable_tools` 两列**，
-> 且 `CachingMCPClient._filtered()`（`agents/mcp_tool_cache.py:99`）**已经实现**了按名过滤，
-> `mcp_manager` 走的正是它。**工具级过滤不需要改任何 MCP server 代码**——
-> 把**同一个 URL 注册成两条 server 记录**（各带一份 `enable_tools`），
-> agent 按需绑即可。它的代价是**要手工维护工具名清单**（新增工具时会漂移），
-> 而这正是"拆 server"（工具集由代码定）的唯一优势。
+| | 旧 prompt | 新 prompt（2 次 run） |
+|---|---|---|
+| 涉及节点 | `log-analyst` / `trace-analyst` | `root-cause`（**2/2**）、`infra-locator`（1/2） |
+| 形态 | **成体系**——`trace-analyst` **每次都**先查宽 `query_logs`（旧 prompt 就是这么要求的） | **零星**——每次不同，且**不是"替别人干活"** |
+| 严重度 | 高（两者工作实质重叠） | 低 |
+
+其余 11 个节点**两次都完全合规**（含 `triage` 零调用、`scope` 只调图工具）。
+
+**⚠️ 对 `root-cause` 的解读与上面不同**：它调 `get_service_topology` **两次都出现，
+而它的 prompt 并没有禁止**——只写了"可用全部 5 个数据工具自行取证"。
+所以这更像**设计缺口**（prompt 与工具面没对齐）而不是模型乱来：
+
+- 它的入参里**已经有** `scope_primary` 与 `failing_service`（供交叉判断）
+- 但它想自己看拓扑时，**唯一的手段就是调 `get_service_topology`**——而那工具在它列表里
+
+**这与旧 prompt 下 `trace-analyst` 先查日志是同一性质。**
+
+### 建议（优先级高于拆 server）
+
+**先改 prompt，别拆 server。** 例如给 `root-cause` 写明：
+「拓扑关系从入参的 `scope_primary` / `failing_service` 拿，**不要自己查**」。
+成本一行，且直接对着实测到的那个稳定缺口。
+
+真要根治（工具面强制）时，注意下面那条更省的路：
 
 ### 缺口
 
@@ -749,13 +768,83 @@ ambiguous       : False                                                         
 
 ### 遗留
 
-**这个坑会在每次改 prompt/schema 时重演。** 详见
-`docs/E2E_VERIFICATION_zh-CN.md` §6.5（含判据与重启命令）。
-
-> 真正的修法应该是让指纹**把代码版本也纳入**（如把 `SYSTEM_PROMPTS` 的哈希写进指纹），
-> 或干脆去掉 resolver 的这一层缓存。**但那属于另一件事**——先记着。
+**这个坑会在每次改 prompt/schema 时重演**——已提成独立条目 **§18**（含修法与短期兜底）。
+判据与重启命令见 `docs/E2E_VERIFICATION_zh-CN.md` §6.5。
 
 ### 相邻问题：`scope` 会自造零证据候选
 
 首版记录里有这条，**未被本轮验证覆盖**（可能同样是旧 prompt 所致，也可能不是）。
 新 prompt 已加禁令 1「不要自己添加工具没返回的候选」。
+
+---
+
+## 18. 改代码不热载：Worker 只认「库内指纹」
+
+> 2026-09-17 记录。这个坑在 §17 里**已经骗过一次**——两个场景各跑一轮都得出错误结论，
+> 最后靠读 trace 里发给模型的 system prompt 才发现。**强烈建议优先做**（成本小、收益直接）。
+
+### 现状
+
+`agents/config_sync.py` 的热载指纹是：
+
+```python
+fingerprint = (_signature(agent_rows), _signature(mcp_rows))
+# _signature = (行数, MAX(updated_at))
+```
+
+**它只看 `agent_configs` / `mcp_servers` 两张表的行**。于是：
+
+| 改了什么 | 会热载吗 |
+|---|---|
+| 页面上改 agent 配置 / 绑 MCP server | ✅ 会（行的 `updated_at` 变了） |
+| **改代码里的 `SYSTEM_PROMPTS` / `AGENT_SCHEMAS`** | ❌ **不会** |
+
+后者不生效的机理：Worker 不重建 resolver，而 `SYSTEM_PROMPTS` 是 **import 时的模块级
+字典**——进程不重启就不更新。
+
+### 为什么它极其难发现
+
+**API 侧（`uvicorn --reload`）会重新 import**，所以 `GET /agents/{name}` **能看到新 prompt**。
+于是：
+
+```
+你以为：改了 prompts.py → API 返回新的 → 生效了 ✅
+实际是：Worker 里跑的还是旧 prompt，run 的行为完全没变
+```
+
+**两侧不一致，且没有任何报错、没有任何日志。**
+
+### 实测代价
+
+给 `service-scoper` 加了四个输出字段、改了两轮 prompt、跑了两个场景的 E2E——
+都发现"字段没输出"。中间得出过两个**错误结论**（"prompt 太长把新字段淹没"、
+"prompt 禁止不住 agent 越界"），并据此写了 TODO（§16 首版、§17 首版）。
+
+**全部源于这一个坑。**
+
+### 目标（二选一）
+
+1. **把代码版本纳入指纹**：如把 `SYSTEM_PROMPTS` / `AGENT_SCHEMAS` 的哈希拼进
+   `fingerprint`。改动集中在一处，且保留"改了就是改了"的语义。
+2. **去掉 resolver 这层缓存**（若确认热载的收益不抵复杂度）。
+
+> 倾向 1：热载本身是**对的**（变更生效有 ≤5s 延迟、换来不反复重建 MCP client），
+> 不该因为它没覆盖代码就整个拿掉。
+
+### 短期兜底
+
+**改了 prompt/schema 就重启 Worker**，并在核对前**先比对两侧**：
+
+```bash
+# trace 里 kind=llm_call 的 payload.messages[0].content[0].text
+# 与 GET /agents/{name} 返回的 system_prompt 逐字对比，不一致就是 Worker 旧了
+pkill -f "agentflow.worker"
+cd <backend> && nohup ./venv/bin/python -m agentflow.worker --tenant otr > /tmp/worker.log 2>&1 &
+```
+
+见 `docs/E2E_VERIFICATION_zh-CN.md` §6.5。
+
+### 涉及文件
+
+`agentflow/agents/config_sync.py`（指纹计算）、`agentflow/agents/agent_config.py`
+（resolver 构建）
