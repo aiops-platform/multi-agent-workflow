@@ -22,6 +22,26 @@ make lint      # ruff 检查
    审批节点参与 skip。`rejected-canceled`（审批超时）是正式终态常量 `REJECTED_CANCELED`，
    已入 `TERMINAL`，`_edge_active` 视同 REJECTED（下游拒绝路径可求值）。
    改语义必须同步 `tests/test_executor.py` 的 S-010b 场景。
+
+   ⚠️ **`join` 默认 `any`——多入边节点几乎总是要显式写 `join: all`。**
+   踩过两次（`locate`、`rca`）：只要有一条**无条件**入边来自"早一波就绪"的上游
+   （如 `triage → know → rca` 里的 `know`），该节点就会**与它其余的取证上游同波并发**
+   启动，params 在启动时解析 → 那些上游全部解析成 `None`。
+   `rca` 因此**从来没拿到过五维取证摘要**（`docs/TODO.md` §19）。
+   判据：**入边是不是都"同一批产出"？是就 `join: all` + `required_edges`。**
+
+3.1 **中断语义（`kind: halt`）**：`halt` 是**执行语义的例外**，四条规则：
+
+   - **halt 一旦执行，其余 PENDING 节点全部 SKIPPED**（`_process_skips` 统一裁决）。
+     不要靠"给每条通往诊断链的边加 `when`"来实现中断——漏一条边就前功尽弃（实测踩过）。
+   - **halt 的 `reason` / `missing` 取自触发它的入边**（`_halt_output(node)` 读
+     `_edge_active` 推出的上游输出），**不要写进 `halt.params`**——那样每加一个触发点
+     都得记得回来改它，与"逐条 gate 边"是同一个脆弱面。产出另带 `triggered_by`。
+   - 判"中断"用 `halt_triggered()`（判据是**图上的 `kind`**，随 snapshot 冻结、可复现）；
+     **不要**用"有没有节点被跳过"——那分不清中断与正常分支（`test.passed == false`
+     跳过 review/commit 是设计内行为）。run.status 仍为 `done`，
+     `GET /runs/{id}` 另给 `outcome: completed|halted` + `halted_at` + `halt`（**现算不落库**）。
+   - halt 节点**不经 runner**（不调 LLM、不重试、不做幂等）。
 4. **审批 CAS + 终态不可逆 + 时间原子判定**（`statestore/base.py:cas_update_approval`）。
    严禁绕过 CAS 改终态。CAS 除状态谓词外还带 `approval_time_guard` 时间谓词（§8.3.2）：
    approve/reject 仅未超时可批、TIMED_OUT 仅超时后可置。改 SQL 必须保留。

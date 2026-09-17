@@ -26,6 +26,10 @@
 | 16 | ~~MCP 工具绑定只有 server 级粒度~~ | **先不做**——首版证据已被推翻；复核只剩 2 处零星越界，**先改 prompt 即可** |
 | 17 | ~~`scope` 不输出消歧字段~~ | ✅ 已解决——**真因是 Worker 未重启**，不是 prompt |
 | 18 | **改代码不热载**：Worker 只认库内指纹 | 每次改 prompt/schema 都会静默用旧版——已在实测中骗过一次 |
+| 19 | ~~`rca` 的 `join: any`~~ | ✅ 已修——**根因节点从来没拿到过取证输出**（五维摘要恒为 None），见下 |
+
+> **中断语义（halt）不在本清单里**——它已实施并实测通过（`8841d20` / `2821ac5`），
+> 约定见 `CLAUDE.md` 约束 3 与 `docs/E2E_VERIFICATION_zh-CN.md` §四验收点。
 
 ---
 
@@ -849,11 +853,14 @@ cd <backend> && nohup ./venv/bin/python -m agentflow.worker --tenant otr > /tmp/
 `agentflow/agents/config_sync.py`（指纹计算）、`agentflow/agents/agent_config.py`
 （resolver 构建）
 
-## 19. `rca` 的 `join: any` 让「根因节点」拿不到任何取证输出
+## 19. ~~`rca` 的 `join: any`~~ ✅ 已修复（2026-09-17 晚，`4691832`）
 
 > 2026-09-17 记录。**严重**：这不是"偶尔漏一条"，而是**每一次 run 都漏**——
 > 从有这两条 workflow 起就没生效过。发现路径：给 `rca → halt` 接线后做 E2E 验证，
 > 顺手核对 halt.reason 来自谁，结果发现 rca 的入参**全是 None**。
+>
+> **修复与实测见文末「✅ 已修复」一节**（含一个同源缺陷：`rca.summary` 恒缺失，
+> 以及"`schema 里有 / prompt 模板里没有`"这条通用判据）。
 
 ### 现象（实测数据）
 

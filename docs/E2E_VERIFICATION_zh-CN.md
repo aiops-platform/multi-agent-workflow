@@ -257,6 +257,29 @@ curl -s -X POST localhost:8000/runs/$rid/approve -H 'Content-Type: application/j
 | 5 | 全流程成功 | `status=success`，15/15 done | 同上 |
 | 6 | 界面完整 | 见下表 | 前端 |
 | 7 | **租户库隔离** | 每个租户只看得到自己的配置 | 见下 |
+| 8 | **中断可区分** | 证据不足时 `outcome=halted` 而非"跑完了" | 见下 |
+
+**中断验收**（`halt` 节点，2026-09-17 实施）：
+
+`run.status` 仍是 `success`（终态机未动），**中断判据是另一个字段**：
+
+```bash
+curl -s -H "X-Tenant-ID: otr" localhost:8000/runs/$rid | $PY -c "
+import sys,json;d=json.load(sys.stdin)
+print(d['status'], '|', d['outcome'], '| halted_at =', d['halted_at'])
+h=d.get('halt') or {}
+print('triggered_by:', h.get('triggered_by'), '| reason:', (h.get('reason') or '')[:80])
+print('missing:', (h.get('missing') or [])[:3])
+"
+```
+
+期望（零证据工单）：`outcome=halted`、`halted_at=halt`、`triggered_by` 指出是哪个上游
+（`["scope"]`＝定位不了 / `["rca"]`＝证不出根因）、`reason` 是**那个上游的** summary、
+`missing` 是非空的"缺什么"清单；其后节点全 SKIPPED。
+正常跑完则是 `outcome=completed` 且 `halt` 为 null。
+
+> ⚠️ `outcome` 是**读时现算**的（判据来自冻结 snapshot 的 `kind` + checkpoint），
+> 所以不能按它筛列表页——要筛得先把它做成真状态。
 
 **工单存储位置验收**（2026-09-14 修复项）：
 
