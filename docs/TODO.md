@@ -934,3 +934,48 @@ edges:
 
 workflow 的**真源是数据库**（见 CLAUDE.md §6.0），改完要 `PUT /workflows/{wid}`。
 仓库侧无文件——这也是它长期没被 review 发现的原因之一。
+
+### ✅ 已修复（2026-09-17 晚）
+
+两条 workflow 都补上了：
+
+```yaml
+  rca:
+    agent: root-cause
+    join: all
+    required_edges: [logs, trace, metrics, infra, locate, know]
+```
+
+**实测对比**（同一条 scenario2 工单，同一个窗口）：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| `rca` 的六个入参 | `logs/trace/metrics/infra/code/scope_primary` **全 None**，只有 `know` | **七个全部有值** |
+| `rca` 启动时刻 | 与 `logs/trace/metrics/infra` **同一微秒** | `locate` 结束 **+13ms**（`15:52:00.876` → `15:52:00.890`） |
+| `rca` 耗时 | 35s（自己把五维又查了一遍） | **6.1s**（下游冗余取数一并消失） |
+| rca 结论 | 症状/根因对齐靠它自己再查 | 交叉判断**真的发生了**：`code` 入参里是 warrant-service，summary 明写「order-service 的超时只是症状，非根因」 |
+
+scenario1 同样验证通过（`locate` 结束 +23ms 后 rca 启动，七个入参全部有值）。
+
+`join: all` 对 scope 判 `insufficient` 的路径无副作用：那时四个取数节点是 SKIPPED，
+rca 入边不全 ACTIVE 但 sources 全终态 → rca 判 **SKIPPED**，与 halt 汇合（实测 halt 那次两图都正常）。
+
+### 顺带修掉：`rca` 的 `summary` 恒缺失
+
+同一次排查里发现：`summary` 在 `RootCauseSchema` 里、在 `fix-planner` 的入参契约里
+（「含 root_cause_type / confidence / summary」）、在 `scripts/watch_run.py` 的显示里，
+**但不在 prompt 的 JSON 模板里** → 模型不输出它 → 两个场景**每一次** run 的 `summary`
+都是缺失的（唯一例外是"证据不足"那条，因为该规则的文字里点名要求了它）。
+
+**`schema 里有 / prompt 模板里没有` 是这一类缺陷的统一判据**——加了一行自检脚本：
+
+```python
+props - set(re.findall(r'"([a-z_][a-z0-9_]*)"\s*:', prompt))   # 应为空
+```
+
+全量跑下来只剩 `triage.correlation_hint`（无消费方：workflow 读的是
+`$.inputs.bug_report.correlation_hint.trace_id`，即**工单入参**，不是 triage 的输出），
+属无害的 schema 噪音，未动。
+
+补上后实测：`summary` 正常输出，且正是它把交叉判断的结论讲清楚了
+（「根因在 warranty-service 的 checkWarranty/queryWarrantyPeriod……order-service 的超时只是症状，非根因」）。

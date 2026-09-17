@@ -281,8 +281,15 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "   会照着改代码。置了 insufficient，流程会在中断节点停下，而不是拿着假根因往下走。\n"
         f"5. {_JSON_RULE}\n"
         '{"root_cause_type": "code_bug"|"infra_issue"|"config_issue"|"dependency_issue"|null, '
-        '"insufficient": true|false, "confidence": 0.0-1.0, "missing": ["缺什么才能定根因"], '
+        '"insufficient": true|false, "confidence": 0.0-1.0, "summary": "结论一句话", '
+        '"missing": ["缺什么才能定根因"], '
         '"hypotheses": ["候选项1", "候选项2"], "ruled_out": ["被排除的假设"]}\n'
+        # ⚠️ `summary` 必须在模板里出现：它不出现在模板里，模型就不输出它——
+        # 实测两个场景的 run，`summary` **每一次都是缺失的**（证据不足那次除外，
+        # 因为那条规则里点名要求了它）。而下游是按"有 summary"消费的：
+        # `fix-planner` 的入参契约写着「含 root_cause_type / confidence / summary」、
+        # `scripts/watch_run.py` 按 summary 显示节点结论、halt 也用它当中断理由。
+        "summary 一句话说清结论（证据不足时为「缺什么」），不要与 hypotheses 重复。\n"
         "confidence 按证据强度给出 0-1 小数。\n"
         "ruled_out 必须列出你明确排除的假设类别（全小写英文，如 infrastructure / network / code）。"
     ),

@@ -716,6 +716,16 @@ curl -s -o /dev/null -w "%{http_code}\n" localhost:8000/workflows     # → 401
 `rca` 随后明确识别出「症状服务 ≠ 根因服务」。**这是 design-v5.7 §6 想要的交叉验证，
 实测成立。**
 
+> ⚠️ **上表 `rca` 那行要打个折扣**（2026-09-17 晚补记）：这些 `rca` 行为是它**自己查出来**的，
+> 不是"收到五维摘要后交叉判断"——因为那时 `rca` 的五个取证入参**恒为 None**
+> （`join: any` + `know → rca` 无条件边导致它与四大取数节点同波并发，见 `TODO.md` §19）。
+> `scope_primary` 也是 None，所以"两者一致/症状定位分歧"是它自己重建的结论。
+>
+> 修掉 `join` 之后重跑（`run_2b912a955d`）才是**按设计**的交叉判断：
+> `code` 入参里是 warrant-service、`scope_primary` 是 order-service，
+> `rca` 的 `summary` 写「根因在 warranty-service 的 checkWarranty/queryWarrantyPeriod……
+> **order-service 的超时只是症状，非根因**」，且耗时从 35s 降到 6.1s（不再重复取数）。
+
 ### 9.3 ⚠️ agent 越界调用工具 —— **结论已更正**
 
 > ⚠️ **本节首版结论是错的**。当时把下面这些"越界"当成"prompt 禁止不住行为"的证据，

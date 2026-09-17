@@ -234,7 +234,10 @@ RootCauseSchema = {
         "ruled_out": {"type": "array", "items": {"type": "string"}},
         "summary": {"type": "string"},
     },
-    "required": ["insufficient", "confidence", "hypotheses", "ruled_out"],
+    #: `summary` 进 required：下游是按"有 summary"消费的（fix-planner 的入参契约、
+    #: watch_run 的显示、halt 的中断理由）。它一度**不在** prompt 的 JSON 模板里，
+    #: 于是两个场景的 run 里**每次都是缺失的**——见 prompts.py 里那条 ⚠️。
+    "required": ["insufficient", "confidence", "summary", "hypotheses", "ruled_out"],
 }
 
 # 解决侧 Schema（M1 初版）
