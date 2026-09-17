@@ -191,13 +191,28 @@ InfraEvidenceSchema = {
 CodeLocationSchema = {
     "type": "object",
     "properties": {
+        # 与其余四个取证节点同形的**负证据出口**。
+        #
+        # 它原先没有：`required` 里却是 `[service, repo_url, suspicious_files]`
+        # ——即**结构上不允许说"我没找到"**。于是目标服务缺失时（工单没带
+        # `trace_id` → trace 报不出 failing_service → locate 的 target_service 为 null），
+        # 模型只能反复尝试或硬编一个仓库，最终**迭代耗尽 → 重试耗尽 → `on_failure: abort`
+        # → 整条 run 红色 failed**（实测 run_a3d6e9cf55）。
+        #
+        # 那把"信息不足"表达成了"执行失败"——而 design-v5.7 §3.6 明写这两者
+        # **不能混用**（abort=节点跑挂了；信息不足=正常但无法继续）。见 `TODO.md` §20。
+        "found": {"type": "boolean"},
         "service": {"type": "string"},
         "repo_url": {"type": "string"},
         "base_sha": {"type": "string"},
         "suspicious_files": {"type": "array", "items": {"type": "string"}},
+        #: `found: false` 时写清**缺什么**才能定位（与 scope/rca 的 `missing` 同形）。
+        "missing": {"type": "array", "items": {"type": "string"}},
         "summary": {"type": "string"},
     },
-    "required": ["service", "repo_url", "suspicious_files"],
+    # 放宽 required：`found: false` 时 `service`/`repo_url` 本就不该有。
+    # （原写法与 prompt 里"如实上报，不要编造仓库"直接冲突——那条禁令没有落点。）
+    "required": ["found", "summary"],
 }
 
 KnowledgeEvidenceSchema = {

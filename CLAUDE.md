@@ -34,6 +34,11 @@ make lint      # ruff 检查
 
    - **halt 一旦执行，其余 PENDING 节点全部 SKIPPED**（`_process_skips` 统一裁决）。
      不要靠"给每条通往诊断链的边加 `when`"来实现中断——漏一条边就前功尽弃（实测踩过）。
+   - **当前三个触发点**（两图一致）：`scope.insufficient`（不知道该查谁）/
+     `rca.insufficient`（查了但证不出根因）/ `locate.found == false`（定位不到要改的仓库）。
+     加新触发点**只需加一条 `when` 边**——不用改 halt 本身（这正是 reason 从触发边取的收益）。
+     最后一个触发点是踩坑加的：`locate` 报负证据后若无人拦，`fix` 会**从 plan 的文字里
+     猜一个仓库**去改，而工作区是默认全量准备的、猜错也静默通过（`docs/TODO.md` §20）。
    - **halt 的 `reason` / `missing` 取自触发它的入边**（`_halt_output(node)` 读
      `_edge_active` 推出的上游输出），**不要写进 `halt.params`**——那样每加一个触发点
      都得记得回来改它，与"逐条 gate 边"是同一个脆弱面。产出另带 `triggered_by`。
@@ -64,7 +69,7 @@ make lint      # ruff 检查
      实际改了仓库 YAML 而没同步到库时，run 跑的还是旧流程，**且没有任何提示**。
    - **要改 workflow**：`PUT /workflows/{wid}`（或 `POST /workflows` 新建），改完立即生效
      （已发起的 run 不受影响——它们用 snapshot 冻结）。
-   - 原设计的 DAG 形态（节点类型 / when / join / 审批门禁）见 `docs/design-v5.6.md` §8.1；
+   - 原设计的 DAG 形态（节点类型 / when / join / 审批门禁）见 `design-v5.2.md` §8.1（**仓库上一级目录**，不在 `backend/docs/`——v5.6 §8 是「残余风险」不是这个）；
      当前两条流程的节点结构见 `docs/design-v5.7.md` §7.2。
    - **新租户的坑**：`tenantctl provision` 只建库建表、**不播种 workflow**，新租户
      `workflows` 表是空的 → `POST /tickets/{tid}/run` 直接 400。见 `docs/TODO.md` §13。
@@ -249,7 +254,7 @@ api/         ⚠️ 按约束 §11 **只应放 API 层**，当前**混入了一�
                  与 `worker.py` 依赖 —— **反向依赖**，整改见 `docs/TODO.md` §14
 tenantctl.py 租户生命周期 CLI（**在顶层**，不在 api/ 下）
 workflows/   ⚠️ **已删除**（2026-09-16）——workflow 的真源是数据库，不是仓库文件。
-             见下方「工作流的真源」。原设计的 DAG 形态留在 docs/design-v5.6.md §8.1。
+             见下方「工作流的真源」。原设计的 DAG 形态留在 design-v5.2.md §8.1（仓库上一级目录）。
 scripts/     watch_run.py（run 逐阶段观测）+ mock_mcp_server.py + verify_sandbox.py
 docker/sandbox/  沙箱镜像（stdlib-only 离线可建）
 ```

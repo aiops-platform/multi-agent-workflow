@@ -13,8 +13,9 @@
 >   —— 全链 E2E 跑通至审批节点
 >
 > **未实施**：① 意图分类只落到了 `scope` 的**输出字段**（`intent`），尚未按它分支路由召回策略；
-> ② §3.6 的「信息不足 → 停止让用户补充」——`scope` 会输出 `insufficient` 供下游判断，
-> 但**流程不会真的停下来**（`kind: clarification` 节点与 `WAITING_INPUT` 状态都没建）；
+> ② §3.6 的「信息不足 → 停止让用户补充」——**部分实施（2026-09-17）**：流程**会真的停下来**了，
+> 但走的是 **(A) 停止本次 run**（`kind: halt`），**不是 §3.6 推荐的 (B) `kind: clarification` 原地暂停**
+> ——`WAITING_INPUT` 状态与断点续跑都没建。**A/B 分叉的取舍与残留问题见 §3.6「实施现状」**；
 > ③ 「召回为空 → 全量给 LLM」的兜底在 agentflow 侧未实现。
 
 ---
@@ -647,6 +648,41 @@ LLM 只在这个短名单上做判断。**这是设计能扩展的前提**，也
 误杀会让人重来。建议：超时后**不自动终止**，转为"长期挂起"并通知，由人或 sweeper
 按租户策略处置——**但这条需要你定**。
 
+#### 实施现状（2026-09-17）：做了 (A)，没做 (B)
+
+**已实施的是 (A)**，以**执行层通用原语**的形态：`kind: halt` 节点
+（`core/dag.py` 的 kind、`docs/CLAUDE.md` 约束 3.1）。它**不是** scope 专属——
+三个触发点共用同一个终点：`scope.insufficient` / `rca.insufficient` / `locate.found == false`；
+halt 的 `reason`/`missing` 由 executor 从**触发它的那条入边**的上游输出搬运，
+产出另带 `triggered_by` 说明"是谁停的"。判"中断"用 `halt_triggered()`
+（判据是图上的 `kind`，随 snapshot 冻结），`GET /runs/{id}` 另给
+`outcome: completed|halted`。
+
+**为什么当时走 (A) 而不是 (B)**：(A) 复用全部现有机制、零执行语义改动（只加一个 node kind）；
+(B) 需要 `kind: clarification` + `WAITING_INPUT` + CAS + 提交端点 + ticket 状态，
+是一整条链路。**但这是工程成本的取舍，不是设计结论**——下表 (B) 的两个好处(A) 一个都没拿到。
+
+**补记：resume 对 halted run 是空操作（实测）。** 发过 halt 的 run，`run.status` 已是终态：
+
+```
+POST /runs/{id}/resume  →  {"ok": true, "status": "resumed"}      ← 接口说"已恢复"
+Worker 日志             →  [run_xxx] run 已终态，忽略 resume      ← 实际什么都没做
+```
+
+（`worker.py:171` 拿 `TERMINAL` 拦下；实测复核见 `docs/TODO.md` §20。
+**接口回 `ok: true` 而实际 no-op 是个独立的小缺陷，值得单独修。**）
+即便绕过这道门，executor 侧也会立刻再全跳过一遍——`_process_skips` 第一句就是
+「halt 已触发 → 其余 PENDING 全 SKIPPED」，而 halt 是 DONE、随 checkpoint 恢复。
+
+**所以补信息的实际路径是：新建工单 → 重发 → 整条诊断链从头跑。**
+（顺带确认了两个缺口：① `POST /tickets/{tid}/run` 的 `TicketRunRequest` **只有
+`workflow_id`，没有 inputs 覆盖口**；② **没有工单更新端点**。二者叠加 =
+**不新建工单就无法补充信息**。）
+
+**残留问题（登记为开放问题，见 §9）**：
+- 补信息要重跑整条诊断链 —— 这正是 (B) 要解决的
+- 没有工单更新端点/inputs 覆盖口 —— 比 (B) 小得多，可先行
+
 ---
 
 ## 4. 置信度驱动取数广度
@@ -910,3 +946,13 @@ topology"）。**没有验证到 Journey/Portfolio/App 这类分层在运行时�
    但如果抽象错了（比如抬到了「售后」这种过宽的层），会**静默地召回一大堆无关服务**，
    而 `hit_paths` 还会因为命中而升高——**错误会被置信度放大而不是暴露**。需要考虑：
    抽象结果是否要**回显给人确认**，或者对过宽的抽象层做惩罚而非奖励。
+
+10. **§3.6 的 (B) `kind: clarification` 要不要做？**（2026-09-17 新增）
+    现状见 §3.6「实施现状」：做了 (A) `kind: halt`，流程会停，但停了就是**终止**——
+    resume 是空操作，补信息得新建工单 + 整条诊断链重跑。
+    (B) 买到的是**断点续跑**（前面查过的证据不重跑）。
+    分两步问：
+    - **先做小的**：给工单加更新端点 / 给 `TicketRunRequest` 加 inputs 覆盖口——
+      至少让人**不用新建工单**就能重跑。与 (B) 无关，独立成立。
+    - **再做大的**：(B) 本身，按 §3.6 列的 5 项新增来。
+    代价对比：诊断链越长（现在 6 个取证/定位节点），(A) 重跑浪费越大，(B) 越值。

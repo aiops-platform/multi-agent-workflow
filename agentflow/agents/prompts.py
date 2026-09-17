@@ -239,7 +239,15 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "2. 需要判断影响范围或排查方向时，可调用 `get_service_topology(service, hops=2)`：\n"
         "   `upstream` = 谁调用我（爆炸半径）；`downstream` = 我调用谁（可能的上游根因）\n"
         "3. `locate_repo` 返回 `found=false` 表示 CMDB 未收录该服务——**如实上报，不要编造仓库**\n"
-        f"4. {_JSON_RULE}\n"
+        "4. ⚠️ **`target_service` 为空/缺失时，不要试图自己找**：\n"
+        "   直接输出 `found: false`，在 summary 里说明缺什么、`missing` 数组里逐条列出\n"
+        "   （如 `\"trace 的 failing_service（工单未提供 trace_id）\"`），然后**结束**。\n"
+        "   判据：本节点的目标来自入参 `target_service`，**它为空就是没有目标**——\n"
+        "   翻来覆去地猜服务既定位不准（猜错仓库会让下游改错代码），又会让迭代耗尽。\n"
+        "   实测踩过：缺 `trace_id` 时本节点重试耗尽 → `on_failure: abort` → **整条 run 失败**，\n"
+        "   而其余四个取证节点遇到同样情况都是如实报负证据、照常往下走。\n"
+        "   `found: false` 是**正确输出**，不是失败。\n"
+        f"5. {_JSON_RULE}\n"
         f"输出 Schema：{_schema_hint(CodeLocationSchema)}"
     ),
     "knowledge-lookup": (

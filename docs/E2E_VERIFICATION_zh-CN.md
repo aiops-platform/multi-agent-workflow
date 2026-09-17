@@ -724,13 +724,17 @@ curl -s -o /dev/null -w "%{http_code}\n" localhost:8000/workflows     # → 401
 > ⚠️ **切换场景前必须清 ES 窗口**（`curl -X DELETE :19200/app-logs`），
 > 否则上一次的日志会污染这一次——两个场景的症状完全不同，混在一起没法判断谁是谁。
 
-> ⚠️ **工单必须带 `correlation_hint.trace_id`**（2026-09-17 踩过）：
-> 缺了它 → `trace-analyst` 如实报 `found=false` → `locate` 的
-> `target_service` 解析成 `null` → `code-locator` 迭代耗尽 → **`on_failure: abort` 炸掉整条 run**。
-> 其余节点全都正常，只有 `locate` failed——**看着像 bug，其实是工单不全**。
+> ⚠️ **工单必须带 `correlation_hint.trace_id`**（2026-09-17 踩过，2026-09-18 已修行为）：
+> 缺了它 → `trace-analyst` 如实报 `found=false` → `locate` 的 `target_service` 为 `null`
+> → `locate` 报 `found: false` → **`locate → halt` 触发，run 中断**（`outcome: halted`，
+> `triggered_by: ["locate"]`，`missing` 里列明缺 trace_id）。
+>
+> **修之前的行为是"整条 run 红色 failed"**（`code-locator` 迭代耗尽 → `on_failure: abort`），
+> 那个已不存在。但**票面预期仍是要带 trace_id**——不带就不是在跑这个场景，
+> 而是在测中断路径。成因与取舍见 `docs/TODO.md` §20。
+>
 > trace_id 这样捞：`curl -s "localhost:19200/app-logs/_search?size=40&sort=app.@timestamp:desc"`
 > 里挑一个业务动作对应的（场景 1 挑带 `No space left on device` 的）。
-> 成因与修复方向见 `docs/TODO.md` §20。
 
 ### 9.2 结果：**全部关键路径按预期工作**
 

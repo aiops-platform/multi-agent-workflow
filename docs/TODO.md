@@ -27,7 +27,7 @@
 | 17 | ~~`scope` 不输出消歧字段~~ | ✅ 已解决——**真因是 Worker 未重启**，不是 prompt |
 | 18 | **改代码不热载**：Worker 只认库内指纹 | 每次改 prompt/schema 都会静默用旧版——已在实测中骗过一次 |
 | 19 | ~~`rca` 的 `join: any`~~ | ✅ 已修——**根因节点从来没拿到过取证输出**（五维摘要恒为 None），见下 |
-| 20 | **缺 `trace_id` 的工单炸整条 run** | 把"证据缺失"表达成了"执行失败"——正是 halt 想消灭的那种含混 |
+| 20 | ~~缺 `trace_id` 的工单炸整条 run~~ | ✅ 已修——把"证据缺失"表达成了"执行失败"；修完暴露了下游无守卫，一并补 `locate → halt` |
 
 > **中断语义（halt）不在本清单里**——它已实施并实测通过（`8841d20` / `2821ac5`），
 > 约定见 `CLAUDE.md` 约束 3 与 `docs/E2E_VERIFICATION_zh-CN.md` §四验收点。
@@ -988,9 +988,12 @@ props - set(re.findall(r'"([a-z_][a-z0-9_]*)"\s*:', prompt))   # 应为空
 补上后实测：`summary` 正常输出，且正是它把交叉判断的结论讲清楚了
 （「根因在 warranty-service 的 checkWarranty/queryWarrantyPeriod……order-service 的超时只是症状，非根因」）。
 
-## 20. 无 `trace_id` 的工单会**整条 run 失败**（`locate` 重试耗尽 + `on_failure: abort`）
+## 20. ~~无 `trace_id` 的工单会整条 run 失败~~ ✅ 已修复（2026-09-18 凌晨）
 
-> 2026-09-17 记录，**未修**。发现路径：改 `rca.join` 后自己造工单做 E2E 验证，
+> 2026-09-17 记录。**修复见文末「✅ 已修复」一节**——注意那里有个反直觉的结论：
+> 只让 `locate` 输出负证据**反而更危险**，必须同时补 `locate → halt` 边。
+>
+> 原始记录：发现路径：改 `rca.join` 后自己造工单做 E2E 验证，
 > 一开始忘了带 `correlation_hint.trace_id` → `run_a3d6e9cf55` 直接 failed。
 
 ### 现象
@@ -1043,3 +1046,56 @@ locate **failed**      ← 其余全部正常
 
 场景 1 / 场景 2 的工单**都必须带** `correlation_hint.trace_id`，否则就会踩到上面这条。
 已补进 `docs/E2E_VERIFICATION_zh-CN.md` §9.1。
+
+### ✅ 已修复（2026-09-17 晚 / 09-18 凌晨）
+
+两处改动，缺一不可：
+
+**① `code-locator` 输出负证据**（`CodeLocationSchema` + prompt）
+
+它原先的 schema 是五个取证 schema 里**唯一没有 `found`** 的，而 `required` 却是
+`[service, repo_url, suspicious_files]`——**结构上不允许说"我没找到"**。于是目标服务缺失时
+模型只能反复尝试或硬编一个仓库 → 迭代耗尽 → abort。
+（顺带：prompt 里那句"如实上报，不要编造仓库"因此一直没有落点。）
+
+改：加 `found` + `missing`，`required` 收窄为 `[found, summary]`，prompt 加第 4 条
+「`target_service` 为空时不要自己找」。
+
+**② 补 `locate → halt` 边**——**这一步是必须的，否则①反而更危险**
+
+实测 `run_c9eb2fe68d`：只做①之后，run **不再失败**了，但——
+
+```
+locate 输出 found: false, service: ""（明说"没有定位目标"）
+  → rca/plan 照常跑
+  → fix 的入参 service = ''（空串）、repo_url = None
+  → fix **从 plan 的文字里自己挑了 order-service**，改了 QuotationService.java
+```
+
+**改对了是运气。** `ws_*` 工具只校验"这个 service 备过工作区没有"，而工作区是
+**默认全量准备**的（三个仓库都在），所以猜错会**静默写进错的仓库**。
+
+**这是①单独上线后的实际效果：把"响亮的失败"换成了"静默地走下去"。**
+补上 `- { from: locate, to: halt, when: "$.nodes.locate.output.found == false" }` 才闭环。
+
+### 实测（两个方向都验，`2026-09-18`）
+
+| | 负路径（无 trace_id）`run_8a94d3a979` | 正路径（带 trace_id）`run_b156f65142` |
+|---|---|---|
+| `locate` | `found: false` + 3 条 `missing` | `found: true` / `service=order-service` / `suspicious_files` 齐全 |
+| `halt` | **触发**，`triggered_by: ['locate']` | **SKIPPED** |
+| 下游 | plan/rca/fix/test/review **全 SKIPPED** | 正常走到 approve-commit |
+| `fix` 的 `service` 入参 | —（未执行） | `order-service`（非空） |
+
+halt 的 `reason` 正是要的那句：「入参 target_service 为空，本节点无定位目标，**不猜测服务名
+（猜错仓库会导致下游改错代码）**」。
+
+> **正路径必须一起验**：①②都动了 `locate` 的 schema/prompt，只跑负路径无法排除
+> "正路径也被改坏"。上表右列就是这条回归。
+
+### 残留（未修，小）
+
+`locate` 的 `missing` 里有一条「故障时间窗口（无发生时间）」——**但工单其实给了**。
+原因是 `locate` 的 params 只有 `{bug, target_service}`，**根本收不到时间窗**，
+模型于是把它当成"工单没提供"。措辞不准，但结论（取不到）是对的。
+要修就是给 `locate` 补 `start_time`/`end_time` 入参——影响很小，未做。
