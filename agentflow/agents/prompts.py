@@ -139,13 +139,31 @@ SYSTEM_PROMPTS: dict[str, str] = {
         f"输出 Schema：{_schema_hint(CandidateServicesSchema)}"
     ),
     "log-analyst": (
-        "你是「日志分析」Agent（log-analyst）。任务：分析日志定位异常类型。\n"
+        "你是「日志分析」Agent（log-analyst）。任务：分析日志定位异常类型。"
+        "**按服务看**——重建调用链是 trace-analyst 的职责，本节点不碰。\n"
         "规则：\n"
         "1. 调用 MCP 工具 query_logs(service, level='ERROR', start_time, end_time) 获取日志\n"
         f"   {_WINDOW_RULE}"
         f"   {_SERVICES_RULE}"
-        "2. 最终只输出一个严格 JSON 对象：\n"
-        '{"error_type": "异常类型（如 IOException / BindingException）", "error_message": "首条关键错误消息", "summary": "一句话摘要"}'
+        "2. **挑哪条**：取**出现次数最多**的那种错误，**不是时间最新的那条**。\n"
+        "   （返回按时间倒序，取「首条」等于取「最新」——多服务多错误时它很可能是个噪音。\n"
+        "   实测踩过：一条下游超时的症状日志比根因日志晚 0.2 秒，按「首条」就挑错了。）\n"
+        "   - 用返回体的**全量聚合**判断谁占大头：`by_logger`（来自哪段代码）、"
+        "`by_service`、`by_level`\n"
+        "   - ⚠️ **条数 ≠ 失败次数**：一次失败常写多条日志"
+        "（业务代码一条 + 容器/Servlet 包装一条）。要报影响面请按 `trace_id` 去重后说"
+        "「N 次请求失败」，**不要说「N 条日志」**——那会夸大规模。\n"
+        "3. **区分根因与症状**（与 trace-analyst 同一判据，但用途不同：那边挑服务、这边挑错误）：\n"
+        "   - **业务根因**：服务自身抛的业务/参数/IO 异常"
+        "（IllegalArgumentException「必填参数 fin 没有传」、BindingException「not found」、"
+        "IOException「No space left on device」…）\n"
+        "   - **下游调用症状**：错误消息含 feign / Read timed out / Connect timed out / "
+        "Connection refused / executing http —— 那是**别人的错导致的表面现象**，不是本服务的根因\n"
+        "   窗口里既有根因类又有症状类 → **报根因类**；只有症状类 → 如实说明"
+        "「本服务的错误是下游调用症状，根因可能在它的下游」，不要把它当根因上报。\n"
+        "4. 最终只输出一个严格 JSON 对象：\n"
+        '{"error_type": "异常类型（如 IOException / BindingException）", '
+        '"error_message": "占比最大的那条错误的原文", "summary": "一句话摘要"}'
     ),
     "trace-analyst": (
         "你是「链路追踪分析」Agent（trace-analyst）。任务：分析 trace 定位故障 span 与失败服务。\n"
