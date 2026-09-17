@@ -30,6 +30,10 @@ LogEvidenceSchema = {
 TraceEvidenceSchema = {
     "type": "object",
     "properties": {
+        # 工单没带 trace_id 时为 false —— **负证据，不是失败**（与 LogEvidence 的 found 同形）。
+        # 这时 failing_service 允许为空：本节点**按请求**工作，没有请求标识就无从下手，
+        # 如实说没有，好过退化成"再查一遍日志"（那与 log-analyst 是纯重复）。
+        "found": {"type": "boolean"},
         "failing_service": {"type": "string"},
         "fault_span": {"type": "string"},
         "first_error": {"type": "string"},
