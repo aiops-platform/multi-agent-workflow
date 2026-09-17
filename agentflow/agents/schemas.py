@@ -23,6 +23,28 @@ LogEvidenceSchema = {
         "error_message": {"type": "string"},
         "summary": {"type": "string"},
         "found": {"type": "boolean"},
+        #: **少见但可疑**的错误——占比小、但不属于"下游调用症状"的。
+        #:
+        #: 为什么必须单独留一栏：跨服务故障里**频率是反向指标**。一个下游故障会让
+        #: 每个调用方都报超时（症状多），而真正的根因（如「必填参数 fin 没有传」）
+        #: **可能只出现一次**。只输出一条的话，无论怎么挑都会把根因漏掉。
+        #: 实测场景：494 条 `Feign Read timed out`（症状）+ 1 条
+        #: `IllegalArgumentException: 必填参数 fin 没有传`（根因）。
+        "notable": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "error_type": {"type": "string"},
+                    "error_message": {"type": "string"},
+                    "count": {"type": "number"},
+                    #: 为什么它值得注意（如「非下游症状，且与工单的『报价单』沾边」）。
+                    #: 有理由才叫"可疑"，没理由的稀有错误只是噪音。
+                    "why": {"type": "string"},
+                },
+                "required": ["error_message", "why"],
+            },
+        },
     },
     "required": ["error_type", "error_message", "summary"],
 }
