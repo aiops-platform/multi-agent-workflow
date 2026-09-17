@@ -24,7 +24,7 @@
 | 14 | 分层：API ↔ Service ↔ Repository | 债，不阻塞。已有一处**重复实现**与一处**反向依赖** |
 | 15 | `datasource/` 例外：保留但立规矩 | 例外**合理**；含一个**无鉴权端点**（只读低危） |
 | 16 | MCP 工具绑定只有 **server 级**粒度 | 实现不了「scope 只拿图工具、取数节点只拿数据工具」 |
-| 17 | `scope` 不输出业务域消歧字段 | 加的结构化字段没到下游 → 相当于白做 |
+| 17 | ~~`scope` 不输出消歧字段~~ | ✅ 已解决——**真因是 Worker 未重启**，不是 prompt |
 
 ---
 
@@ -698,50 +698,52 @@ AgentScope 的 `Toolkit(mcps=[...])` **没有按工具过滤的入口**；`ToolP
 
 ---
 
-## 17. `scope` 不输出业务域消歧字段
+## 17. `scope` 不输出业务域消歧字段 —— **已解决，真因是 Worker 未重启**
 
-> 2026-09-17 记录。做双场景 E2E 时实测：新加的结构化字段**一个都没输出**。
+> 2026-09-17。⚠️ **本项首版诊断是错的**（当时判为"prompt 太长把新字段淹没"），下面是更正后的记录。
 
-### 现状
+### 真实原因
 
-`CandidateServicesSchema` 新增的字段，**两个场景都没出现在 scope 的输出里**：
+**新 prompt 从来没送达模型。**
+
+`config_sync.py` 的热载指纹是 `(行数, MAX(updated_at))`——**只看数据库的行**。
+而改 `prompts.py` 改的是**代码**，指纹不变 → Worker 不重建 resolver；
+而 `SYSTEM_PROMPTS` 是 import 时的模块级字典，**进程不重启就不更新**。
+
+实测证据：Worker 里跑的是 **1728 字符的旧版 prompt**，连 `business_paths` 这个词都没有；
+新版是 3427 字符。**字段从来没被要求过，当然不会输出。**
+
+**为什么极难发现**：API 侧（`uvicorn --reload`）会重新 import，所以
+`GET /agents/service-scoper` **能看到新 prompt**——你以为改对了，实际 Worker 里是旧的。
+**两侧不一致，且没有任何报错。**
+
+### 修复
+
+1. **重启 Worker**（真正起作用的那一步）
+2. 顺带把 scope 的 prompt 重构了：把「输出契约」从流程规则里**拎出来单独成段**
+   （`## 二、输出契约（逐字段填，缺一不可）`）。**这一条不是必需的修复**——
+   实测证明只要 prompt 送达了就会输出；保留它是因为读起来更清楚，
+   但**不要以为它解决了问题**。
+
+### 验证（重启 Worker 后重跑）
 
 ```
-evidence_source : None      ← **必填**字段却缺
-business_paths  : 无
-matched_domains : null
-ambiguous       : null
-in_domain       : null
+matched_domains : [{'name': 'customer-server-journey', 'type': 'journey', ...}]   ✓
+ambiguous       : False                                                          ✓
+  order-service    evidence_source='ticket_cmdb_ci'  business_paths=有  in_domain=True   ✓
+  payment-service  evidence_source='topology'        business_paths=有  in_domain=True   ✓
+  gateway-service  evidence_source='topology'        business_paths=有  in_domain=False  ✓
 ```
 
-而 **13 个节点里 12 个合规，只有 `scope` 违反**——所以不是系统性问题，也不是配置没生效
-（`GET /agents/service-scoper` 能查到新 prompt 与新 schema，`agent_configs` 两列都是 NULL
-走代码回退）。
+### 遗留
 
-**后果**：所有"业务域消歧"的工作（`business_paths` / `matched_domains` / `in_domain` /
-`ambiguous`）**全部止步于 scope，没有到达任何下游**。相当于白做。
+**这个坑会在每次改 prompt/schema 时重演。** 详见
+`docs/E2E_VERIFICATION_zh-CN.md` §6.5（含判据与重启命令）。
 
-### 两个原因（都要处理）
+> 真正的修法应该是让指纹**把代码版本也纳入**（如把 `SYSTEM_PROMPTS` 的哈希写进指纹），
+> 或干脆去掉 resolver 的这一层缓存。**但那属于另一件事**——先记着。
 
-1. **prompt 太长，新字段被淹没。** scope 的 prompt 已 3609 字符 / 6 条规则，
-   其中规则 3 有 8 个子项，新字段的要求埋在第 7 个子项里。
-   → 应把**输出契约**从流程规则里**拎出来单独成段**，不与"怎么做"混在一起。
+### 相邻问题：`scope` 会自造零证据候选
 
-2. **schema 没有硬校验。** `scopes.py` 的 `run_agent` 只做 `json.loads`，
-   **不校验 required**。所以"必填"只对模型构成**请求**，不构成**约束**。
-   → 要么加校验（注意 `scope` 的 `on_failure: abort`，校验失败会挂整个 run，
-   需要配 `retry` 才合理），要么承认 schema 只是提示、别在 required 里放关键字段。
-
-> ⚠️ 加校验前先想清楚失败策略：`scope` 现在是 `abort`，一个字段没填就整条 run 挂掉，
-> 代价可能大过收益。**建议先做 1（改 prompt 结构），观察是否解决。**
-
-### 另一处相邻问题：`scope` 会自造零证据候选
-
-场景 1 里它输出过一个 `hit_paths: 0` 的候选，reasons 里自己写着
-「**非工具输出**：由图谱探索补出的同域节点…」。prompt 说"工具返回的是事实，直接采信"，
-但**没明说"不许自己加"**。→ prompt 补一句即可。
-
-### 涉及文件
-
-`agentflow/agents/prompts.py`（`service-scoper` 段）、`agentflow/agents/scopes.py`
-（若要加校验）
+首版记录里有这条，**未被本轮验证覆盖**（可能同样是旧 prompt 所致，也可能不是）。
+新 prompt 已加禁令 1「不要自己添加工具没返回的候选」。

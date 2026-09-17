@@ -373,10 +373,35 @@ pgrep -f agentflow.worker
 grep "消费 run.trigger" /tmp/worker.log     # 确认租户名一致
 ```
 
-### 6.5 改完 agent 配置 / 绑了 MCP server 后不生效
+### 6.5 改完 agent 配置 / 绑了 MCP server / **改了 `prompts.py`** 后不生效
 
 Worker 是独立进程。配置热载走库内指纹（`AGENTFLOW_CONFIG_REFRESH_SEC`，默认 5s），
 但 **MCP 连接本身**在进程内缓存 → **重启 Worker**。
+
+#### ⚠️ 改了代码里的 `SYSTEM_PROMPTS` / `AGENT_SCHEMAS` **必须重启 Worker**
+
+**热载只看数据库的行，看不到代码。** `config_sync.py` 的指纹是
+`(行数, MAX(updated_at))`——**改 `prompts.py` 不会让它变化**，于是：
+
+- Worker 不重建 resolver
+- 而 `SYSTEM_PROMPTS` 是 **import 时的模块级字典**，进程不重启就不会更新
+
+**症状极隐蔽**：API 侧（`uvicorn --reload`）会重新 import，所以
+`GET /agents/{name}` **能看到新 prompt**——你以为改对了；而 Worker 里跑的还是**旧 prompt**，
+run 的行为完全没变。**两侧不一致，但没有任何报错。**
+
+> **实测踩过（2026-09-17）**：给 `service-scoper` 加了四个输出字段并改了两轮 prompt，
+> 跑两个场景都发现"字段没输出"。查 trace 里发给模型的 system prompt 才发现——Worker 里
+> 的还是 **1728 字符的旧版**（连 `business_paths` 这个词都没有），而新版是 3427 字符。
+> 字段从来没被要求过，当然不会出现。
+
+**判据**：看 trace 里 `kind=llm_call` 的 `payload.messages[0].content[0].text`，
+与 `GET /agents/{name}` 返回的 `system_prompt` **逐字对比**。不一致就是 Worker 旧了。
+
+```bash
+pkill -f "agentflow.worker"
+cd <backend> && nohup ./venv/bin/python -m agentflow.worker --tenant otr > /tmp/worker.log 2>&1 &
+```
 
 ### 6.6 `pr_url` 为空
 
@@ -691,9 +716,22 @@ curl -s -o /dev/null -w "%{http_code}\n" localhost:8000/workflows     # → 401
 `rca` 随后明确识别出「症状服务 ≠ 根因服务」。**这是 design-v5.7 §6 想要的交叉验证，
 实测成立。**
 
-### 9.3 ⚠️ 未解决的：agent 越界调用工具
+### 9.3 ⚠️ agent 越界调用工具 —— **结论已更正**
 
-prompt 里写了"不要做 X"，**模型照样做 X**——因为它的工具列表里有 X。
+> ⚠️ **本节首版结论是错的**。当时把下面这些"越界"当成"prompt 禁止不住行为"的证据，
+> 但后来发现 **Worker 里跑的是旧 prompt**（见 §6.5）——那些行为其实是**在正确执行旧 prompt**。
+>
+> **重启 Worker 后重跑，两个越界都消失了**：
+>
+> | 节点 | 旧 prompt 下 | 新 prompt 下 |
+> |---|---|---|
+> | `log-analyst` | 调 `get_trace`（越界） | ✅ 只有 2 次**按服务**的 `query_logs` |
+> | `trace-analyst` | 先调**无 service 的宽** `query_logs` | ✅ 只有 1 次 `get_trace`（用工单 trace_id） |
+>
+> **所以"prompt 禁止不住行为"这条结论不成立**（证据全部来自旧 prompt）。
+> 下面这段保留作记录，但**不要据此下结论**。
+
+prompt 里写了"不要做 X"，模型可能照样做 X。
 
 | 场景 | 越界行为 |
 |---|---|
@@ -712,7 +750,16 @@ prompt 里写了"不要做 X"，**模型照样做 X**——因为它的工具列
 > 根因是 MCP 工具绑定**只有 server 级粒度**，而 9 个工具全在同一个 server 上——
 > 要么全给、要么全不给。详见 `TODO.md` §16。
 
-### 9.4 另一个未解决：`scope` 不输出新契约字段
+### 9.4 ~~`scope` 不输出新契约字段~~ —— **已解决，真因见 §6.5**
+
+> ⚠️ 首版诊断（"prompt 太长把新字段淹没"）**是错的**。
+> 真因是 **Worker 未重启**，新 prompt 从来没送达模型——
+> Worker 里跑的是 **1728 字符的旧版**（连 `business_paths` 这个词都没有）。
+> **重启 Worker 后重跑，四个字段全部正常输出。**
+> 详见 `TODO.md` §17 与本文档 §6.5。
+
+### 9.4b 旧记录（作废）
+
 
 `CandidateServicesSchema` 新增的 `evidence_source`（**必填**）、`business_paths`、
 `matched_domains`、`ambiguous`，**两个场景都没输出**：
