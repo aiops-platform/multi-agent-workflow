@@ -23,6 +23,7 @@
 | 13 | 新租户缺「播种」 | 新租户直接起不来诊断（`/tickets/{tid}/run` 400） |
 | 14 | 分层：API ↔ Service ↔ Repository | 债，不阻塞。已有一处**重复实现**与一处**反向依赖** |
 | 15 | `datasource/` 例外：保留但立规矩 | 例外**合理**；含一个**无鉴权端点**（只读低危） |
+| 16 | MCP 工具绑定只有 **server 级**粒度 | 实现不了「scope 只拿图工具、取数节点只拿数据工具」 |
 
 ---
 
@@ -624,3 +625,52 @@ agentflow/
 `agentflow/api/app.py`（`/app-indicators`）、`agentflow/datasource/*`、
 `tests/test_app_indicators_api.py`；
 MCP 侧 `backends/prometheus.py`（`_sel()`）
+
+---
+
+## 16. MCP 工具绑定只有 **server 级**粒度
+
+> 2026-09-17 记录。做「triage 交出数据工具」时发现：能做的只有**全给或全不给**。
+
+### 现状
+
+`agent_configs.mcp_server_ids` 是**按 server 绑**的，而 `aiops-datasource-mcp-server`
+把 **9 个工具全放在一个 server 上**：
+
+| 类别 | 工具 |
+|---|---|
+| 数据面 | `query_logs` `get_trace` `query_metrics` `check_infra` `describe_pod` |
+| CMDB/图 | `get_service_topology` `locate_repo` `query_entity_graph` `infer_candidate_services` |
+
+于是绑了这个 server 的 agent **一律拿到全部 9 个**。实测 `otr` 租户里 **8 个 agent
+全绑了同一个 server**（批量绑的），每个都拿全套。
+
+AgentScope 的 `Toolkit(mcps=[...])` **没有按工具过滤的入口**；`ToolPolicy.allowed_tools`
+**没有任何消费方**，其 docstring 还明说「数据源与 CMDB 工具已迁 MCP——其放行由 MCP 侧
+承担，不在此处枚举」。**所以当前没有"限制某个 agent 拿哪些 MCP 工具"的机制。**
+
+### 已做的（2026-09-17）
+
+**triage 解绑**（`mcp_server_ids` → NULL）——它本就不该有工具（症状分类只看工单文本），
+所以"全不给"恰好就是正确答案。配套改了 prompt 与 `_SERVICES_RULE`。
+
+### 缺口
+
+`service-scoper` **该有**图工具（design-v5.7 §3.5 点名 `query_entity_graph` +
+`get_service_topology`）**但不该有**数据工具——现在它全有，可以自己跑去查日志
+（上一轮那次伪归因就是这么发生的）。
+
+### 目标（二选一）
+
+1. **拆 server**：同一个代码库起两个 FastMCP 实例（`aiops-datasource` 数据面 /
+   `aiops-cmdb` 图），agent 按需绑。边界最清楚，但要改部署与注册。
+2. **加 per-agent 工具 allowlist**：`agent_configs` 加一列 + `build_toolkit` 过滤。
+   改动小，但要在 AgentScope 的 Toolkit 之外自己拦一层（它没有原生入口）。
+
+> 倾向 1：**边界由部署承载**是本项目既有做法（v5.3 租户隔离就是这么做的），
+> 而且拆完之后"scope 能查日志吗"在配置上一眼可见，不需要读代码。
+
+### 涉及文件
+
+`agentflow/agents/mcp.py`（`build_toolkit`）、`agentflow/api/agent_store.py`（如需加列）、
+`aiops-mcp-servers/servers/aiops-datasource-mcp-server/server.py`（拆实例）
