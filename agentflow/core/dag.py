@@ -50,7 +50,16 @@ class Edge:
 @dataclass
 class Node:
     id: str
-    kind: str = "agent"  # agent | approval
+    #: ``agent`` —— 调 LLM 的职能节点；``approval`` —— 等人批；``halt`` —— **中断终点**。
+    #:
+    #: ``halt`` 的存在理由：条件边（``when``）不满足时，下游节点是 **SKIPPED**（级联），
+    #: 而 SKIPPED 与 DONE 一样属于 ``TERMINAL``——于是"中途条件不满足停在终点"与
+    #: "正常跑完"在 run 终态上是**同一个 done**、在 API 上是**同一个 success**。
+    #: 一个显式的 halt 节点让"这次是中断"成为**可判定的事实**，而不是要靠数 SKIPPED 去猜
+    #: （后者分不清"中断"与"正常跳过"——如 ``test.passed == false`` 跳过 review/commit）。
+    #:
+    #: 它是**确定性**的：不调 LLM，只把入参里的"为什么停、缺什么"如实带出去。
+    kind: str = "agent"  # agent | approval | halt
     agent: str | None = None  # agent 节点对应的职能智能体
     in_edges: list[Edge] = field(default_factory=list)
     when: str | None = None  # 便捷写法：单上游时的边条件
@@ -74,6 +83,11 @@ class Node:
     @property
     def is_approval(self) -> bool:
         return self.kind == "approval"
+
+    @property
+    def is_halt(self) -> bool:
+        """中断节点。执行它 = 本条 run 判定为「证据不足、不再往下走」。"""
+        return self.kind == "halt"
 
     @property
     def upstreams(self) -> list[str]:

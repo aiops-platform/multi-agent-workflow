@@ -30,7 +30,7 @@ from ..agents.tools import tools_for_agent
 from ..approval.notifier import ApprovalNotifier
 from ..approval.sweeper import ApprovalSweeper
 from ..config import Settings, get_settings
-from ..core.dag import WAITING_APPROVAL, WorkflowDAGError
+from ..core.dag import DONE, WAITING_APPROVAL, WorkflowDAGError
 from ..core.workflow import Workflow
 from ..datasource import build_app_indicators_service
 from ..executor.dag_executor import ApprovalRaceError
@@ -978,11 +978,35 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
             "upstream": upstream_out,
         })
 
+    # ---- outcome：**按图走完** 还是 **中途中断** ----
+    #
+    # ``status=success`` 只说明"没有节点失败"，**不说明诊断出了结果**：条件边不满足时
+    # 下游节点是 SKIPPED，而 SKIPPED 与 DONE 同属终态 → run 照样 ``done`` → API 照样
+    # ``success``。实测踩过：一条零证据的 run（scope 定不了位、四个取证节点全负证据、
+    # rca 自述"证据完全缺失"）走完全程报了 success。
+    #
+    # 这里**现算**而不落库：判据来自冻结的 snapshot（``kind == "halt"``）与 checkpoint，
+    # 两者都不可变，所以现算的结果**天然可复现**——也就不用动状态机：
+    # run.status / TERMINAL / Worker 接单 CAS / 审批终态判定全都不用改。
+    halted_node = None
+    if wf is not None:
+        for nid, cp in nodes_raw.items():
+            node = wf.dag.nodes.get(nid)
+            if node is not None and node.is_halt and cp.get("status") == DONE:
+                halted_node = nid
+                break
+
     return {
         "run_id": run_id,
         "workflow": graph.get("name"),
         "graph": graph,
         "status": _api_run_status(run["status"]),
+        #: ``completed``（按图走完）/ ``halted``（中途判定证据不足，停在 halt 节点）
+        "outcome": "halted" if halted_node else "completed",
+        #: 中断的落点与原因（未中断时为 null）。**给人和程序同一个判据**——
+        #: 不必去数 SKIPPED（那分不清"中断"与"正常跳过"）。
+        "halted_at": halted_node,
+        "halt": (nodes.get(halted_node) or {}).get("output") if halted_node else None,
         "total_tokens": total_tokens,
         "total_cost": total_cost,
         "nodes": nodes,

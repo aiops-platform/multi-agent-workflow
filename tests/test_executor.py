@@ -496,3 +496,169 @@ async def test_approval_reject_cascades_skip_to_convergence() -> None:
     assert ex.get_status("c") == SKIPPED   # 审批节点也被级联 skip
     assert ex.get_status("d") == SKIPPED
     assert ex.get_status("recap") == DONE
+
+
+# ======================================================================
+# halt 节点：中途判定证据不足 → 停在终点，且与「正常走完」**可区分**
+#
+# 为什么需要：条件边不满足时下游是 SKIPPED，而 SKIPPED 与 DONE **同属终态**
+# → `all_terminal()` 为真 → run 照样 `done` → API 照样 `success`。
+# 实测踩过：一条零证据的 run（定位不了、四个取证节点全负证据、rca 自述"证据完全缺失"）
+# 走完全程报了 success。halt 让"中断"成为**可判定的事实**。
+# ======================================================================
+HALT_YAML = """
+name: halt-demo
+version: "1.0.0"
+inputs:
+  bug: { type: object, required: true }
+nodes:
+  scope:
+    agent: scope
+  probe:
+    agent: probe
+    params: { s: "$.nodes.scope.output.summary" }
+  recap:
+    agent: recap
+  halt:
+    kind: halt
+    params:
+      reason: "$.nodes.scope.output.summary"
+      missing: "受影响服务、发生时间、错误原文"
+edges:
+  - { from: scope, to: probe, when: "$.nodes.scope.output.insufficient == false" }
+  - { from: probe, to: recap }
+  - { from: scope, to: halt, when: "$.nodes.scope.output.insufficient == true" }
+"""
+
+
+async def _run_halt_case(insufficient: bool):
+    """跑一遍 halt-demo。scope 按入参决定是否说「我定不了位」。"""
+    wf = Workflow.load_yaml(HALT_YAML)
+    calls: dict = {}
+
+    async def runner(node, params):
+        calls[node.id] = calls.get(node.id, 0) + 1
+        if node.agent == "scope":
+            return {"summary": "无法定位到具体服务", "insufficient": insufficient,
+                    "candidate_services": []}
+        return {"summary": f"{node.agent}-out"}
+
+    ex = DAGExecutor("run_h", "tenant-a", wf.dag, InMemoryStateStore(), node_runner=runner)
+    outcome = await ex.run()
+    return ex, outcome, calls
+
+
+async def test_halt_fires_and_is_distinguishable() -> None:
+    """证据不足 → 走 halt；`halt_triggered()` 为真。"""
+    ex, outcome, calls = await _run_halt_case(insufficient=True)
+
+    assert ex.get_status("scope") == DONE
+    # 中间节点被 SKIPPED 级联 —— 这正是「避免后续不必要的消耗」
+    assert ex.get_status("probe") == SKIPPED
+    assert ex.get_status("recap") == SKIPPED
+    assert ex.get_status("halt") == DONE
+    assert ex.halt_triggered() is True
+    # ⚠️ run 的返回值仍是 `done` —— **这是刻意的**：判"中断"用 halt_triggered()，
+    # 不动状态机（TERMINAL / Worker 接单 CAS / 审批终态判定都不用改）
+    assert outcome == "done"
+
+
+async def test_halt_not_triggered_on_normal_path() -> None:
+    """正常路径：halt 被 SKIPPED，`halt_triggered()` 为假。
+
+    ⚠️ 这条与上一条**必须都在**：只测"中断时触发"是不够的——如果判据写成"有节点被跳过
+    就算中断"，这里也会为真，而那条判据分不清中断与**正常跳过**（如 `test.passed == false`
+    跳过 review/commit）。
+    """
+    ex, outcome, calls = await _run_halt_case(insufficient=False)
+
+    assert ex.get_status("probe") == DONE
+    assert ex.get_status("recap") == DONE
+    assert ex.get_status("halt") == SKIPPED
+    assert ex.halt_triggered() is False
+    assert outcome == "done"
+
+
+async def test_halt_does_not_call_the_runner() -> None:
+    """halt **不经 runner**（不调 LLM）：它是确定性组装。
+
+    "中断"是最不该出岔子的那条路——花一次 LLM 调用去做"把缺什么带出去"这件事
+    既慢又可能不听话。
+    """
+    ex, _, calls = await _run_halt_case(insufficient=True)
+    assert "halt" not in calls
+    assert calls == {"scope": 1}          # probe/recap 被跳过，一次都没调
+
+
+async def test_halt_output_carries_reason_and_missing() -> None:
+    """halt 的输出：为什么停、缺什么——**给人和程序同一个判据**。"""
+    ex, _, _ = await _run_halt_case(insufficient=True)
+    out = ex.node_states["halt"]["output"]
+    assert out["halted"] is True
+    assert "无法定位" in out["reason"]
+    assert out["missing"] == ["受影响服务、发生时间、错误原文"]
+
+
+async def test_halt_missing_normalized_to_list() -> None:
+    """`missing` 归一成 `list[str]`——上游给的是字符串还是列表都收。"""
+    wf = Workflow.load_yaml(HALT_YAML)
+    ex = DAGExecutor("r", "t", wf.dag, InMemoryStateStore(), node_runner=make_runner())
+    assert ex._halt_output({"missing": "只有一个"})["missing"] == ["只有一个"]
+    assert ex._halt_output({"missing": ["a", "b"]})["missing"] == ["a", "b"]
+    assert ex._halt_output({"missing": None})["missing"] == []
+    assert ex._halt_output({})["missing"] == []
+
+
+#: 模拟"漏 gate 的那条边"：`side` 的入边是**无条件**的（对应实测里的 `know → rca`——
+#: `know` 不依赖候选服务，所以它没被 gate，于是 rca 能启动、整条链跟着跑）。
+HALT_LEAK_YAML = """
+name: halt-leak-demo
+version: "1.0.0"
+inputs:
+  bug: { type: object, required: true }
+nodes:
+  scope:
+    agent: scope
+  halt:
+    kind: halt
+    params:
+      reason: "$.nodes.scope.output.summary"
+  side:
+    agent: side
+  tail:
+    agent: tail
+    params: { s: "$.nodes.side.output.summary" }
+edges:
+  - { from: scope, to: halt, when: "$.nodes.scope.output.insufficient == true" }
+  - { from: scope, to: side }
+  - { from: side, to: tail }
+"""
+
+
+async def test_halt_skips_everything_remaining_even_with_unconditional_edges() -> None:
+    """halt 触发 → **其余未执行节点全部 SKIPPED**，哪怕它们的入边是有条件的 ACTIVE。
+
+    这条钉的是"中断"的语义边界。实测踩过：只给四个取数节点 gate 了 `insufficient`，
+    可 `rca` 的 `join: any` 还有一条 `know → rca` 没 gate —— rca 照跑，plan/fix/test/
+    review 全跟着跑。**逐条 gate 边这条路漏一条就前功尽弃。**
+
+    所以"不再往下走"由 executor 统一裁决，而不是指望每张图的作者把所有通往诊断链的边
+    都记得 gate 上。
+    """
+    wf = Workflow.load_yaml(HALT_LEAK_YAML)
+
+    async def runner(node, params):
+        if node.agent == "scope":
+            return {"summary": "定位不了", "insufficient": True, "candidate_services": []}
+        return {"summary": f"{node.agent}-out"}
+
+    ex = DAGExecutor("run_leak", "tenant-a", wf.dag, InMemoryStateStore(), node_runner=runner)
+    outcome = await ex.run()
+
+    assert ex.get_status("halt") == DONE
+    assert ex.halt_triggered() is True
+    # ⚠️ 关键：`scope → side` 是**无条件**边（ACTIVE），但 halt 已触发 → side 必须 SKIPPED。
+    # 没有这条断言，"halt 只跳过了恰好没边连着的节点"也能通过。
+    assert ex.get_status("side") == SKIPPED
+    assert ex.get_status("tail") == SKIPPED
+    assert outcome == "done"

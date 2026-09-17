@@ -221,6 +221,40 @@ class DAGExecutor:
     def all_terminal(self) -> bool:
         return all(st["status"] in TERMINAL for st in self.node_states.values())
 
+    @staticmethod
+    def _halt_output(params: dict) -> dict:
+        """halt 节点的产出（确定性组装）。``missing`` 归一成 ``list[str]``。"""
+        missing = params.get("missing")
+        if isinstance(missing, str):
+            missing = [missing] if missing.strip() else []
+        elif isinstance(missing, list):
+            missing = [str(m) for m in missing if str(m).strip()]
+        elif missing is None:
+            missing = []
+        else:
+            missing = [str(missing)]
+        return {
+            "halted": True,
+            "reason": str(params.get("reason") or "上游判定证据不足，流程在此中断"),
+            "missing": missing,
+        }
+
+    def halt_triggered(self) -> bool:
+        """本条 run 有没有**真的执行过** halt 节点 → 判定为「中断」。
+
+        判据用**图上的 kind**，不是"输出里有没有 halted 字段"、更不是"有没有节点被跳过"：
+
+        - 靠输出约定：谁都能往 output 里塞 ``halted``，判据就不再是结构性的；
+        - 靠"有 SKIPPED"：分不清**中断**与**正常跳过**——``test.passed == false`` 跳过
+          review/commit 是设计内的正常分支，不是中断。
+
+        ``kind`` 是规划期就写死、且随 snapshot 冻结的，所以这个判据**可复现**。
+        """
+        for nid, node in self.dag.nodes.items():
+            if node.is_halt and self.node_states.get(nid, {}).get("status") == DONE:
+                return True
+        return False
+
     def is_releasable(self) -> bool:
         """§8.6：仅当 ready 集为空时才释放 Worker。"""
         return not self._ready_nodes()
@@ -264,13 +298,25 @@ class DAGExecutor:
         return "blocked"
 
     def _ready_nodes(self) -> list[str]:
-        return [
+        ready = [
             nid
             for nid, node in self.dag.nodes.items()
             if self.node_states[nid]["status"] == PENDING
             and not node.is_approval
             and self._node_decision(node) == "ready"
         ]
+        # halt 一旦 ready 就**独占这一波**。
+        #
+        # 为什么：`run()` 把 ready 集 `gather` 起来并发执行，所以与 halt 同波的其他节点
+        # 会**在 halt 触发之前**就跑掉——全局跳过只对**后续波次**生效。实测踩过：
+        # `know` 与 `halt` 都只依赖 scope，同波并发，于是 know 白跑了一次。
+        #
+        # 独占是安全的：`_node_decision` 已经求值过 halt 入边的 `when`，
+        # **它 ready ⇒ 它一定会被执行 ⇒ 一定会触发**。让它单独跑完，其余节点在下一波
+        # 被 `_process_skips` 统一跳过。
+        if any(self.dag.nodes[nid].is_halt for nid in ready):
+            return [nid for nid in ready if self.dag.nodes[nid].is_halt]
+        return ready
 
     # ==================================================================
     # 执行
@@ -339,6 +385,21 @@ class DAGExecutor:
         可判定）。级联收敛由 :meth:`run` 的外层不动点循环负责——那里会与
         ``_process_approvals`` 交替调用，因为审批节点的 skip 判定同样受本次结果影响。
         """
+        # ---- halt 已触发 → 其余未执行的节点**全部跳过** ----
+        #
+        # 这是「中断流程」的落点，**不能靠逐条 gate 边来实现**。实测踩过：给四个取数节点
+        # 都加了 `when: insufficient == false`，可 `rca` 的 `join: any` 还有一条
+        # `know → rca`（`know` 不依赖候选服务，没被 gate）—— 于是 rca 照跑，plan/fix/
+        # test/review 全跟着跑，只省下四个取证节点。**漏一条边就前功尽弃。**
+        #
+        # 中断的语义是"不再往下走"，那就由 executor 统一裁决，而不是指望每张图的作者
+        # 把所有通往诊断链的边都记得 gate 上。
+        if self.halt_triggered():
+            for nid, node in self.dag.nodes.items():
+                if self.node_states[nid]["status"] == PENDING:
+                    await self._mark_skipped(nid)
+            return
+
         for nid, node in self.dag.nodes.items():
             if node.is_approval or self.node_states[nid]["status"] != PENDING:
                 continue
@@ -500,9 +561,16 @@ class DAGExecutor:
         self.node_states[nid]["params"] = params
         await self._persist(nid)
         try:
-            output = await self._run_with_retry(
-                node, params, external_operation_id=self._external_operation_id(node, ctx)
-            )
+            if node.is_halt:
+                # halt 节点**不经 runner**（不调 LLM、不重试、不做幂等）。
+                # 它要做的事只有一件：把"为什么停、缺什么"如实带出去——那是对入参的
+                # 搬运，没有需要模型判断的地方。花一次 LLM 调用做这件事既慢又可能不
+                # 听话，而"中断"恰恰是最不该出岔子的那条路。
+                output = self._halt_output(params)
+            else:
+                output = await self._run_with_retry(
+                    node, params, external_operation_id=self._external_operation_id(node, ctx)
+                )
             state: dict = {"status": DONE, "output": output, "params": params}
             # 真实 node_runner（AgentNodeRunner）暴露 take_usage → 合并 token/cost 计量
             # （按节点 pop，防并行 agent 波串扰）；mock _default_runner 无该方法 → 保持无计量
