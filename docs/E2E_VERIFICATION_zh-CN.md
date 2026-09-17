@@ -730,6 +730,10 @@ curl -s -o /dev/null -w "%{http_code}\n" localhost:8000/workflows     # → 401
 >
 > **所以"prompt 禁止不住行为"这条结论不成立**（证据全部来自旧 prompt）。
 > 下面这段保留作记录，但**不要据此下结论**。
+>
+> **连带影响**：`TODO.md` §16（拆 MCP server）**因此降级为「先不做」**——
+> 它的实测依据被推翻，且 `mcp_servers` 表已有的 `enable_tools` 列**本就能实现工具级过滤**
+> （见该节）。
 
 prompt 里写了"不要做 X"，模型可能照样做 X。
 

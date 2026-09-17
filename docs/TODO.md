@@ -23,7 +23,7 @@
 | 13 | 新租户缺「播种」 | 新租户直接起不来诊断（`/tickets/{tid}/run` 400） |
 | 14 | 分层：API ↔ Service ↔ Repository | 债，不阻塞。已有一处**重复实现**与一处**反向依赖** |
 | 15 | `datasource/` 例外：保留但立规矩 | 例外**合理**；含一个**无鉴权端点**（只读低危） |
-| 16 | MCP 工具绑定只有 **server 级**粒度 | 实现不了「scope 只拿图工具、取数节点只拿数据工具」 |
+| 16 | ~~MCP 工具绑定只有 server 级粒度~~ | **先不做**——首版证据已被推翻（那些越界是旧 prompt 所致）；且 `enable_tools` 已能实现工具级过滤 |
 | 17 | ~~`scope` 不输出消歧字段~~ | ✅ 已解决——**真因是 Worker 未重启**，不是 prompt |
 
 ---
@@ -655,25 +655,37 @@ AgentScope 的 `Toolkit(mcps=[...])` **没有按工具过滤的入口**；`ToolP
 **triage 解绑**（`mcp_server_ids` → NULL）——它本就不该有工具（症状分类只看工单文本），
 所以"全不给"恰好就是正确答案。配套改了 prompt 与 `_SERVICES_RULE`。
 
-### 实测证据（2026-09-17，双场景 E2E）
+### ⚠️ 首版的实测证据**已被推翻**（2026-09-17 晚）
 
-**prompt 禁止不住行为，只有工具面能禁。** 同一批改动里的对照实验：
+首版记录引了三例"agent 越界调用工具"，并据此得出"**prompt 禁止不住行为，只有工具面能禁**"。
+**那些证据不成立**——它们全部来自**旧 prompt**（Worker 没重启，见 §17）。
 
-| | 结果 |
-|---|---|
-| `triage` 禁止查数据 | ✅ **禁住了**——因为它 `mcp_server_ids` 被解绑，手上没有工具 |
-| `trace-analyst` prompt 明写"不要为了找 trace_id 先查日志" | ❌ **没禁住**——它手上有全部 9 个工具 |
+重启 Worker、新 prompt 真正生效后重跑：
 
-实测的三次越界：
+| 节点 | 旧 prompt 下 | 新 prompt 下 |
+|---|---|---|
+| `log-analyst` | 调 `get_trace`（越界） | ✅ 只有 2 次**按服务**的 `query_logs` |
+| `trace-analyst` | 先调**无 service 的宽** `query_logs` | ✅ 只有 1 次 `get_trace`（用工单 trace_id） |
 
-| 场景 | 越界行为 |
-|---|---|
-| 1 | `trace-analyst` 调 `query_metrics`（`metrics-analyst` 的职责） |
-| 2 | `log-analyst` 调 `get_trace`（`trace-analyst` 的职责） |
-| 2 | `trace-analyst` 仍先调 `query_logs`，且是**不带 service 的宽查询** |
+**两个越界都消失了。**
 
-> 这不是模型不听话——**它的工具列表里有那个工具，prompt 只是在请求，不是在限制**。
-> 详见 `docs/E2E_VERIFICATION_zh-CN.md` §9.3。
+### 所以本项降级：**先不做**
+
+原理仍然站得住（工具面是**强制**，prompt 是**请求**；`triage` 那次确实是靠**解绑 server**
+禁住的，而它的 prompt 当时明确要它查数据）。**但"prompt 不够用"现在没有实测证据**——
+本轮观测到的越界，是在正确执行旧 prompt。
+
+在拿不出"新 prompt 下仍越界"的实例之前，拆 server 的代价（两个 FastMCP 实例 + 路径 +
+lifespan + 测试，且会让边界变成部署问题）**换不回可验证的收益**。
+
+**若将来确实要拆**，下面两条路都可行——**且注意 `enable_tools` 那条更省**：
+
+> 💡 **先看这条**：`mcp_servers` 表**已经有 `enable_tools` / `disable_tools` 两列**，
+> 且 `CachingMCPClient._filtered()`（`agents/mcp_tool_cache.py:99`）**已经实现**了按名过滤，
+> `mcp_manager` 走的正是它。**工具级过滤不需要改任何 MCP server 代码**——
+> 把**同一个 URL 注册成两条 server 记录**（各带一份 `enable_tools`），
+> agent 按需绑即可。它的代价是**要手工维护工具名清单**（新增工具时会漂移），
+> 而这正是"拆 server"（工具集由代码定）的唯一优势。
 
 ### 缺口
 
