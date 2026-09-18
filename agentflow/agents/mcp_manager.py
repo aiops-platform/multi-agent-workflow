@@ -75,6 +75,28 @@ class MCPClientManager:
         # 回调可为 async 且接受 (agent_name, tenant_id)（v5.3：按租户的 agent 绑定解析）。
         self.server_ids_for = server_ids_for
 
+    @property
+    def stores_provider(self):
+        """per-tenant MCP store 提供者：``async (tenant_id|None) → store``。
+
+        ⚠️ **必须走属性**：``api/app.py`` 是在 init() 里对**已构造的模块级单例**赋值
+        （``mcp_manager.stores_provider = …``），而构造参数只写 ``self._stores_provider``。
+        没有这个 setter 时，那句赋值只是在实例上挂了一个**没人读的死属性**——租户路由
+        静默失效，manager 永远读全局库，表现为**所有 agent 都拿不到 MCP 工具**：
+        `llm_call` 的 `tools=[]`，agent 只能靠提示词里那点信息作答（本机实测：日志流程的
+        log-analyst 一次 `query_logs` 都没调，却"分析"出了根因——正是伪归因的温床）。
+        单测发现不了：它们都用构造参数注入 provider，不走 app.py 这条赋值路径。
+        """
+        return self._stores_provider
+
+    @stores_provider.setter
+    def stores_provider(self, provider) -> None:
+        self._stores_provider = provider
+        # 换后端 → 已加载的租户视图作废（下次访问按新 provider 重新加载）。
+        # 只清 _loaded 不清 _rows/_clients：本 setter 目前只在 init() 里调用一次，
+        # 此时还没有任何租户被加载；清 client 表要 async 关闭连接，不适合放在 setter 里。
+        self._loaded.clear()
+
     async def _store_for(self, tenant_id: str | None) -> Any:
         if self._stores_provider is not None:
             return await self._stores_provider(tenant_id)

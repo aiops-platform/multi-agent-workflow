@@ -1,0 +1,147 @@
+# ===== Problem Center「分析new」：日志分析 → 根因 → 修复计划 → 人工审批 =====
+#
+# ⚠️ 本文件**不是运行时真源**：workflow 的真源是数据库（CLAUDE.md §6.0 / docs/TODO.md §13）。
+#    它只是 scripts/seed_problem_log_diagnose.py 的推送载荷——改完必须重跑该脚本（幂等 PUT），
+#    改这里的 YAML 而不同步到库，run 跑的还是旧流程，且没有任何提示。
+#
+# 场景：问题单（APM Problem Center）→ 日志证据 + 知识 + 代码定位 → 根因 → 修复计划 → 人工审批。
+# 本期**只做日志**（指标分析后续另起一条 workflow）；审批**只记录计划**，不执行任何修复动作。
+name: problem-log-diagnose
+version: "1.0.0"
+description: "Problem Center 分析new：日志分析 → 根因 → 修复计划 → 人工审批（审批只记录，不执行修复）"
+
+inputs:
+  bug_report:
+    type: object
+    required: true
+    description: "问题单平铺 ticket（APM _build_ticket：number/short_description/description/cmdb_ci/symptom/requestId…）"
+  window_start:
+    type: string
+    required: true
+    description: "日志窗口起（UTC ISO8601，由 first_seen_at/detected_at 推导）"
+  window_end:
+    type: string
+    required: true
+    description: "日志窗口止（UTC ISO8601，由 last_seen_at/detected_at 推导，跨度 ≤24h）"
+
+nodes:
+  # ── 症状分类（无工具，只读工单文本；不传时间窗——它没有数据工具）──────────────
+  triage:
+    agent: triage
+    require: [bug]
+    params:
+      bug: "$.inputs.bug_report"
+    on_failure: abort
+
+  # ── 日志证据：本流程**唯一**的取数节点 ────────────────────────────────────────
+  # 目标服务来自问题单的 CMDB CI（记录本身就是权威答案），不经 service-scoper 再推一遍。
+  # `service`（标量）与 `services`（候选集）两种形态同时传是刻意的：
+  #   service  → require 的锚点（列表形态缺元素时 _usable([None]) 仍为 True，抓不住）
+  #   services → prompt/Schema 约定的候选集形态；evidence_source 如实标 ticket_cmdb_ci，
+  #              不能把工单给的服务写成上游推断（那是伪造证据来源）
+  logs:
+    agent: log-analyst
+    require: [service, start_time, end_time]
+    retry: 1
+    params:
+      bug: "$.inputs.bug_report"
+      service: "$.inputs.bug_report.cmdb_ci.name"
+      services:
+        - service: "$.inputs.bug_report.cmdb_ci.name"
+          confidence: high
+          evidence_source: ticket_cmdb_ci
+      start_time: "$.inputs.window_start"
+      end_time: "$.inputs.window_end"
+    # abort：日志是本流程唯一的证据来源。拿不到日志就不该出计划——显式失败好过
+    # 让下游对着空证据编一份"修复方案"（伪归因）。要放宽见 plan 的"开放点"。
+    on_failure: abort
+
+  # ── 历史知识：**已移除** ──────────────────────────────────────────────────────
+  # 原 know 节点用占位工具 `search_knowledge`，它恒返回写死的 INC0001——一次真实 run 里
+  # 却调了 5 次（占全部 14 次工具调用的 1/3），纯开销且对根因无贡献。
+  # 接真实知识库后再加回；届时记得同步 rca 的 required_edges 与 params。
+
+  # ── 代码定位（MCP locate_repo / get_service_topology）────────────────────────
+  locate:
+    agent: code-locator
+    require: [target_service]
+    params:
+      bug: "$.inputs.bug_report.short_description"
+      target_service: "$.inputs.bug_report.cmdb_ci.name"
+    on_failure: continue
+
+  # ── 根因（只吃日志证据）──────────────────────────────────────────────────────
+  # join: all + required_edges 必须列**全部**直接上游（core/dag.py:212 只认直接上游；
+  # 默认 join: any 会在 triage 一完成就把本节点拉起来——此时 logs 还没跑）。
+  rca:
+    agent: root-cause
+    join: all
+    required_edges: [triage, logs, locate]
+    require: [logs]
+    params:
+      logs: "$.nodes.logs.output"
+      code: "$.nodes.locate.output"
+      symptom: "$.nodes.triage.output.summary"
+      scope_primary: "$.inputs.bug_report.cmdb_ci.name"
+      # 未采集的三维**显式**写成负证据：不留空键，避免模型假装核对过
+      trace: "本次未采集（log-only 流程：链路数据源未接入）"
+      metrics: "本次未采集（log-only 流程）"
+      infra: "本次未采集（log-only 流程）"
+      start_time: "$.inputs.window_start"
+      end_time: "$.inputs.window_end"
+    on_failure: abort
+
+  # ── 修复计划 ─────────────────────────────────────────────────────────────────
+  # agent 与入参名**必须同时改**：remediation-planning-analyst 只读 `root_cause` 一个入参，
+  # 沿用 `rca` 的话 require 会静默放过 None（预检按同名 key 查），agent 拿到空输入。
+  # 换它的理由：fix-planner 的 schema 是单计划 `{plan:{summary,steps}}`；
+  # 本 agent 输出 decisions[].options[]（互斥多方案 + recommended），恢复旧版的多方案页签。
+  plan:
+    agent: remediation-planning-analyst
+    require: [root_cause]
+    params:
+      root_cause: "$.nodes.rca.output"
+    on_failure: abort
+
+  # ── 人工审批（只记录，无下游动作）────────────────────────────────────────────
+  # join: all + 两条入边：rca 与 plan 都是**直接**上游，审批卡片的 upstream 会把两者的
+  # 完整输出都渲染出来（前端 renderRunApprovals 只画 upstream）——这就是"带根因上下文的计划门"。
+  # ⚠️ 只写 plan 一条边 + 默认 join: any 会让 plan 一完成就弹审批；只写 rca 则在 plan 之前弹。
+  # timeout 86400：审批由人驱动；inline 模式下超时后没有人消费 resume 命令（见 plan §7.1），
+  # 给足一天，避免演示时被 sweeper 自动驳回。
+  approve-plan:
+    kind: approval
+    name: "审核修复计划（仅记录，不执行修复）"
+    join: all
+    required_edges: [rca, plan]
+    params:
+      rca: "$.nodes.rca.output"
+      plan: "$.nodes.plan.output"
+    approvers: []
+    timeout: 86400
+    # ⚠️ on_reject 引擎**只解析、从不消费**（全仓仅 core/dag.py 三处）——拒绝路由靠下面那条
+    #    `when: approved == false` 的边。写在这只是为了说明默认值，别指望它生效。
+    on_reject: abort
+
+  # ── 复盘（仅拒绝/超时分支；批准路径被 skip 级联跳过）─────────────────────────
+  recap:
+    agent: postmortem
+    params:
+      rca: "$.nodes.rca.output"
+      plan: "$.nodes.plan.output"
+      approved: "$.nodes.approve-plan.output.approved"
+      approver: "$.nodes.approve-plan.output.approver"
+      comment: "$.nodes.approve-plan.output.comment"
+    on_failure: continue
+
+edges:
+  - { from: triage, to: logs }
+  - { from: triage, to: locate }
+  - { from: triage, to: rca }
+  - { from: logs,   to: rca }
+  - { from: locate, to: rca }
+  - { from: rca,  to: plan }
+  - { from: rca,  to: approve-plan }
+  - { from: plan, to: approve-plan }
+  # 唯一进 recap 的边：人工拒绝与超时自动驳回都落在这里（超时写的是 {"approved": false}）
+  - { from: approve-plan, to: recap, when: "$.nodes.approve-plan.output.approved == false" }

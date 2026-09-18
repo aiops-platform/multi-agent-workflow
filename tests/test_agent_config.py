@@ -147,6 +147,16 @@ def test_remediation_plan_prompt_has_direction_contract() -> None:
     # 既有步骤契约不破坏（rollback 仍必填项）
     assert "rollback" in schema["properties"]["steps"]["items"]["properties"]
     assert "required" in schema["properties"]["steps"]["items"]
+    # 步骤字段必须与 UI 渲染器 dgxOptionBody 读的键**同名**——缺一个就是那一块静默不渲染。
+    # 曾因 schema 用 scope+expected 且没有 type/change/suggested_diff，导致类别标签、
+    # 「怎么改」正文、示意 diff 三处**永远空白**，而 action 被当成短标签渲染却塞进整段长文。
+    step = schema["properties"]["steps"]["items"]
+    assert {"type", "action", "target", "change", "expected_effect",
+            "verification", "rollback", "risk", "suggested_diff"} <= set(step["properties"])
+    # 每个选项自带**自己的** steps：共用一份时页签切换毫无意义（点开哪个正文都一样）。
+    assert "steps" in opt
+    assert "steps" in d["options"]["items"]["required"], "选项必须必填 steps"
+    assert opt["steps"]["items"] is step, "选项的 steps 必须与顶层同一份 schema，防两处漂移"
 
 
 def test_resolve_custom_row_null_prompt_falls_back_to_canonical() -> None:

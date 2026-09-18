@@ -247,7 +247,13 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "   实测踩过：缺 `trace_id` 时本节点重试耗尽 → `on_failure: abort` → **整条 run 失败**，\n"
         "   而其余四个取证节点遇到同样情况都是如实报负证据、照常往下走。\n"
         "   `found: false` 是**正确输出**，不是失败。\n"
-        f"5. {_JSON_RULE}\n"
+        "5. **`suspicious_files` 必须是核实过的真实路径**：仓库名取 `repo_url` 的最后一段，"
+        "用\n"
+        '   `search_code(repo_path, query="class <类名>")`（或搜方法名/配置键）核实，'
+        "**以返回的路径为准**。\n"
+        "   凭印象补全包名会得到不存在的文件（真实是 `com/company/order` 却写成 `com/acme/order`），"
+        "假路径会污染下游的根因分析。**搜不到就如实留空，不要填猜测值**\n"
+        f"6. {_JSON_RULE}\n"
         f"输出 Schema：{_schema_hint(CodeLocationSchema)}"
     ),
     "knowledge-lookup": (
@@ -269,14 +275,24 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "   - 若证据指向磁盘/CPU/网络资源打满、pod 异常 → infra_issue\n"
         "   - 配置项本身错误（无代码缺陷）→ config_issue\n"
         "   - 调用方 error 是 feign/read timeout 而下游无自身异常 → dependency_issue（但需核实下游）\n"
-        "3. **交叉核对两个服务信号**（入参 `scope_primary` 与 trace 证据里的 failing_service）：\n"
+        "3. **判定为 code_bug 时，必须用 git 工具把「哪一行、谁引入的」落实**"
+        "（这是根因结论的证据，不是装饰）：\n"
+        "   a. 从日志证据的栈帧里取出文件名与行号（形如 `QuotationService.java:61`）\n"
+        "   b. 仓库名取 `code` 证据里 `repo_url` 的最后一段（如 `aiops-test-order-service`）\n"
+        '   c. 先 `search_code(repo_path, query="class <类名>")` **核实文件的真实路径**——'
+        "栈帧里只有文件名，凭印象补路径会指向不存在的文件，**一律以 search_code 的返回为准**\n"
+        "   d. 再 `blame_file(repo_path, file_path=<c 得到的路径>, start_line=<行号>, end_line=<行号>)`\n"
+        "   e. 结果写进输出的 `introduced_by`（sha / author / date / summary / file / line）\n"
+        "   f. 查不到时（仓库未收录 / 非 git 仓库 / 行号越界）**如实省略 introduced_by**，"
+        "绝不编造提交\n"
+        "4. **交叉核对两个服务信号**（入参 `scope_primary` 与 trace 证据里的 failing_service）：\n"
         "   - 二者一致 → 证据相互印证，可提高 confidence\n"
         "   - **不一致不是错误，而是信号**：`scope_primary` 来自工单语言在 CMDB 上的定位"
         "（早、宽、含业务语义），failing_service 来自链路日志（晚、窄、是真实运行时证据）。"
         "**症状服务 ≠ 根因服务**是常态——把分歧写进 hypotheses，不要丢掉任何一方\n"
         "   - 若 `scope_primary` 为空（工单描述定位不到服务），说明该信号缺失，按其余证据判断即可，"
         "**不要因此编造服务名**\n"
-        "4. ⚠️ **证据不足时如实说，不要编一个根因类型**：\n"
+        "5. ⚠️ **证据不足时如实说，不要编一个根因类型**：\n"
         "   `insufficient: true` + `root_cause_type: null`，并把**缺什么**同时写进两处：\n"
         "   summary 里说清（给人读），`missing` 数组里逐条列出（给程序读，"
         "如 `\"窗口内的错误日志原文\"`、`\"失败调用的 code_locator 结论\"`、`\"变更/发布记录\"`）。\n"
@@ -287,18 +303,21 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "   而自己的 hypothesis 里写着「无代码缺陷证据，仅为剩余可能性中最低跨度的一项」。\n"
         "   **编出来的类型会被下游当真**：`fix-planner` 会照着出计划、`fix-implementer`\n"
         "   会照着改代码。置了 insufficient，流程会在中断节点停下，而不是拿着假根因往下走。\n"
-        f"5. {_JSON_RULE}\n"
+        f"6. {_JSON_RULE}\n"
         '{"root_cause_type": "code_bug"|"infra_issue"|"config_issue"|"dependency_issue"|null, '
         '"insufficient": true|false, "confidence": 0.0-1.0, "summary": "结论一句话", '
         '"missing": ["缺什么才能定根因"], '
-        '"hypotheses": ["候选项1", "候选项2"], "ruled_out": ["被排除的假设"]}\n'
+        '"hypotheses": ["候选项1", "候选项2"], "ruled_out": ["被排除的假设"], '
+        '"introduced_by": {"sha": "…", "author": "…", "date": "…", "summary": "…", '
+        '"file": "…", "line": 61}}\n'
         # ⚠️ `summary` 必须在模板里出现：它不出现在模板里，模型就不输出它——
         # 实测两个场景的 run，`summary` **每一次都是缺失的**（证据不足那次除外，
         # 因为那条规则里点名要求了它）。而下游是按"有 summary"消费的：
         # `fix-planner` 的入参契约写着「含 root_cause_type / confidence / summary」、
         # `scripts/watch_run.py` 按 summary 显示节点结论、halt 也用它当中断理由。
         "summary 一句话说清结论（证据不足时为「缺什么」），不要与 hypotheses 重复。\n"
-        "confidence 按证据强度给出 0-1 小数。\n"
+        "confidence 按证据强度给出 0-1 小数。`introduced_by` 由第 3 条 git 追溯得到，"
+        "查不到时整个字段省略。\n"
         "ruled_out 必须列出你明确排除的假设类别（全小写英文，如 infrastructure / network / code）。"
     ),
     # ==================================================================
@@ -408,8 +427,17 @@ AGENT_SCHEMAS: dict[str, dict] = {
 # 此处在“无 DB 行”或“DB 字段被清空”时作代码回退 + 单测锚点）
 # ======================================================================
 # remediation-planning-analyst：基于已审批根因生成可一次过审的修复计划。
-# decisions[] 是「方向选择」契约（形态 A）：互斥路径显式并列 + recommended 默认采纳；
-# 审批人不认可推荐时低成本改选 → 结构化驳回（带 decision_id + chosen_option）回本 agent 重写。
+#
+# **方案基数**（2026-09-18 修订，借自 aiops-agent-orchestration-spike 的 conclusion 契约）：
+# **默认只给一个方案**；仅当根因依赖未决前提（未定的业务规则/边界条件）时，才用 decisions[]
+# 并列互斥备选，且每个备选是一条完整可执行的路径。此前规则 5 写的是「存在互斥路径就必须
+# 列 decisions」，加上示例里挂着完整 decisions 块，模型几乎每轮都造出多个决策点 × 多个选项，
+# 实测一次产出 2 决策 × 3 选项 = 6 个「方案」，而 steps 只有一份、被 6 个选项共用，
+# 页面上表现为「一堆正文一模一样的方案」。改后示例给 `"decisions": []`，规则也以「默认空」开头。
+#
+# decisions[] 的形态 A（互斥路径显式并列 + 结构化驳回带 decision_id + chosen_option 回本 agent
+# 重写）**仍保留在 schema 里**，但其「改选方向」的交互依赖引擎 on_reject（未实现），
+# 详见 docs/todos/PLAN_APPROVAL_DIRECTION_FORM_A_zh-CN.md。
 REMEDIATION_PLANNING_PROMPT = (
     "你是 AI 运维平台的「修复规划」Agent（remediation-planning-analyst）。\n"
     "任务：基于已通过人工审批的根因结论，产出一份「一次可过审、可执行、可回滚」的修复计划。\n"
@@ -424,21 +452,34 @@ REMEDIATION_PLANNING_PROMPT = (
     "\n"
     "规则：\n"
     "1. 区分「止血 mitigation（先恢复可用性，按需前置）」与「根治 root_fix（消除根因，必须覆盖）」两类动作。\n"
-    "2. 每个步骤都要自证：target(改动目标) → action(动作) → expected(预期) → verification(如何验证) → rollback(如何回退) → risk(风险)。\n"
-    "   没有回滚路径的步骤不允许出现。requires_approval 只标「部署/不可逆/高风险」动作，测试等自证步骤一律 false。\n"
+    "2. 每个步骤都要自证：type(类别 code_fix/config_change/infra_action) + target(改动目标) → action(短标签，一句话)\n"
+    "   → change(具体怎么改：哪个文件哪段逻辑、怎么改) → expected_effect(预期) → verification(如何验证)\n"
+    "   → rollback(如何回退) → risk(风险)。没有回滚路径的步骤不允许出现（确实无需回滚写「无」）。\n"
+    "   requires_approval 只标「部署/不可逆/高风险」动作，测试等自证步骤一律 false。\n"
+    "   action 是**短标签**不是描述，长内容放 change —— 界面上 action 与 type 渲染成并列的小标签。\n"
     "3. 只引用证据里的事实，绝不编造 root_cause / 代码侦查里不存在的文件、行号、配置、API；仅凭根因无法定位到具体行时，\n"
     "   把「定位待改代码」列为首个实现步骤，不硬凑路径。\n"
     "4. 出稿前先核实：凡能从绑定工具/代码/仓库状态查实的（调用方、分支/制品、字段可空性、是否已有校验），必须先查实再写，\n"
     "   禁止把「自己本该查清的事」丢给审批人——这类项不得出现在 assumptions / open_questions。\n"
-    "5. 当存在互斥修复路径、各有合理 trade-off、无法靠证据唯一确定时，禁止静默选边：必须在 decisions[] 里并列给出 options\n"
-    "   （含 pros/cons/effort/risk/rollback）并标 recommended + accept_criteria。recommended 必须是你最有把握审批人会接受的选项，\n"
-    "   且 summary/steps 要与 recommended 口径一致——不要一边推荐 A 一边计划按 B 写。审批人默认「采纳推荐方向」，不需要你为某一边辩护。\n"
-    "6. 明确影响面（impact：affected_services / blast_radius / needs_deploy / change_window）与可测试的 success_criteria，供 tester/reviewer 验收。\n"
-    "7. open_questions ≤3，只留「真·产品/业务/外部」未知且必须由人拍板的（如上游调用方真实行为、字段业务语义、生产制品来源）；\n"
+    "5. **默认只给一个方案**：不要为凑备选而制造决策点，decisions 默认是空数组。\n"
+    "   仅当根因依赖**未决前提**（典型：未定的业务规则，如某字段是否必填、边界条件）时，\n"
+    "   才禁止静默选边：用 decisions[] 并列**互斥**备选（含 pros/cons/effort/risk/rollback）+ recommended + accept_criteria。\n"
+    "   备选数量以消歧所需为限（通常 2 个），并在各选项的 description 写明其成立前提——这正是消歧点。\n"
+    "   一个选项 = 一条**完整可执行**的路径：**每个选项都要写出它自己的 steps**（按该选项的方向展开，\n"
+    "   字段与顶层 steps 同一套）。顶层 steps 是首选方向的计划、与推荐选项的 steps 一致；\n"
+    "   各选项**不得共用同一份 steps** —— 两个选项的 steps 一样，等于你根本没给出两个方案。\n"
+    "   同理**不要**把同一方案的多步拆成多个选项，也不要把互不相关的取舍塞进同一个决策。\n"
+    "6. decisions 非空时：恰有一个 recommended 指向 options 内某项，且 summary/steps 与它口径一致——\n"
+    "   不要一边推荐 A 一边计划按 B 写。拿不准就把**最保守/最可能成立**的那项标为 recommended\n"
+    "   （系统兜底：多个标记取第一个、零个标记取首个选项），不需要你为某一边辩护。\n"
+    "7. 明确影响面（impact：affected_services / blast_radius / needs_deploy / change_window）与可测试的 success_criteria，供 tester/reviewer 验收。\n"
+    "8. open_questions ≤3，只留「真·产品/业务/外部」未知且必须由人拍板的（如上游调用方真实行为、字段业务语义、生产制品来源）；\n"
     "   可查实的不得留，不需要人拍板的写进 assumptions。\n"
-    "8. 交付前自检，任一不过则先改写再输出：\n"
+    "9. 交付前自检，任一不过则先改写再输出：\n"
     "   - 每步有 verification + rollback + risk；requires_approval 只标该标的步骤；\n"
-    "   - decisions 的 recommended 确实在 options 内，且与 summary/steps 口径一致；\n"
+    "   - decisions 为空，或恰有一个 recommended 在 options 内且与 summary/steps 口径一致；\n"
+    "   - 每个 option 都有自己的 steps，且是该选项方向的展开（不是照抄顶层 steps）；\n"
+    "   - 备选之间确实互斥（各自成立前提不同），不是同一方案被拆开；\n"
     "   - root_cause_ref 与上游已审批根因一致；open_questions 无自己能查实的项且 ≤3 条；\n"
     "   - summary 一句话讲清「改什么 / 为什么 / 风险 / 怎么退」。\n"
     "\n"
@@ -446,20 +487,75 @@ REMEDIATION_PLANNING_PROMPT = (
     '{"summary": "计划一句话摘要",\n'
     ' "root_cause_ref": {"type": "code_bug", "confidence": 0.9, "summary": "根因摘要"},\n'
     ' "approach": "mitigation_first",\n'
-    ' "steps": [{"id": "S1", "phase": "mitigation", "scope": "code", "target": "文件:行", "action": "动作",\n'
-    '            "expected": "预期", "verification": "验证方式", "rollback": "回滚方案", "risk": "low",\n'
-    '            "depends_on": [], "requires_approval": true}],\n'
+    ' "steps": [{"id": "S1", "phase": "mitigation", "type": "code_fix", "target": "src/main/java/…/QuotationService.java:61",\n'
+    '            "action": "补空值校验", "change": "trim() 前判空，为空则抛 QuotationTemplateMissingException",\n'
+    '            "expected_effect": "该路径不再抛 NPE，改为受控业务异常", "verification": "单测 + 复现请求",\n'
+    '            "rollback": "revert 本提交", "risk": "low", "requires_approval": true}],\n'
     ' "impact": {"affected_services": ["svc-a"], "blast_radius": "service", "needs_deploy": true, "change_window": true},\n'
     ' "success_criteria": ["可验证的验收标准"],\n'
     ' "risks": [{"risk": "风险", "mitigation": "缓解"}],\n'
     ' "assumptions": ["前提假设"],\n'
     ' "open_questions": ["≤3 条，仅真·产品/外部未知"],\n'
-    ' "decisions": [{"id": "D1", "question": "要人拍板的问题",\n'
-    '                 "context": "为何需人定",\n'
-    '                 "options": [{"id": "A", "title": "选项A", "pros": [], "cons": [], "rollback": "…"},\n'
-    '                             {"id": "B", "title": "选项B", "pros": [], "cons": [], "rollback": "…"}],\n'
-    '                 "recommended": "A", "accept_criteria": "选 A 后计划据此展开，满足…即可放行"}]}'
+    ' "decisions": []}\n'
+    "\n"
+    "注意上面示例里 decisions 是**空数组**，这是常态：一个方案能讲清就别给备选，"
+    "不要为了显得周全而制造决策点。\n"
+    "仅当根因依赖未决前提（见规则 5）、确需并列互斥备选时，decisions 才写成非空数组，"
+    '每项形如 {"id": "D1", "question": "要人拍板的问题", "context": "为何需人定",\n'
+    '  "options": [{"id": "A", "title": "选项A", "description": "做法 + 本选项成立前提", "pros": [], "cons": [], "rollback": "…",\n'
+    '               "steps": [{"phase": "root_fix", "type": "code_fix", "target": "…", "action": "…",\n'
+    '                          "change": "…", "expected_effect": "…", "verification": "…", "rollback": "…", "risk": "low"}]},\n'
+    '              {"id": "B", "title": "选项B", "description": "做法 + 本选项成立前提", "pros": [], "cons": [], "rollback": "…",\n'
+    '               "steps": [{"phase": "root_fix", "type": "code_fix", "target": "…", "action": "…",\n'
+    '                          "change": "…", "expected_effect": "…", "verification": "…", "rollback": "…", "risk": "low"}]}],\n'
+    '  "recommended": "A", "accept_criteria": "选 A 后计划据此展开，满足…即可放行"}。'
 )
+
+# 修复步骤的 schema。**定义一次、两处引用**：顶层 ``steps``（无备选时的单方案）与
+# ``decisions[].options[].steps``（每个备选自己的完整计划），避免两处字段漂移。
+#
+# 字段名对齐 UI 渲染器 ``dgxOptionBody``（``service-intelligence-platform-ui/js/app.js``）——
+# 它读的是 type / action / target / change / expected_effect / verification / rollback /
+# risk / suggested_diff。原先 schema 用 ``scope`` + ``expected`` 且**没有**
+# type/change/suggested_diff，于是渲染器 8 个字段里 3 个**永远是空的**（类别标签、「怎么改」
+# 正文、示意 diff 都不显示），而 ``action`` 被要求写成一整句长文本、又被渲染器塞进
+# ``<span class="dgx-tag">`` 当短标签用。实测模型还会填出 ``"scope": "data"`` 这种 enum 外
+# 的值——两套词汇表并存，模型自己也没对齐。
+_REMEDIATION_STEP_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string", "description": "步骤标识（S1/S2…）"},
+        "phase": {
+            "type": "string",
+            "enum": ["mitigation", "root_fix", "verification", "cleanup"],
+            "description": "止血 / 根治 / 验证 / 清理",
+        },
+        "type": {
+            "type": "string",
+            "enum": ["code_fix", "config_change", "infra_action"],
+            "description": "步骤类别，UI 按它显示标签",
+        },
+        "target": {
+            "type": "string",
+            "description": "改动目标：code 写文件路径（须与 git 返回的一致），infra 写资源名",
+        },
+        "action": {"type": "string", "description": "短标签：这一步做什么（一句话，别写成长段落）"},
+        "change": {
+            "type": "string",
+            "description": "具体怎么改：改哪个文件哪段逻辑、怎么改（code_fix / config_change 必填）",
+        },
+        "expected_effect": {"type": "string", "description": "执行后的预期效果"},
+        "verification": {"type": "string", "description": "如何验证该步骤生效"},
+        "rollback": {"type": "string", "description": "回滚/撤销方案（必填；确实无需回滚写「无」）"},
+        "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+        "requires_approval": {"type": "boolean", "description": "仅「部署 / 不可逆 / 高风险」动作标 true"},
+        "suggested_diff": {
+            "type": "string",
+            "description": "可选：示意 diff（仅 code_fix / config_change；给人看，无执行语义）",
+        },
+    },
+    "required": ["phase", "type", "target", "action", "change", "expected_effect", "verification", "rollback", "risk"],
+}
 
 REMEDIATION_PLANNING_SCHEMA: dict = {
     "type": "object",
@@ -478,24 +574,8 @@ REMEDIATION_PLANNING_SCHEMA: dict = {
         "approach": {"type": "string", "enum": ["mitigation_first", "root_fix_only", "combined"], "description": "止血优先 / 仅根治 / 双管齐下"},
         "steps": {
             "type": "array",
-            "description": "有序执行步骤；每一步都必须可验证、可回滚",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "phase": {"type": "string", "enum": ["mitigation", "root_fix", "verification", "cleanup"]},
-                    "scope": {"type": "string", "enum": ["code", "config", "infra"]},
-                    "target": {"type": "string", "description": "改动目标：文件/服务/配置/资源"},
-                    "action": {"type": "string", "description": "具体动作"},
-                    "expected": {"type": "string", "description": "预期效果"},
-                    "verification": {"type": "string", "description": "如何验证该步骤生效"},
-                    "rollback": {"type": "string", "description": "回滚/撤销方案（必填）"},
-                    "risk": {"type": "string", "enum": ["low", "medium", "high"]},
-                    "depends_on": {"type": "array", "items": {"type": "string"}},
-                    "requires_approval": {"type": "boolean"},
-                },
-                "required": ["phase", "scope", "target", "action", "expected", "verification", "rollback", "risk"],
-            },
+            "description": "首选方向的执行计划。decisions 为空时它就是唯一方案；非空时与推荐选项的 steps 一致。",
+            "items": _REMEDIATION_STEP_SCHEMA,
         },
         "impact": {
             "type": "object",
@@ -540,8 +620,13 @@ REMEDIATION_PLANNING_SCHEMA: dict = {
                                 "effort": {"type": "string", "description": "low/medium/high 或人天"},
                                 "risk": {"type": "string", "enum": ["low", "medium", "high"]},
                                 "rollback": {"type": "string", "description": "若最终走向该选项，如何回退"},
+                                "steps": {
+                                    "type": "array",
+                                    "description": "本选项**自己的**完整执行步骤：按本选项的方向写，不要照抄推荐项的 steps。",
+                                    "items": _REMEDIATION_STEP_SCHEMA,
+                                },
                             },
-                            "required": ["id", "title"],
+                            "required": ["id", "title", "description", "steps"],
                         },
                     },
                     "recommended": {"type": "string", "description": "推荐选项 id；必须是 options 中某项，审批默认采纳"},

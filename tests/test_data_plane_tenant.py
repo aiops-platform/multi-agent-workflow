@@ -149,6 +149,27 @@ async def test_mcp_manager_tenant_isolation(tenant_manager) -> None:
     assert [c.name for c in await mgr.clients_for_agent("triage", tenant_id="team-a")] == ["a-tools"]
 
 
+async def test_stores_provider_assigned_after_construction_routes_tenants() -> None:
+    """**构造后**赋值 ``stores_provider`` 必须真的生效（api/app.py 就是这么接的）。
+
+    回归：类里只写 `self._stores_provider`，而 app.py 用 `mcp_manager.stores_provider = …`
+    对已构造的单例赋值 —— 没有属性 setter 时那是一个**死属性**，租户路由静默失效，
+    manager 永远读全局库（本机实测后果：所有 agent 的 llm_call `tools=[]`，
+    log-analyst 一次 query_logs 都没调就"分析"出了根因）。
+    """
+    store_a = _FakeStore([
+        {"id": "m-a", "name": "a-tools", "transport": "http", "config": {"url": "http://a"},
+         "enabled": True},
+    ])
+    global_store = _FakeStore([])
+    mgr = MCPClientManager(global_store)  # 先构造（无 provider）
+    mgr.stores_provider = lambda tid: _pick(tid, store_a, _FakeStore([]), global_store)
+
+    assert [c.name for c in await mgr.clients_for_agent("triage", tenant_id="team-a")] == ["a-tools"]
+    assert await mgr.clients_for_agent("triage", tenant_id="team-b") == []
+    assert await mgr.clients_for_agent("triage", tenant_id=None) == []
+
+
 async def test_mcp_manager_async_tenant_server_ids() -> None:
     """server_ids_for 支持 async + (agent, tenant) 签名——按租户绑定解析。"""
     store = _FakeStore([

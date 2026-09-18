@@ -248,6 +248,20 @@ RootCauseSchema = {
         "hypotheses": {"type": "array", "items": {"type": "string"}},
         "ruled_out": {"type": "array", "items": {"type": "string"}},
         "summary": {"type": "string"},
+        # 引入缺陷的提交（git blame 追溯得到）。**可选**：仓库未收录 / 非 git 仓库 /
+        # 行号越界时整个字段省略——「查不到」是合法结果，不接受编造的提交。
+        "introduced_by": {
+            "type": "object",
+            "description": "引入该缺陷的提交（由 git blame 得到）",
+            "properties": {
+                "sha": {"type": "string"},
+                "author": {"type": "string"},
+                "date": {"type": "string"},
+                "summary": {"type": "string"},
+                "file": {"type": "string"},
+                "line": {"type": "integer"},
+            },
+        },
     },
     #: `summary` 进 required：下游是按"有 summary"消费的（fix-planner 的入参契约、
     #: watch_run 的显示、halt 的中断理由）。它一度**不在** prompt 的 JSON 模板里，
