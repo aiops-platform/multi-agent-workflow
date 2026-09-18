@@ -282,3 +282,70 @@ async def test_ws_git_disables_repo_hooks(tmp_path: Path, monkeypatch) -> None:
     # 正常提交不受影响（不是把 commit 一起禁掉了）
     assert out["rc"] == 0
     assert "改一下" in git("log", "-1", "--pretty=%s", cwd=repo)
+
+
+# ----------------------------------------------------------------------
+# 测试命令只能来自部署配置（不接受 LLM 传参）
+# ----------------------------------------------------------------------
+def test_ws_run_tests_has_no_command_parameter() -> None:
+    """硬保证：命令**不能传参**。
+
+    原先签名的第二个参数是 `command`，由 LLM 传自由命令、再用前缀白名单去猜
+    安不安全——而白名单里含 `"bash "`，`bash -c "<任意>"` 直接通过，等于没有白名单。
+    这条测试锁住"那个参数不许回来"。
+    """
+    import inspect
+
+    from agentflow.agents.workspace_tools import ws_run_tests
+
+    params = set(inspect.signature(ws_run_tests).parameters)
+    assert "command" not in params, (
+        "ws_run_tests 又能传命令了——模型可以注入任意命令，白名单挡不住"
+    )
+    assert "service" in params
+
+
+def test_test_cmd_unconfigured_is_fail_closed(monkeypatch) -> None:
+    """未配置 → **报错**，不是跑一个默认命令。
+
+    一个"跑得起来"的默认值会让配置漏了也照跑，那正是本仓反复踩的静默缺陷。
+    """
+    from agentflow.agents.workspace_tools import WorkspaceToolError, test_cmd_for
+    from agentflow.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "test_cmds", "")
+    with pytest.raises(WorkspaceToolError, match="未配置测试命令"):
+        test_cmd_for("order-service")
+
+
+def test_test_cmd_missing_service_lists_configured(monkeypatch) -> None:
+    """配了别的服务但漏了这个 → 报错里列出已配的，便于当场发现漏配。"""
+    from agentflow.agents.workspace_tools import WorkspaceToolError, test_cmd_for
+    from agentflow.config import get_settings
+
+    monkeypatch.setattr(
+        get_settings(), "test_cmds", '{"warranty-service": "./gradlew test"}'
+    )
+    with pytest.raises(WorkspaceToolError, match=r"已配置的服务.*warranty-service"):
+        test_cmd_for("order-service")
+
+
+def test_test_cmd_bad_json_is_loud(monkeypatch) -> None:
+    """配置写坏了要报出来，不是静默当作"没配"。"""
+    from agentflow.agents.workspace_tools import WorkspaceToolError, test_cmd_for
+    from agentflow.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "test_cmds", "{不是 JSON")
+    with pytest.raises(WorkspaceToolError, match="不是合法 JSON"):
+        test_cmd_for("order-service")
+
+
+def test_test_cmd_returns_configured(monkeypatch) -> None:
+    from agentflow.agents.workspace_tools import test_cmd_for
+    from agentflow.config import get_settings
+
+    monkeypatch.setattr(
+        get_settings(), "test_cmds",
+        '{"order-service": "./gradlew test --no-daemon -q"}',
+    )
+    assert test_cmd_for("order-service") == "./gradlew test --no-daemon -q"

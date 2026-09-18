@@ -86,7 +86,10 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     ),
     "ws_run_tests": ToolSpec(
         "ws_run_tests", ["tester", "fix-implementer"],
-        timeout=300, level="L2", description="工作区内执行测试命令（白名单前缀）",
+        timeout=300, level="L2",
+        # 描述要如实：命令**由部署配置给定**，调用方不能传。旧文案"白名单前缀"会让
+        # 模型以为自己能指定命令——而那个"白名单"里含 `bash `，等于没有。
+        description="执行该服务在部署配置中登记的测试命令（命令固定，不接受传参）",
     ),
     "ws_git": ToolSpec(
         "ws_git", ["committer", "fix-implementer"],

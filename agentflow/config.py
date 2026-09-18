@@ -164,6 +164,14 @@ class Settings(BaseSettings):
     # {"order-service": "aiops-test-order-service"}
     # 缺省（空）→ 目录名取服务名本身。**注意：这里没有默认个人路径。**
     repo_map: str = ""
+    # 每服务的**测试命令**（JSON `{"service": "命令"}`）。
+    #
+    # 为什么由配置给、而不是让 agent 传：`ws_run_tests(service, command)` 原先允许
+    # LLM 传自由命令，再用「前缀白名单」去猜它安不安全——而白名单里含 `bash `，
+    # `bash -c "<任意>"` 直接通过，**等于没有白名单**。改成"可执行命令的集合在部署时
+    # 定死"，这个问题就不存在了。
+    # 未配置该服务的命令 → **报错**（fail-closed，不猜一个默认值代跑）。
+    test_cmds: str = ""
 
     # ---- 工作区（§8.7.2）----
     # Run 级代码工作区根目录；布局 {root}/{tenant}/{run}/repos/{service}。

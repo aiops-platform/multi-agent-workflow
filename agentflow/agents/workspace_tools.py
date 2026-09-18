@@ -18,6 +18,7 @@ git 命令白名单：只放行 status/diff/add/commit/push/rev-parse/branch/che
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -124,17 +125,50 @@ async def ws_write_file(service: str, path: str, content: str) -> dict:
     }
 
 
-async def ws_run_tests(service: str, command: str | None = None, timeout: int = 120) -> dict:
-    """在工作区执行测试命令（默认 gradle 单测）。
+def test_cmd_for(service: str) -> str:
+    """该服务的测试命令（**只能来自部署配置**，见 ``AGENTFLOW_TEST_CMDS``）。
 
-    刻意不走沙箱：本地 E2E 环境无沙箱 Pod 常驻（M4 沙箱见 sandbox/）。命令受白名单
-    前缀约束，且 cwd 固定在工作区内。
+    为什么不让 agent 传命令：原先签名是 ``ws_run_tests(service, command)``，由 LLM 传
+    自由命令、再用前缀白名单去猜安不安全——而白名单里含 ``"bash "``，
+    ``bash -c "<任意>"`` 直接通过，**等于没有白名单**。
+    改成"可执行命令的集合在部署时定死"之后，"白名单"这件事就不存在了。
+
+    未配置 → **报错**（fail-closed）。**不要**给默认值：一个"跑得起来"的默认命令会让
+    配置漏了也照跑，正是本仓反复踩的那类静默缺陷（`docs/TODO.md` §23）。
+    """
+    from ..config import get_settings
+
+    raw = (get_settings().test_cmds or "").strip()
+    if not raw:
+        raise WorkspaceToolError(
+            f"未配置测试命令：service={service!r} 无 AGENTFLOW_TEST_CMDS 条目"
+            "（该配置决定每个服务能跑什么命令，不再接受调用方传参）"
+        )
+    try:
+        table = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise WorkspaceToolError(f"AGENTFLOW_TEST_CMDS 不是合法 JSON: {exc}") from exc
+    cmd = (table or {}).get(service)
+    if not cmd:
+        raise WorkspaceToolError(
+            f"service={service!r} 未在 AGENTFLOW_TEST_CMDS 中配置测试命令"
+            f"（已配置的服务：{sorted((table or {}))}）"
+        )
+    return cmd
+
+
+async def ws_run_tests(service: str, timeout: int = 120) -> dict:
+    """在工作区执行**该服务配置的**测试命令。
+
+    ⚠️ **无 command 参数**——命令来自部署配置（``test_cmd_for``），不接受 LLM 传参。
+    这是"测试命令不来自模型"这条要求的落点。
+
+    本函数是**本地实现**（当前形态：worker 进程内执行）。沙箱化见
+    ``agents/mcp.py`` 的接线——写入与测试最终必须落在沙箱容器里执行，
+    因为跑的是仓库代码（不可信），而 worker 持有全部密钥。
     """
     repo = _resolve_repo(service)
-    cmd = command or "./gradlew test --no-daemon -q"
-    allowed_prefixes = ("./gradlew", "gradle", "mvn ", "mvn\t", "python ", "pytest", "npm ", "bash ")
-    if not cmd.startswith(allowed_prefixes):
-        raise WorkspaceToolError(f"测试命令不在白名单内: {cmd!r}")
+    cmd = test_cmd_for(service)
     proc = await asyncio.create_subprocess_shell(
         cmd, cwd=str(repo),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
