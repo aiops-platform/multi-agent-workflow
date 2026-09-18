@@ -1371,6 +1371,27 @@ Worker 日志             →  [run_xxx] run 已终态，忽略 resume      ← 
 `sandbox_client` / `action_executor` **两个参数都没传**，于是
 `agents/tools.py:150` 的分支判断恒为假，L2 工具**根本不会被建出来**。
 
+### 23.5 `ws_git` 有两个**只校验、不生效**的参数
+
+`agents/workspace_tools.py` 的 `ws_git(service, args, message="", remote="origin")`：
+
+```python
+if sub == "commit" and not message:
+    raise WorkspaceToolError("git commit 需要 message")
+...
+full = ["git", *args]          # ← message / remote 都没出现在这里
+```
+
+- **`message`**：被校验，但**从不参与构造命令**。提交信息实际由 `args` 里的 `-m` 提供
+  → 守卫逼调用方**传两遍**，而它看起来像是在把关"提交信息"。
+- **`remote`**：完全没被使用（`push` 的目标由 `args` 决定）。
+
+`ToolSpec` 不做参数 schema，所以这两个参数对 LLM **是可见的**，模型会照着签名去填。
+与 §23 其余几条同族：**看着在把关，实际没把关**。
+
+改法二选一：让 `message` 真正生效（`sub == "commit"` 时由它拼 `-m`，并禁止 `args` 再带
+`-m`），或把两个参数都删掉、由 `args` 全权表达。**属独立缺陷，未与安全修复混提**。
+
 ---
 
 ## 24. ~~密钥卫生：`Settings` 全部用 `str` 存，`repr()` 明文带出~~ ✅ 已修（2026-09-18）

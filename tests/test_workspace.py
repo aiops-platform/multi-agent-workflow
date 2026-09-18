@@ -220,3 +220,65 @@ def test_git_output_truncation_keeps_head_and_is_visible() -> None:
 
     same, not_truncated = _truncate("short", 40)
     assert (same, not_truncated) == ("short", False)
+
+
+# ----------------------------------------------------------------------
+# 仓库自带 hook 不得在 worker 里执行（隔离：写/测试在沙箱，但 git 在 worker）
+# ----------------------------------------------------------------------
+async def test_ws_git_disables_repo_hooks(tmp_path: Path, monkeypatch) -> None:
+    """恶意仓库的 `.git/hooks/pre-commit` 不能在 worker 容器里执行。
+
+    仓库内容是不可信的（沙箱写进去的、来自工单定位到的代码），而 `.git/hooks/`
+    也在工作区里、同样可写。`git commit` 会执行 `pre-commit`——恶意仓库因此能在
+    **持有全部密钥的 worker 容器里**执行任意代码，正好绕过"写和测试进沙箱"的隔离。
+    """
+    from agentflow import exec_context
+    from agentflow.agents.workspace_tools import ws_git
+    from agentflow.config import get_settings
+
+    root = tmp_path / "ws"
+    run_id, tenant, service = "run_hook", "t1", "order-service"
+    repo = root / tenant / run_id / "repos" / service
+    repo.mkdir(parents=True)
+    git("init", "-q", "-b", "main", cwd=repo)
+    (repo / "a.txt").write_text("x", encoding="utf-8")
+    git("add", ".", cwd=repo)
+    git("commit", "-q", "-m", "init", cwd=repo)
+
+    sentinel = tmp_path / "PWNED"
+    hooks = repo / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    hook = hooks / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {sentinel}\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    # 把 hooksPath 显式钉到 `.git/hooks`：开发机的全局 git config 可能是
+    # `core.hooksPath=.githooks`，那会让 `.git/hooks/` 整体失效、hook 根本不跑——
+    # 于是这条测试在**本机**永远"通过"，而**容器里**（无全局配置）漏洞是活的。
+    # 钉死之后，测的是产品行为，不是这台机器的配置。
+    git("config", "core.hooksPath", str(hooks), cwd=repo)
+
+    # 自检：**不带** core.hooksPath 时这个 hook 确实会跑——否则本测试是空断言
+    (repo / "a.txt").write_text("probe", encoding="utf-8")
+    git("add", "a.txt", cwd=repo)
+    git("commit", "-q", "-m", "probe", cwd=repo)
+    assert sentinel.exists(), "自检失败：这个 hook 本来就不会执行，本测试没有意义"
+    sentinel.unlink()
+
+    monkeypatch.setattr(get_settings(), "workspace_root", root)
+    tok_run = exec_context.current_run.set(run_id)
+    tok_tenant = exec_context.current_tenant.set(tenant)
+    try:
+        (repo / "a.txt").write_text("y", encoding="utf-8")
+        await ws_git(service, ["add", "a.txt"])
+        # message 是 ws_git 的签名参数（只被校验、不参与构造命令，见 TODO §23.5），
+        # 提交信息实际由 args 里的 -m 提供——这里按现状传，别把两件事混在一个提交里
+        out = await ws_git(service, ["commit", "-m", "改一下"], message="改一下")
+    finally:
+        exec_context.current_run.reset(tok_run)
+        exec_context.current_tenant.reset(tok_tenant)
+
+    assert not sentinel.exists(), "仓库自带的 pre-commit 在 worker 里被执行了"
+    # 正常提交不受影响（不是把 commit 一起禁掉了）
+    assert out["rc"] == 0
+    assert "改一下" in git("log", "-1", "--pretty=%s", cwd=repo)

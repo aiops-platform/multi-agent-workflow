@@ -188,7 +188,17 @@ async def ws_git(service: str, args: list[str], message: str = "", remote: str =
     if sub == "commit" and not message:
         raise WorkspaceToolError("git commit 需要 message")
 
-    full = ["git", *args]
+    # ⚠️ `core.hooksPath=/dev/null`：**禁用仓库自带的 hook**。
+    #
+    # 仓库内容是不可信的（沙箱写进去的、来自工单定位到的代码），而 `.git/hooks/`
+    # 也在工作区里、同样可写。`git commit` 会执行 `pre-commit` / `commit-msg`，
+    # `git push` 会执行 `pre-push` —— 恶意仓库因此能在 **worker 容器里**执行任意代码，
+    # 而 worker 持有 DeepSeek key / DB DSN / MCP 凭证 / git PAT。这条正好绕过
+    # "写和测试进沙箱"的隔离，所以必须堵。
+    #
+    # 用 `core.hooksPath` 而不是 `--no-verify`：后者只跳过 commit 的两个 hook，
+    # 挡不住 `pre-push` 等其余钩子。`-c` 是全局选项，**必须排在子命令之前**。
+    full = ["git", "-c", "core.hooksPath=/dev/null", *args]
     proc = await asyncio.create_subprocess_exec(
         *full, cwd=str(repo),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
