@@ -1,0 +1,42 @@
+# agentflow-sandbox-java21：Java 服务运行测试用的沙箱变体（design §10.2）
+#
+# 构建：
+#   docker build -t agentflow-sandbox-java21:local \
+#       -f docker/sandbox/Dockerfile.java21 .          # 依赖 agentflow-sandbox:local 已构建
+#
+# 为什么是独立镜像而不是基础镜像的一个开关：见 docker/sandbox/Dockerfile 顶部注释——
+# 基础镜像要保住"零依赖、离线可建"，工具链按 runtime 各自成镜像。
+#
+# ⚠️ **本镜像一个凭据都不能有**。它执行的是仓库里的代码（`build.gradle` 本身就是可执行
+# 脚本），而 worker 容器持有 DeepSeek key / DB DSN / MCP 凭证 / git PAT。
+# 判据：谁持有密钥，谁不执行不可信代码。往这里塞任何 AGENTFLOW_* 密钥都等于把上面那条
+# 隔离整个作废。
+FROM localhost/agentflow-sandbox:local
+
+# ---- JDK ----
+# 测试床三个服务实测：JavaLanguageVersion.of(21) + gradle-8.10（wrapper 自带）。
+# 只装 JDK：`./gradlew` 会自己下发行版（Gradle 8.x 的 wrapper 是
+# `java -jar gradle-wrapper.jar` 下载，**不需要 wget/curl，也不需要 unzip**）。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openjdk-21-jdk-headless \
+ && rm -rf /var/lib/apt/lists/*
+
+# ---- gradle 发行版与依赖缓存 ----
+# `./gradlew test` 首次运行要下 gradle 本体（~130MB）+ Maven Central 全部依赖。
+# 这与"沙箱默认断网"直接冲突，解法是**预热**：把 GRADLE_USER_HOME 指到一个可挂载的
+# 路径，CI 里预先跑一次 `./gradlew dependencies` 填满，之后即可断网跑测试。
+#
+# 注意缓存与 **gradle 版本 + 项目** 绑定：换 gradle 版本会重下。多服务时按服务分卷
+# （`gradle-home/{service}`），共用一份会在版本不一致时互相覆盖。
+ENV GRADLE_USER_HOME=/gradle-home
+VOLUME ["/gradle-home"]
+
+# 与基础镜像一致；沙箱**不装 git**——克隆与提交都在 worker（那也是唯一该有 PAT 的地方），
+# 仓库代码因此连做仓库操作的手段都没有。
+ENV SBX_MAX_EXEC_SECONDS=300 \
+    SBX_MAX_STDOUT_BYTES=1048576 \
+    SBX_MAX_CONCURRENT=10 \
+    SBX_WRITABLE=/workspace:/tmp
+
+EXPOSE 44772
+CMD ["python", "-m", "agentflow.sandbox.exec_service"]

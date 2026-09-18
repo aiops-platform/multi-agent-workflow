@@ -1,15 +1,16 @@
-# agentflow-sandbox：沙箱执行 Pod 镜像（design §4.1 / §10.2）
+# agentflow-sandbox（基础镜像）：沙箱执行 Pod 镜像（design §4.1 / §10.2）
 # exec 服务纯 Python stdlib 实现（http.server），零 pip 依赖 → 完全离线可建。
+#
+# **本镜像刻意保持最小**：只跑 exec 服务，不含任何语言工具链、不含 git、不含密钥。
+# 需要"能编译/跑某个服务的测试"时，用按 runtime 分出的变体镜像叠加，例如
+# `docker/sandbox/Dockerfile.java21`（FROM 本镜像 + JDK21）。
+#
+# 为什么不再用 `--build-arg WITH_JDK=1`：工具链与"零依赖、离线可建"这条约束是矛盾的，
+# 揉进一个 Dockerfile 会让基础镜像的构建条件变得看开关。拆成独立变体后，
+# 基础镜像**永远**可离线构建，而变体按需联网、按 runtime 各建一个。
 FROM python:3.12-slim
 
-# Java 21（可选，编译 Java 用；apt 下载 ~250MB 依赖网络，默认关以离线构建）
-# 注：python:3.12-slim 自带 bash
-ARG WITH_JDK=0
-RUN if [ "$WITH_JDK" = "1" ]; then \
-        apt-get update && apt-get install -y --no-install-recommends \
-            openjdk-21-jdk-headless git \
-        && rm -rf /var/lib/apt/lists/*; \
-    fi
+# 注：python:3.12-slim 自带 bash 与 ca-certificates（实测 /etc/ssl/certs 301 条）
 
 # 拷贝 exec 服务（stdlib-only，无第三方依赖）
 WORKDIR /opt/agentflow
