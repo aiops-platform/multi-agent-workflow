@@ -153,6 +153,12 @@ class Settings(BaseSettings):
     # ---- 沙箱（M4）----
     open_sandbox_domain: str = "localhost:8080"
     open_sandbox_api_key: SecretStr = SecretStr("")
+    # 沙箱 exec 服务地址（worker → sidecar）。空 = **不接线沙箱**：
+    # 此时 `ws_write_file` / `ws_run_tests` 调用即报错，**不会**回退到 worker 本地执行
+    # （它们跑的是仓库代码，而 worker 持有全部密钥——回退等于把隔离作废）。
+    # sidecar 形态填 `http://127.0.0.1:44772`（同 Pod 同网络命名空间走 loopback，
+    # exec 服务默认也只绑 loopback：它没有认证）。
+    sandbox_url: str = ""
 
     # ---- 仓库映射（工作区准备用，§8.7.2）----
     # 工作区准备发生在 run 创建期（早于任何 agent 节点），此时还没有 MCP 调用，

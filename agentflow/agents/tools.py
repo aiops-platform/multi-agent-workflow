@@ -201,21 +201,52 @@ def build_local_tools(agent_name: str) -> list[dict]:
     return tools
 
 
-def build_workspace_tools(agent_name: str) -> list[dict]:
+#: 必须经沙箱的工作区工具。判据是**它会不会执行/改动仓库里的东西**：
+#: 写文件与跑测试都在执行仓库代码（`build.gradle` 本身就是脚本），而 worker 持有
+#: DeepSeek key / DB DSN / MCP 凭证 / git PAT —— 谁持有密钥，谁不执行不可信代码。
+#:
+#: **读**（ws_read_file / ws_list_files）刻意不在列：诊断链的 `code-locator` 靠它们
+#: 定位，如果读也依赖沙箱，沙箱一挂整条诊断链就跑不起来。读不改状态、不执行仓库
+#: 代码，风险低。这个取舍是有意的，别"顺手统一"。
+WORKSPACE_SANDBOXED = frozenset({"ws_write_file", "ws_run_tests"})
+
+
+def build_workspace_tools(agent_name: str, *, sandbox_client=None) -> list[dict]:
     """为 agent 生成工作区工具（§8.7；实现见 ``workspace_tools.py``）。
 
-    与 L1/L2 并列的第三类：不经数据源、也不经沙箱，直接读写**本次 run 的工作区**
+    与 L1/L2 并列的第三类：不经数据源，直接读写**本次 run 的工作区**
     （定位靠 ``exec_context.current_run``，不接受 LLM 传 run/service 之外的越界参数）。
     ``ws_read_file``/``ws_list_files`` 只读（DONT_ASK 下自动 ALLOW），
     写/git/测试走 needs_approval，由租户 ToolPolicy 兜底。
+
+    ``sandbox_client``：注入后 ``WORKSPACE_SANDBOXED`` 里的工具改走沙箱 sidecar
+    （照 ``build_l2_tools`` 的 ``partial`` 模式）。**未注入时不静默降级为本地执行**，
+    而是注册一个调用即报错的占位——见 ``_fail_closed_ws_tool``。
     """
-    from .workspace_tools import WORKSPACE_TOOLS
+    from .workspace_tools import (
+        WORKSPACE_TOOLS,
+        _fail_closed_ws_tool,
+        ws_run_tests_sandboxed,
+        ws_write_file_sandboxed,
+    )
+
+    sandboxed = {
+        "ws_write_file": ws_write_file_sandboxed,
+        "ws_run_tests": ws_run_tests_sandboxed,
+    }
 
     out: list[dict] = []
     for spec in tools_for_agent(agent_name):
         func = WORKSPACE_TOOLS.get(spec.name)
         if func is None:
             continue
+        if spec.name in WORKSPACE_SANDBOXED:
+            if sandbox_client is not None:
+                from functools import partial
+
+                func = partial(sandboxed[spec.name], sandbox_client)
+            else:
+                func = _fail_closed_ws_tool(spec.name, func)
         out.append({
             "name": spec.name,
             "description": spec.description,

@@ -111,9 +111,14 @@ class AgentNodeRunner:
         mcp_manager=None,
         agent_config=None,
         agent_config_provider=None,
+        sandbox_client=None,
     ) -> None:
         self.model = UsageTrackingModel(model)
         self.mcp_manager = mcp_manager
+        # 沙箱 client：注入后写文件/跑测试走 sidecar（在无密钥容器里执行仓库代码）。
+        # 不注入 → 那两个工具调用即报错，**不回退本地执行**（见 agents/tools.py
+        # 的 WORKSPACE_SANDBOXED 与 workspace_tools._fail_closed_ws_tool）。
+        self.sandbox_client = sandbox_client
         # AgentSpec DB 配置解析器（agent_config.AgentConfigResolver）：提供 system_prompt 覆盖 + enabled
         self.agent_config = agent_config
         # v5.3 §7：per-tenant 配置解析器提供者 async (tenant_id|None) → AgentConfigResolver
@@ -171,7 +176,9 @@ class AgentNodeRunner:
         if self.mcp_manager is not None:
             clients = await self.mcp_manager.clients_for_agent(agent, tenant_id=tenant_id)
             allow_extra = await self.mcp_manager.allow_names_for_agent(agent, tenant_id=tenant_id)
-        toolkit = build_toolkit(agent, mcp_clients=clients)
+        toolkit = build_toolkit(
+            agent, mcp_clients=clients, sandbox_client=self.sandbox_client
+        )
         ctx = build_permission_context(agent, allow_extra=allow_extra)
         # 每节点独立 recorder：采集 llm_call / tool_call 明细；DENY 工具跑后补扫
         recorder = TraceRecorder(node.id, agent)

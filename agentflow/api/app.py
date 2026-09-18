@@ -315,12 +315,17 @@ async def init() -> RunService:
         from ..agents.scopes import build_model
 
         resolver = await _reload_agent_config_resolver()
+        from ..sandbox import build_sandbox_client
+
         kwargs["node_runner"] = AgentNodeRunner(
             build_model(settings),
             mcp_manager=mcp_manager,
             agent_config=resolver,
             agent_config_provider=_agent_config_provider,
             # 数据查询与 CMDB 全部经 MCP（mcp_manager 注入的 client，design-v5.6）
+            # 写文件/跑测试经沙箱：它们执行仓库代码，而本进程持有全部密钥。
+            # 未配置 URL → None，那两个工具调用即报错（不回退本地执行）。
+            sandbox_client=build_sandbox_client(settings),
         )
         print("[agentflow] node_runner=agent（DeepSeek）：Bug Solve 页将真实调用 agent")
     queue_mode = settings.run_mode == "queue"

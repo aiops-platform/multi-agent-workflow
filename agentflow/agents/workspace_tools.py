@@ -18,6 +18,7 @@ git 命令白名单：只放行 status/diff/add/commit/push/rev-parse/branch/che
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from pathlib import Path
 from typing import Any
@@ -111,7 +112,13 @@ async def ws_list_files(service: str, path: str = "", pattern: str = "**/*") -> 
 
 
 async def ws_write_file(service: str, path: str, content: str) -> dict:
-    """写工作区内文件。LLM 的低成本文本编辑入口（§10.3 路径白名单）。"""
+    """写工作区内文件。LLM 的低成本文本编辑入口（§10.3 路径白名单）。
+
+    ⚠️ 这是**本地实现**，直接写在 worker 进程的文件系统上。生产形态下写操作必须经
+    沙箱（``ws_write_file_sandboxed``）——由 ``agents/tools.build_workspace_tools``
+    在注入了 ``sandbox_client`` 时改走那一条。保留本函数是为了：
+    本地 E2E 无 sidecar 时仍可跑（显式配置），以及被沙箱版复用作路径校验的单一来源。
+    """
     if len(content.encode("utf-8")) > _MAX_WRITE_BYTES:
         raise WorkspaceToolError(f"写入超限（>{_MAX_WRITE_BYTES} bytes）")
     repo = _resolve_repo(service)
@@ -123,6 +130,59 @@ async def ws_write_file(service: str, path: str, content: str) -> dict:
         "path": path, "created": not existed, "bytes": len(content.encode("utf-8")),
         "summary": f"{'新建' if not existed else '覆盖'} {path}",
     }
+
+
+# ----------------------------------------------------------------------
+# 沙箱版（写 / 测试）：跑的是仓库代码，必须在**没有密钥**的容器里执行
+# ----------------------------------------------------------------------
+# 判据：谁持有密钥，谁不执行不可信代码。worker 有 DeepSeek key / DB DSN / MCP 凭证 /
+# git PAT，而 `build.gradle` 本身就是可执行脚本 —— 所以写入与测试都交给沙箱 sidecar。
+#
+# **读**（ws_read_file / ws_list_files）刻意**不走沙箱**：诊断链的 `code-locator`
+# 靠它们定位问题，如果读也依赖沙箱，沙箱一挂整条诊断链就跑不起来。读不改状态、不执行
+# 仓库代码，风险低。这个取舍是有意的，别"顺手统一"。
+
+
+async def ws_write_file_sandboxed(sandbox, service: str, path: str, content: str) -> dict:
+    """经沙箱写工作区内文件（沙箱与 worker 挂**同一个卷**，路径两侧一致）。"""
+    if len(content.encode("utf-8")) > _MAX_WRITE_BYTES:
+        raise WorkspaceToolError(f"写入超限（>{_MAX_WRITE_BYTES} bytes）")
+    repo = _resolve_repo(service)
+    target = _safe_path(repo, path)  # 沿用同一套越界校验，不另写一份
+    existed = target.exists()
+    try:
+        await sandbox.write_file(str(target), content)
+    except Exception as exc:  # noqa: BLE001 —— 统一转成工具错误，带上"沙箱不可达"的判据
+        raise WorkspaceToolError(
+            f"沙箱写文件失败（沙箱不可达时**不会**回退到 worker 本地执行）: {exc}"
+        ) from exc
+    return {
+        "path": path, "created": not existed, "bytes": len(content.encode("utf-8")),
+        "summary": f"{'新建' if not existed else '覆盖'} {path}（沙箱）",
+    }
+
+
+def _fail_closed_ws_tool(name: str, original):
+    """沙箱未接线时注册的占位：**调用即报错**。
+
+    为什么不干脆不注册这个工具：不注册的话模型看不到它，会绕开或用别的方式"想办法"，
+    失败形态是**静默**的（本仓 `docs/TODO.md` §23 整节都是这类）。注册一个会明确报错的，
+    失败点就落在调用处、且说的是真原因。
+
+    保留 ``original`` 的签名：AgentScope 按签名给模型生成参数 schema，用 ``*args``
+    会让模型看不到该传什么——错误就退化成"参数不对"，而不是"沙箱没接线"。
+    """
+
+    async def _stub(*_args: Any, **_kwargs: Any) -> dict:
+        raise WorkspaceToolError(
+            f"{name} 需要沙箱（写入与测试跑的是仓库代码，必须在无密钥的容器里执行），"
+            "但当前进程未接线 sandbox_client。检查 AGENTFLOW_SANDBOX_URL 与 worker Pod 的"
+            " sandbox sidecar。**不会**回退到 worker 本地执行。"
+        )
+
+    _stub.__name__ = name
+    _stub.__signature__ = inspect.signature(original)  # type: ignore[attr-defined]
+    return _stub
 
 
 def test_cmd_for(service: str) -> str:
@@ -163,9 +223,8 @@ async def ws_run_tests(service: str, timeout: int = 120) -> dict:
     ⚠️ **无 command 参数**——命令来自部署配置（``test_cmd_for``），不接受 LLM 传参。
     这是"测试命令不来自模型"这条要求的落点。
 
-    本函数是**本地实现**（当前形态：worker 进程内执行）。沙箱化见
-    ``agents/mcp.py`` 的接线——写入与测试最终必须落在沙箱容器里执行，
-    因为跑的是仓库代码（不可信），而 worker 持有全部密钥。
+    本函数是**本地实现**。生产形态经 ``ws_run_tests_sandboxed`` 走沙箱 sidecar
+    （``build_workspace_tools`` 注入 ``sandbox_client`` 时自动切换）。
     """
     repo = _resolve_repo(service)
     cmd = test_cmd_for(service)
@@ -180,15 +239,39 @@ async def ws_run_tests(service: str, timeout: int = 120) -> dict:
     except TimeoutError:
         proc.kill()
         out, rc, timed_out = b"(timeout)", -1, True
-    text = out.decode("utf-8", "replace")
-    # 测试输出保留**尾部**（结论 BUILD SUCCESSFUL/FAILED 在末尾）；截断处显式标注
+    return _test_result(cmd, rc, timed_out, out.decode("utf-8", "replace"), where="本地")
+
+
+async def ws_run_tests_sandboxed(sandbox, service: str, timeout: int = 120) -> dict:
+    """经沙箱执行**该服务配置的**测试命令（跑的是仓库代码，必须在无密钥容器里）。"""
+    repo = _resolve_repo(service)
+    cmd = test_cmd_for(service)
+    try:
+        res = await sandbox.run_shell(cmd, cwd=str(repo), timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        raise WorkspaceToolError(
+            f"沙箱执行测试失败（沙箱不可达时**不会**回退到 worker 本地执行）: {exc}"
+        ) from exc
+    return _test_result(
+        cmd, res.rc, res.timed_out, (res.stdout or "") + (res.stderr or ""), where="沙箱"
+    )
+
+
+def _test_result(cmd: str, rc: int, timed_out: bool, text: str, *, where: str = "") -> dict:
+    """两个实现（本地 / 沙箱）共用同一套结果组装——**别让它们漂移**。
+
+    测试输出保留**尾部**：gradle 的结论（BUILD SUCCESSFUL/FAILED）在末尾，
+    留头部等于把最该看的那行截掉。截断处显式标注，模型才知道自己看的是残缺内容。
+    """
     if len(text) > _TEST_OUTPUT_LIMIT:
         omitted = len(text) - _TEST_OUTPUT_LIMIT
         text = f"... [前 {omitted} 字符已省略] ...\n" + text[-_TEST_OUTPUT_LIMIT:]
     return {
-        "passed": rc == 0, "rc": rc, "timed_out": timed_out,
+        "passed": rc == 0 and not timed_out,
+        "rc": rc, "timed_out": timed_out,
         "output": text,
-        "summary": f"`{cmd}` → rc={rc}" + ("（超时）" if timed_out else ""),
+        "summary": f"`{cmd}` → rc={rc}{where}"
+                   + ("（超时）" if timed_out else ""),
     }
 
 

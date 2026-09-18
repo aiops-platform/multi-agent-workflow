@@ -349,3 +349,137 @@ def test_test_cmd_returns_configured(monkeypatch) -> None:
         '{"order-service": "./gradlew test --no-daemon -q"}',
     )
     assert test_cmd_for("order-service") == "./gradlew test --no-daemon -q"
+
+
+# ----------------------------------------------------------------------
+# 写 / 测试必须经沙箱；读刻意不经（诊断链不该被沙箱拖住）
+# ----------------------------------------------------------------------
+class _FakeSandbox:
+    def __init__(self) -> None:
+        self.writes: list[tuple[str, str]] = []
+        self.runs: list[tuple[str, str | None]] = []
+
+    async def write_file(self, path: str, content: str) -> dict:
+        self.writes.append((path, content))
+        return {"ok": True}
+
+    async def run_shell(self, cmd: str, *, cwd=None, timeout: int = 300):
+        from types import SimpleNamespace
+
+        self.runs.append((cmd, cwd))
+        return SimpleNamespace(rc=0, stdout="BUILD SUCCESSFUL", stderr="", timed_out=False)
+
+
+class _UnreachableSandbox:
+    async def write_file(self, path: str, content: str) -> dict:
+        raise ConnectionError("connection refused")
+
+    async def run_shell(self, cmd: str, *, cwd=None, timeout: int = 300):
+        raise ConnectionError("connection refused")
+
+
+def _prepared_workspace(tmp_path: Path, monkeypatch):
+    """造一个已 prepare 的工作区 + 上下文，返回 (service, repo)。"""
+    from agentflow import exec_context
+    from agentflow.config import get_settings
+
+    root = tmp_path / "ws"
+    run_id, tenant, service = "run_sbx", "t1", "order-service"
+    repo = root / tenant / run_id / "repos" / service
+    repo.mkdir(parents=True)
+    git("init", "-q", "-b", "main", cwd=repo)
+    (repo / "a.txt").write_text("x", encoding="utf-8")
+    git("add", ".", cwd=repo)
+    git("commit", "-q", "-m", "init", cwd=repo)
+
+    monkeypatch.setattr(get_settings(), "workspace_root", root)
+    monkeypatch.setattr(
+        get_settings(), "test_cmds", '{"order-service": "./gradlew test --no-daemon -q"}'
+    )
+    t1 = exec_context.current_run.set(run_id)
+    t2 = exec_context.current_tenant.set(tenant)
+    return service, repo, (t1, t2)
+
+
+def _tool(name: str, sandbox, agent: str = "fix-implementer"):
+    from agentflow.agents.tools import build_workspace_tools
+
+    return next(
+        t["func"] for t in build_workspace_tools(agent, sandbox_client=sandbox)
+        if t["name"] == name
+    )
+
+
+def _reset(toks) -> None:
+    """还原 _prepared_workspace 置位的 contextvar（避免污染同进程的其它用例）。"""
+    from agentflow import exec_context
+
+    exec_context.current_run.reset(toks[0])
+    exec_context.current_tenant.reset(toks[1])
+
+
+def test_write_and_tests_are_fail_closed_without_sandbox(tmp_path, monkeypatch) -> None:
+    """未注入沙箱 → **调用即报错**，绝不回退本地执行。
+
+    这是本次改造的核心保证：写文件与跑测试执行的是仓库代码，而 worker 持有全部密钥。
+    "沙箱不可达就本地跑"会把隔离整个作废，且失败是静默的。
+    """
+    import asyncio
+
+    from agentflow.agents.tools import build_workspace_tools
+    from agentflow.agents.workspace_tools import WorkspaceToolError
+
+    tools = {t["name"]: t["func"] for t in build_workspace_tools("fix-implementer")}
+    for name in ("ws_write_file", "ws_run_tests"):
+        assert name in tools, f"{name} 未注册——模型看不到它，失败会变成静默的"
+        with pytest.raises(WorkspaceToolError, match="需要沙箱"):
+            asyncio.run(tools[name](service="s", path="p", content="c"))
+    # 读工具保持直连，不受影响
+    assert "ws_read_file" in tools
+
+
+async def test_write_goes_through_sandbox(tmp_path, monkeypatch) -> None:
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    sbx = _FakeSandbox()
+    try:
+        out = await _tool("ws_write_file", sbx)(service=service, path="src/A.java", content="class A {}")
+    finally:
+        _reset(toks)
+
+    assert sbx.writes, "写操作没有走沙箱"
+    path, content = sbx.writes[0]
+    assert path == str(repo / "src/A.java"), f"沙箱侧路径不一致（两侧挂同一卷）: {path}"
+    assert content == "class A {}"
+    assert "沙箱" in out["summary"]
+
+
+async def test_tests_go_through_sandbox_with_configured_cmd(tmp_path, monkeypatch) -> None:
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    sbx = _FakeSandbox()
+    try:
+        out = await _tool("ws_run_tests", sbx)(service=service)
+    finally:
+        _reset(toks)
+
+    cmd, cwd = sbx.runs[0]
+    assert cmd == "./gradlew test --no-daemon -q"  # 来自配置，不是调用方传的
+    assert cwd == str(repo)
+    assert out["passed"] is True
+
+
+async def test_unreachable_sandbox_does_not_fall_back(tmp_path, monkeypatch) -> None:
+    """沙箱连不上 → 报错，**不是**悄悄在 worker 本地跑。"""
+    from agentflow.agents.workspace_tools import WorkspaceToolError
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(WorkspaceToolError, match="不会.*回退"):
+            await _tool("ws_write_file", _UnreachableSandbox())(
+                service=service, path="a.txt", content="x"
+            )
+    finally:
+        _reset(toks)
+
+    # 断言真的没写进去（不是"报了错但文件已经落了"）
+    assert (repo / "a.txt").read_text(encoding="utf-8") == "x"
+

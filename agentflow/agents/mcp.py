@@ -66,7 +66,7 @@ def _build_function_tools(
             func=t["func"], name=t["name"], description=t["description"],
             is_read_only=True,  # 本地只读工具
         ))
-    for t in build_workspace_tools(agent_name):
+    for t in build_workspace_tools(agent_name, sandbox_client=sandbox_client):
         tools.append(FunctionTool(
             func=t["func"], name=t["name"], description=t["description"],
             is_read_only=t["read_only"],

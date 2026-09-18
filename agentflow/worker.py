@@ -295,6 +295,7 @@ async def build_node_runner(settings, stores: Any) -> NodeRunner | None:
     from .agents.mcp_manager import MCPClientManager
     from .agents.runner import AgentNodeRunner
     from .agents.scopes import build_model
+    from .sandbox import build_sandbox_client
 
     async def _mcp_store_provider(tenant_id: str | None):
         bundle = await stores.get(tenant_id or "local")
@@ -318,12 +319,22 @@ async def build_node_runner(settings, stores: Any) -> NodeRunner | None:
 
     mcp_manager.server_ids_for = _server_ids_for
     await mcp_manager.load()
+    sandbox = build_sandbox_client(settings)
+    if sandbox is None:
+        # 不接线沙箱属于**部署配置缺失**：写文件/跑测试会以明确的工具错误失败
+        # （不会回退到本地执行）。这里提前告警，别等到 fix 节点跑到一半才发现。
+        log.warning(
+            "未配置 AGENTFLOW_SANDBOX_URL → 工作区写文件与测试命令不可用"
+            "（调用即报错，不会回退到 worker 本地执行）"
+        )
     runner = AgentNodeRunner(
         build_model(settings),
         mcp_manager=mcp_manager,
         agent_config_provider=_agent_config_provider,
+        sandbox_client=sandbox,
     )
-    log.info("node_runner=agent（DeepSeek）数据源经 MCP")
+    log.info("node_runner=agent（DeepSeek）数据源经 MCP%s",
+             "，写/测试经沙箱" if sandbox is not None else "")
     return runner
 
 
