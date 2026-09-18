@@ -1,0 +1,38 @@
+# ⚠️ 这是**种子**，不是真源。真源是租户库的 `mcp_servers` / `agent_configs` 表。
+#
+# 只在两张表**为空**时写入一次（新租户建库后）。改了这里对已存在的租户没有效果。
+#
+# 它回答的是："一个刚开通的租户，要有哪些 MCP server、哪些 agent 绑它"——
+# 没有这一步，agent 的 `mcp_server_ids` 是 NULL ⇒ **每个 agent 零工具**，
+# run 会跑完但每个节点都在"无证据推理"（看着成功，实则空转）。
+
+# ── MCP server 定义 ──────────────────────────────────────────────
+# **URL 是环境相关的**（本地 127.0.0.1、k8s 里是 service DNS），故不写死在这里，
+# 由 `url_setting` 指向的配置项注入（见 config.py / .env.example）。
+#
+# ⚠️ **不要**把 `tools` / `enable_tools` / `disable_tools` 放进种子：那几个列是
+# MCP server **load 时运行时发现**的结果，写进种子等于把一次性的发现冻成声明，
+# 服务端工具一改就与事实不符。留 NULL，让它自己抓。
+servers:
+  - name: aiops-datasource
+    transport: http
+    is_stateful: 0
+    url_setting: mcp_datasource_url
+
+# ── agent 绑定（agent 名 → [server 名]）────────────────────────────
+# 绑定是 **per-agent** 的，没有租户级默认（`AgentConfigResolver.server_ids_for`
+# 读的就是该 agent 那一行）——所以"最小可用"必须逐个列出。
+#
+# 角色的 role/stage **不在这里声明**：它们从 `agents/agent_config.py` 的静态表取，
+# 种子里重复一份只会引入漂移。
+#
+# 注意 `triage` **不在**列表里：它不绑数据工具（设计如此，"triage 交出数据工具"）。
+# 没有 DB 行 = 静态回退 = 空集 = 无工具，与 otr 库里那条 `mcp_server_ids=NULL` 的行等价。
+bindings:
+  service-scoper:  [aiops-datasource]
+  log-analyst:     [aiops-datasource]
+  trace-analyst:   [aiops-datasource]
+  metrics-analyst: [aiops-datasource]
+  infra-locator:   [aiops-datasource]
+  code-locator:    [aiops-datasource]
+  root-cause:      [aiops-datasource]

@@ -1,0 +1,24 @@
+# ⚠️ 这是**种子**，不是 workflow 的真源。真源是数据库（CLAUDE.md §6.0）。
+#
+# 只在租户库 `workflows` 表**为空**时写入一次（新租户建库后）。
+# **改了这里对已存在的租户没有任何效果**——要改已开通租户，走 `PUT /workflows/{wid}`。
+#
+# 顺序即语义：播种时按本表顺序给 `created_at` 递增（base + i*1ms），而
+# `GET /workflows` 是 ORDER BY created_at DESC、`POST /tickets/{tid}/run` 未指定
+# `workflow_id` 时取 `saved[0]` ⇒ **本表最后一条 = 新租户的默认流程**。
+#
+# 每条 YAML 的 `name:` 字段由播种器从正文解析，不在本表重复（避免两处漂移）。
+source: agentflow-otr
+exported_at: "2026-09-18"
+note: |
+  两条 workflow 从参考租户 agentflow-otr 原样导出（与库内**逐字节相同**）。
+  导出时已核对：
+  · agent 名全部在内置注册表（DIAGNOSE_AGENTS ∪ FIX_AGENTS），不依赖任何自定义 agent；
+  · YAML 正文不含 URL / 端口 / 本机路径等环境绑定，只有 name 标签与注释里提到服务名。
+  ⚠️ scenario1 独有的 `remediate`（K8s 止血）分支目前**只产计划、不执行**——
+     ActionExecutor 的接线在 agentflow 侧尚未打通（见 docs/TODO.md）。
+     别以为新租户拿它能真止血。
+items:
+  # 顺序 = created_at 递增。最后一条是默认。
+  - { id: seed-scenario1-quotation-print-fail, file: scenario1-quotation-print-fail.yaml }
+  - { id: seed-scenario2-bug-fix,             file: scenario2-bug-fix.yaml }

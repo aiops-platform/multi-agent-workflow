@@ -24,6 +24,11 @@ def _isolate_settings(monkeypatch):
     # 仓库映射：防止本机 .env 的 testbed 路径污染测试（个别测试再按需覆盖）
     monkeypatch.setattr(s, "repo_root", "")
     monkeypatch.setattr(s, "repo_map", "")
+    # 默认数据播种：**默认关掉**。它是"租户库建好时往三张表写默认数据"，而本套测试里
+    # 大量用例会经 TenantStoresRouter 建租户库——开着的话每个用例都会多出 2 条 workflow +
+    # 1 个 server + 7 条 agent 绑定，既有断言（表为空 / 计数）会集体失真。
+    # `tests/test_seed_defaults.py` 自己按需打开。
+    monkeypatch.setattr(s, "seed_defaults", False)
     monkeypatch.setattr(s, "state_db_path", __import__("pathlib").Path("data/agentflow.db"))
     monkeypatch.setattr(s, "postgres_dsn", "localhost:5432/agentflow?user=agentflow&password=agentflow")
 

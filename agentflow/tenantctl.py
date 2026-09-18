@@ -174,9 +174,17 @@ async def provision(args) -> int:
             "image_tag": f"{args.tenant}-{args.sha[:12]}" if args.sha else None,
             "created_at": (existing or {}).get("created_at"),
         })
-        # 建租户库：连接触发幂等建表（StateStore + 三张配置表，同库异表）
+        # 建租户库：连接触发幂等建表（StateStore + 三张配置表，同库异表）+ 默认数据播种
+        # （seed/，见 agentflow/seed/README.md——播种在 router._build 里，此处不重复调用）
         router = TenantStoresRouter(settings, mgmt)
-        await router.get(args.tenant)
+        bundle = await router.get(args.tenant)
+        # 顺手读一份计数打进输出：运维要能一眼看出"这个租户到底有没有被播种"
+        # （只写日志的话，出问题时得去翻 Worker/API 的日志才能确认）。
+        seeded = {
+            "workflows": len(await bundle.workflow.list()),
+            "servers": len(await bundle.mcp.list()),
+            "agents": len(await bundle.agent_config.list()),
+        }
         await router.aclose()
         sha = args.sha or "init"
         await mgmt.set_schema_version(args.tenant, sha, SCHEMA_VERSION)
@@ -186,8 +194,12 @@ async def provision(args) -> int:
             f"[tenantctl] ✅ provision {args.tenant}: isolation={isolation} "
             f"db={db_ref.get('dsn') or db_ref.get('path')} "
             f"namespace={args.namespace or f'agentflow-{args.tenant}'} "
-            f"schema={SCHEMA_VERSION}"
+            f"schema={SCHEMA_VERSION} "
+            f"workflows={seeded['workflows']} servers={seeded['servers']} "
+            f"agents={seeded['agents']}"
         )
+        if not settings.seed_defaults:
+            print("[tenantctl] ⚠ AGENTFLOW_SEED_DEFAULTS=0 —— 未播种默认数据，该租户开箱不可用")
         return 0
     finally:
         await mgmt.close()

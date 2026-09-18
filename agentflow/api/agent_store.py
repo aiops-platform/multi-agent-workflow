@@ -174,6 +174,27 @@ class AgentConfigStore:
         await self._c.commit()
         return col["name"]
 
+    async def insert_if_absent(self, data: dict[str, Any]) -> bool:
+        """按 name 插入；已存在 → 不覆盖，返回 False（播种用）。
+
+        本表 PK 就是 `name`。播种的 agent 行**只带绑定**（`origin=builtin` + role/stage +
+        `mcp_server_ids`），`system_prompt` / `schema_json` 留 NULL 走静态回退——
+        把提示词也塞进种子等于与代码里那份构成双真源，改一处忘一处就会静默分歧。
+        """
+        await self.connect()
+        col = _to_row(data)
+        cur = await self._c.execute(
+            "INSERT INTO agent_configs"
+            "(name, origin, role, stage, description, system_prompt, schema_json,"
+            " mcp_server_ids, enabled, reasoning_enabled, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO NOTHING",
+            (col["name"], col["origin"], col["role"], col["stage"], col["description"],
+             col["system_prompt"], col["schema_json"], col["mcp_server_ids"], col["enabled"],
+             col["reasoning_enabled"], col["updated_at"], col["updated_at"]),
+        )
+        await self._c.commit()
+        return cur.rowcount == 1
+
     async def list(self) -> list[dict[str, Any]]:
         """全部记录（按创建时间倒序）。"""
         await self.connect()
@@ -307,6 +328,22 @@ class PgAgentConfigStore:
             raise
         await self._c.commit()
         return col["name"]
+
+    async def insert_if_absent(self, data: dict[str, Any]) -> bool:
+        """按 name 插入；已存在 → 返回 False。语义同 sqlite 版（见其 docstring）。"""
+        await self.connect()
+        col = _to_row(data)
+        cur = await self._c.execute(
+            "INSERT INTO agent_configs"
+            "(name, origin, role, stage, description, system_prompt, schema_json,"
+            " mcp_server_ids, enabled, reasoning_enabled, created_at, updated_at)"
+            " VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (name) DO NOTHING",
+            (col["name"], col["origin"], col["role"], col["stage"], col["description"],
+             col["system_prompt"], col["schema_json"], col["mcp_server_ids"], col["enabled"],
+             col["reasoning_enabled"], col["updated_at"], col["updated_at"]),
+        )
+        await self._c.commit()
+        return cur.rowcount == 1
 
     async def list(self) -> list[dict[str, Any]]:
         await self.connect()

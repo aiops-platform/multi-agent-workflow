@@ -233,6 +233,56 @@ async def test_tenantctl_provision_deploy_deprovision(ctl_env) -> None:
         await mgmt.close()
 
 
+async def test_provision_seeds_defaults_and_replay_is_idempotent(ctl_env, monkeypatch, capsys) -> None:
+    """**provision 完就开箱可用**——三张表都有默认数据，且幂等重放不重复播。
+
+    这是"租户初始化"的端到端证明（sqlite 形态，与真机链路同构：
+    provision → 建库 → 建表 → 播种 → 幂等重放）。顺带钉住 CLI 输出里必须看得到计数
+    ——只写日志的话，运维确认"到底播没播"就得去翻 API/Worker 的日志。
+    """
+    from agentflow.agents.agent_config import AgentConfigResolver
+    from agentflow.api.agent_store import AgentConfigStore
+    from agentflow.api.mcp_store import MCPStore
+    from agentflow.api.workflow_store import WorkflowStore
+    from agentflow.seed import load_dataplane_seed, load_workflow_seeds
+
+    s, tmp_path = ctl_env
+    monkeypatch.setattr(s, "seed_defaults", True)  # conftest 默认关（既有测试靠它保持语义）
+
+    assert await tenantctl(["provision", "seed-x"]) == 0
+    n_wf = len(load_workflow_seeds())
+    n_srv = len(load_dataplane_seed()["servers"])
+    n_agt = len(load_dataplane_seed()["bindings"])
+    assert f"workflows={n_wf} servers={n_srv} agents={n_agt}" in capsys.readouterr().out
+
+    db = tmp_path / "data" / "tenants" / "seed-x.db"
+    assert db.exists()
+    w, m, a = WorkflowStore(db), MCPStore(db), AgentConfigStore(db)
+    for store in (w, m, a):
+        await store.connect()
+    try:
+        assert len(await w.list()) == n_wf
+        assert len(await m.list()) == n_srv
+        assert len(await a.list()) == n_agt
+        assert all(r["id"].startswith("seed-") for r in await w.list())
+        # 端到端语义：不只是"表里有行"，而是 resolver 真解析得出工具
+        resolver = AgentConfigResolver(await a.list())
+        assert resolver.server_ids_for("log-analyst")
+        assert resolver.server_ids_for("triage") == set()
+    finally:
+        for store in (w, m, a):
+            await store.close()
+
+    # 幂等重放：一条都不该多出来
+    assert await tenantctl(["provision", "seed-x"]) == 0
+    w2 = WorkflowStore(db)
+    await w2.connect()
+    try:
+        assert len(await w2.list()) == n_wf
+    finally:
+        await w2.close()
+
+
 async def test_tenantctl_migrate_fans_out(ctl_env) -> None:
     s, tmp_path = ctl_env
     assert await tenantctl(["provision", "team-a"]) == 0

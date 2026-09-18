@@ -20,7 +20,7 @@
 | 10 | 清预置 lint / 测试债 | 不阻塞，但债会让回归信号不可信 |
 | 11 | 其余小项 | 观察项 / 长期项 |
 | 12 | 已完成（留痕） | 无正文，只记 commit 与结论 |
-| 13 | 新租户缺「播种」 | 新租户直接起不来诊断（`/tickets/{tid}/run` 400） |
+| 13 | ~~新租户缺「播种」~~ | ✅ 已实施——三张表一起播（workflow + MCP server + agent 绑定），开箱可用；剩「同步动作」1 项尾巴 |
 | 14 | 分层：API ↔ Service ↔ Repository | 债，不阻塞。已有一处**重复实现**与一处**反向依赖** |
 | 15 | `datasource/` 例外：保留但立规矩 | 例外**合理**；含一个**无鉴权端点**（只读低危） |
 | 16 | ~~MCP 工具绑定只有 server 级粒度~~ | **先不做**——首版证据已被推翻；复核只剩 2 处零星越界，**先改 prompt 即可** |
@@ -388,7 +388,7 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 
 ---
 
-## 13. ⭐ 新租户初始化缺「播种」：workflow 与数据面绑定
+## 13. ~~新租户初始化缺「播种」~~ ✅ 已实施（2026-09-18）—— 剩下 2 项尾巴
 
 > 2026-09-16 记录。做 scope 节点的 E2E 时踩到：**改完 workflow YAML，run 跑的还是旧流程**。
 
@@ -417,7 +417,68 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 - **同样的问题在数据面**：`mcp_servers` 表空 + `agent_configs.mcp_server_ids` 未绑定
   → agent 拿不到任何工具（`mcp_server_ids` 是两态语义：NULL/`[]` = 无 server）
 
-### 要做
+### ✅ 已实施（2026-09-18）：三张表一起播，新租户开箱可用
+
+**做成的事**（用户目标原话："初始化 tenant 操作完成后，就要最小能力可用…开箱即用"）：
+`agentflow/seed/` 种子目录 + 在 `TenantStoresRouter._build()` 里播种，
+新租户建库即拿到 **workflow + MCP server 注册 + agent 绑定**三样。
+
+| | 内容 | 载体 |
+|---|---|---|
+| workflow | 两条（与 `agentflow-otr` 库内**逐字节相同**） | `seed/workflows/*.yaml` + `_manifest.yaml` |
+| MCP server | 1 个（`aiops-datasource`），**URL 由 `settings.mcp_datasource_url` 注入**（环境相关，不写死） | `seed/dataplane.yaml` |
+| agent 绑定 | 7 条（`service-scoper`/`log-analyst`/`trace-analyst`/`metrics-analyst`/`infra-locator`/`code-locator`/`root-cause`） | `seed/dataplane.yaml` |
+
+**为什么"只播 workflow"不够**——后果分三层，一层比一层隐蔽：
+① `workflows` 空 → `POST /tickets/{tid}/run` 直接 400；
+② `mcp_servers` 空 → agent 绑定不到 server；
+③ `agent_configs.mcp_server_ids` 为 NULL → **每个 agent 零工具**，run 会跑完但每个节点
+都在"无证据推理"——**看着成功，实则空转**。
+
+**几个实现要点**：
+- **接线点选 `router._build()`**（所有建库入口的唯一咽喉：provision / migrate / API 启动 /
+  Worker 装配 / 请求路径…）。`_build()` 本来就是 ensure 语义，且将来多一个入口也不会漏。
+- **`insert_if_absent` + `ON CONFLICT DO NOTHING`**：`router.get()` 缓存未命中时**无并发保护**
+  （两个并发首请求会各 `_build` 一遍），"空表检查"只挡得住单进程；没有 ON CONFLICT 就是
+  PK 冲突冒成 500。
+- **绑定按名读回真实 server id**，不能用假想的 `seed-<name>`：`mcp_servers` 的唯一约束在
+  `name`，租户若已有同名 server，种子那条会被 `ON CONFLICT` 吞掉——此时若还按假想 id 写绑定，
+  就绑到**不存在的 server**，症状是静默零工具。
+- **`tools` / `enable_tools` / `disable_tools` 不进种子**：那几列是 MCP server load 时
+  **运行时发现**的结果，写进种子等于把一次性的发现冻成声明。
+- **agent 的 role/stage 不进种子**：从 `agents/agent_config.py` 的静态表取（也是"该 agent 是不是
+  内置的"的校验）；`system_prompt`/`schema` 留 NULL 走静态回退，避免与代码构成双真源。
+- **`triage` 有意不播**：它不绑工具。已核实 otr 库里那条的 `system_prompt` 与代码**逐字节相同**
+  （冗余物化），而"无 DB 行"的静态回退同样是空集 ⇒ 不播它行为完全一致。
+- **`seed/` 不 import `api/`**：三个 store 由调用方传入（鸭子类型）——不加重 §14 的分层债。
+- **fail-soft 是硬要求**：本模块跑在请求路径上，任何异常都不能外抛（否则新租户首个请求 500）。
+- 打包：`pyproject.toml` 加了 `[tool.setuptools.package-data]`。**`-e .` 会侥幸不丢、
+  非 editable 安装会静默丢光**——已用 `pip wheel` + `unzip -l` 验证 6 个资源都在。
+
+**实测**（真实 PG + 真实 provision）：
+```
+[tenantctl] ✅ provision demo-seed: ... workflows=2 servers=1 agents=7
+```
+幂等重放（含 `--force`）后计数不变；`GET /workflows`（`X-Tenant-ID: demo-seed`）返回 2 条；
+`POST /tickets/{tid}/run` **不指定 workflow 也能发起**（原先这里 400）；
+`agentflow-otr` 的 2/1/8 行与原始 id **一字未动**。
+
+**为什么选"仓库 seed 目录"而不是 (b) 参考租户复制**（原本倾向 (b)，此处正式否掉）：
+(b) 的"参考租户"是**可变状态**——谁改了它、或 `deprovision --confirm-delete` 删了库，
+所有未来新租户拿到的默认就跟着变，而且**没有 diff 面、没有 review 入口、没有版本可追溯**。
+种子文件能进 PR review、能 `git log`、能离线校验——这比"多一个载体"的代价更值。
+防误读靠：`seed-` 前缀 id（`save()` 产出 12 位 hex，永不撞）、manifest 头注释、
+`seed/README.md`、`__init__.py` docstring、CLAUDE.md §6.0 —— 五处。
+
+### 还没做（本项尾巴）
+
+1. ~~`provision` 时播种 workflow~~ —— ✅ 见上（播种源已定：仓库 seed 目录）
+2. **只剩"数据面绑定"之外的：** ← 见下一节，已随本次一起做了
+3. **补一个「同步」动作**：改完 workflow 后一条命令推给目标租户，而不是手工 `PUT`。
+   **这条仍然待办**——种子只解决"新租户初始"，**已存在租户的 workflow 更新仍需手工 `PUT`**
+   （这正是"改 seed 对已存在租户无效"的另一面）。
+
+<details><summary>原始记录（选播种源之前的讨论，保留备查）</summary>
 
 1. **`provision` 时播种 workflow** —— ⚠️ **播种源需要先定**，因为仓库里的
    `workflows/*.yaml` 已于 2026-09-16 **删除**（见 §13 开头：它们不在运行时链路上）。
@@ -441,6 +502,8 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 
 > **与版本冻结的关系**：run 用 snapshot，改 YAML **不影响已发起**的 run（这是对的）；
 > 但新租户 / 新建的库必须有一份初始的——缺的就是这一步。
+
+</details>
 
 ---
 
@@ -1193,3 +1256,48 @@ Worker 是 `from_checkpoint` 重建 executor 后直接 `run()` 的，**压根不
 - `approve-remediate` / `approve-commit` 仍用 `on_reject: continue`（它们有显式 recap 边）。
   要不要改成 `abort` 是产品选择，未动。
 - **超时**（`REJECTED_CANCELED`）不走 `on_reject`——那是 `on_timeout` 的语义，尚未实现。
+
+
+## 22. `remediate` 分支「只产计划、不执行」——ActionExecutor 全仓没接线
+
+> 2026-09-18 记录，**未修**。发现路径：给租户播种挑默认 workflow 时，核对
+> `scenario1` 独有的那条分支到底干什么（见 §13 的播种实施）。
+
+### 现象
+
+`scenario1` 的 `remediate` 节点（agent `infra-remediator`，前置审批 `approve-remediate`）
+设计上通过 **ActionExecutor 白名单**执行 `scale_deployment` / `restart_pod` /
+`patch_resources`。实测（`run_be23f3b257`，唯一一次它真的跑的 run）：
+
+```
+可用工具: []          ← 空列表
+工具调用次数: 0
+产出: {"changes": [{"action": "restart_pod", ...}, {"action": "patch_resources", ...}]}
+```
+
+**产出了一份没人执行的动作清单。**
+
+### 成因
+
+`action_executor` 全仓**只有管道、没有接线**：
+
+```
+agents/mcp.py:52      build_toolkit(..., action_executor=None, ...)      ← 有参数
+agents/mcp.py:74      build_l2_tools(..., action_executor=action_executor)
+agents/tools.py:150   elif spec.name in ("scale_deployment","restart_pod",...) \
+                          and action_executor is not None:                ← 为 None 就不建这三个工具
+```
+
+**没有任何调用方传过这个值**（`worker.py` / `agents/scopes.py` 零命中）。
+
+### 影响
+
+- 新租户拿到的默认 workflow 里，这条分支**看着有、实际不干活**——播种时已在
+  `seed/workflows/_manifest.yaml` 的 note 里注明，免得下一个人以为它能止血。
+- 对比：**代码路是真执行的**（`fix-implementer` 的 `ws_write_file`/`ws_git` 确实改了工作区，
+  `tester` 真跑了测试）。只有 K8s 这条路"计划即终点"。
+
+### 目标
+
+把 `ActionExecutor` 构出来并传进 `build_toolkit`（`sandbox/action_executor.py` 已实现，
+动作受白名单约束）。注意与沙箱的 `SandboxClient` 是同一条 L2 链路的两个分支，接线时要一起看。

@@ -64,6 +64,19 @@ class Settings(BaseSettings):
     # db_ref/凭证加密密钥（Fernet, 32B urlsafe base64，§5.3）；缺省从 jwt_secret 派生（告警）
     secret_key: str = ""
 
+    # ---- 新租户默认数据播种（`agentflow/seed/`，见其 README）----
+    # 租户库建好之后往里写一份默认数据，让它**开箱可用**：默认 workflow +
+    # MCP server 注册 + agent 绑定。不播的话新租户 `POST /tickets/{tid}/run` 直接 400；
+    # 只播 workflow 而不播绑定的话，run 能跑完但**每个 agent 零工具**（空转）。
+    #
+    # 语义：**空表才播、绝不覆盖**（三张表各自判断）。推论——把某张表清空的租户会在
+    # 下次进程启动 / LRU 重建时重新拿到种子（"空 = 出厂态"）；要彻底关掉置 0。
+    seed_defaults: bool = True
+    # 种子中那个数据面 MCP server 的地址。**是配置不是常量**：URL 环境相关
+    # （本地 127.0.0.1，k8s 里要 pod 可达的 service DNS）。默认值对齐
+    # `uv run python -m aiops_datasource_mcp_server`（:8300）。
+    mcp_datasource_url: str = "http://127.0.0.1:8300/mcp"
+
     # ---- 数据面姿态（v5.3 §7/P1，v5.5 批3 起语义收窄）----
     # 原名"共享数据源开关"：**内置共享数据源工具已删除**（数据查询全部走租户 MCP，
     # design-v5.6），本开关如今**只剩一个作用**——是否放行 `inputs.repos` 直传。

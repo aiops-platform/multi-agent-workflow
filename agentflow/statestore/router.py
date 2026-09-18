@@ -109,6 +109,28 @@ class TenantStoresRouter:
         await state.connect()
         for s in (workflow, mcp, agent_config, ticket):
             await s.connect()
+
+        # 新租户默认数据播种（seed/）：默认 workflow + MCP server + agent 绑定，
+        # 让刚建好的库"开箱可用"。放这里而不是 `tenantctl provision`——`_build()` 本来就是
+        # **ensure 语义**（它已经做 CREATE DATABASE + CREATE TABLE IF NOT EXISTS），
+        # 且是所有入口（provision / migrate / API 启动 / Worker 装配 / 请求路径…）的
+        # 唯一咽喉，将来多一个入口也不会漏。
+        if self._settings.seed_defaults:
+            from ..seed import seed_defaults  # 惰性：与上面的 store import 同风格
+
+            try:
+                counts = await seed_defaults(workflow, mcp, agent_config, settings=self._settings)
+                if any(counts.values()):
+                    log.info(
+                        "租户 %s 播种默认数据：workflows=%d servers=%d agents=%d"
+                        "（种子非真源，见 agentflow/seed/README.md）",
+                        tenant_id, counts["workflows"], counts["servers"], counts["agents"],
+                    )
+            except Exception:
+                # 播种失败**绝不能**拖垮建库/连接——那会让该租户的所有请求 500。
+                # seed 内部已按表兜底，这里是最后一道。
+                log.exception("租户 %s 播种默认数据失败（已跳过，不影响连接）", tenant_id)
+
         return TenantStores(
             tenant_id=tenant_id, state=state, workflow=workflow,
             mcp=mcp, agent_config=agent_config, ticket=ticket,

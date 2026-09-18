@@ -64,6 +64,28 @@ class WorkflowStore:
         await self._c.commit()
         return wid
 
+    async def insert_if_absent(
+        self, wid: str, name: str, yaml_text: str, created_at: str
+    ) -> bool:
+        """按**指定 id / 时间戳**插入（播种/导入用）。id 已存在 → 不覆盖，返回 False。
+
+        与 :meth:`save` 的唯一区别：id 与 created_at 由调用方给定（save 是随机 id + now）
+        —— 播种要稳定 id（`seed-*`）与确定的 created_at（决定 `list()` 顺序，见
+        `agentflow/seed/workflows/_manifest.yaml`）。
+
+        `ON CONFLICT DO NOTHING` **不是**给"空表才播"用的——那是播种器的守卫。这里是
+        兜并发：`TenantStoresRouter.get()` 缓存未命中时两个并发请求会各自 `_build`，
+        都读到空表，然后抢插同一个 id。没有它，PK 冲突会冒成 500。
+        """
+        await self.connect()
+        cur = await self._c.execute(
+            "INSERT INTO workflows(id, name, yaml, created_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(id) DO NOTHING",
+            (wid, name, yaml_text, created_at),
+        )
+        await self._c.commit()
+        return cur.rowcount == 1
+
     async def list(self) -> list[dict[str, Any]]:
         """按创建时间倒序列出 [{id, name, created_at}]。"""
         await self.connect()
@@ -159,6 +181,19 @@ class PgWorkflowStore:
         )
         await self._c.commit()
         return wid
+
+    async def insert_if_absent(
+        self, wid: str, name: str, yaml_text: str, created_at: str
+    ) -> bool:
+        """按指定 id / 时间戳插入（播种/导入用）。语义同 sqlite 版（见其 docstring）。"""
+        await self.connect()
+        cur = await self._c.execute(
+            "INSERT INTO workflows(id, name, yaml, created_at) VALUES(%s,%s,%s,%s) "
+            "ON CONFLICT (id) DO NOTHING",
+            (wid, name, yaml_text, created_at),
+        )
+        await self._c.commit()
+        return cur.rowcount == 1
 
     async def list(self) -> list[dict[str, Any]]:
         """按创建时间倒序列出 [{id, name, created_at}]。"""

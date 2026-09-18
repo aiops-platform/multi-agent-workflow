@@ -1,0 +1,308 @@
+# ===== 场景2 完整修复工作流：结账无响应（warranty fin 缺参 + 吞异常）=====
+# design §3.5：诊断（含负证据）→ 规划 → 修复（沙箱）→ 测试 → 审查 → 审批 → 提交 PR → 复盘
+name: bug-fix-scenario2
+version: "1.0.0"
+description: "场景2 跨服务代码故障完整闭环：诊断 + 沙箱修复 + 审批 + PR"
+
+inputs:
+  bug_report:
+    type: object
+    required: true
+  # 故障时间窗（ISO8601）。数据查询工具（design-v5.6 §3.4）**必须**带时间区间——
+  # 窗口来自事件源（工单 opened_at / 告警触发时刻），由调用方算好传入；
+  # 不留默认值：窗口错了返回的数据就没有意义，宁可在入口处要明确的值。
+  window_start:
+    type: string
+    required: true
+    description: "诊断时间窗起（ISO8601），如 2026-09-10T08:30:00（UTC）"
+  window_end:
+    type: string
+    required: true
+    description: "诊断时间窗止（ISO8601），如 2026-09-10T10:30:00（UTC）"
+  repos:
+    type: object
+    required: false
+    description: "服务→仓库映射；不提供则由 CMDB 查询"
+
+nodes:
+  # ===== 诊断阶段（metrics/infra 为负证据）=====
+  # 取数节点把时间窗透传给 agent，agent 再原样传给 MCP 数据工具（必填参数）。
+  triage:
+    agent: triage
+    require: [start_time, end_time]
+    params:
+      bug: "$.inputs.bug_report"
+      start_time: "$.inputs.window_start"
+      end_time: "$.inputs.window_end"
+    on_failure: abort
+
+  # ===== 定位问题服务（design-v5.7 §3）=====
+  # 取数之前必须先知道"查哪个服务"——否则四个取数节点只能拿 triage 的一句摘要去猜。
+  #
+  # **bug_report 必须单独传**：triage 的输出 schema 只有 {symptom_type, severity, summary}，
+  # `bug_report.cmdb_ci.name` 在 triage 之后就丢了——不补这条，工单自带的 service 永远到不了这里。
+  #
+  # on_failure: abort —— 定不出服务，后面四个取数节点全是空转。
+  # 注意 `insufficient: true`（信息不足）**不是失败**：节点照样成功，只是候选为空，
+  # 下游退回"不带 service 过滤"的宽查询（§3.6 的"停止让用户补充"机制尚未实现）。
+  scope:
+    agent: service-scoper
+    join: all
+    required_edges: [triage]
+    params:
+      bug: "$.nodes.triage.output.summary"
+      bug_report: "$.inputs.bug_report"
+      start_time: "$.inputs.window_start"
+      end_time: "$.inputs.window_end"
+    on_failure: abort
+
+  # ⚠️ 下面四个取数节点都加了 `join: all` + `required_edges: [triage, scope]`。
+  # **不加就会被过早调度**：默认 `join: any` 的语义是"至少一条 ACTIVE 入边即 READY"
+  # （executor/dag_executor.py:259），于是 triage 一完成它们就跑了——此时 scope 还没跑，
+  # `candidate_services` 是 None。这正是 `locate` 节点已经踩过的坑（见其注释）。
+  logs:
+    agent: log-analyst
+    require: [start_time, end_time]
+    join: all
+    required_edges: [triage, scope]
+    params:
+      bug: "$.nodes.triage.output.summary"
+      services: "$.nodes.scope.output.candidate_services"
+      start_time: "$.inputs.window_start"
+      end_time: "$.inputs.window_end"
+    on_failure: continue
+
+  trace:
+    agent: trace-analyst
+    require: [start_time, end_time]
+    join: all
+    required_edges: [triage, scope]
+    params:
+      bug: "$.nodes.triage.output.summary"
+      # 工单自带的链路 ID —— **trace-analyst 唯一不依赖 scope 的输入**。
+      # 没有它，那个节点只能退化成「再查一遍日志捞 trace_id」，而那一步与
+      # log-analyst 一字不差（纯重复）。缺了它就如实报负证据。
+      trace_id: "$.inputs.bug_report.correlation_hint.trace_id"
+      start_time: "$.inputs.window_start"
+      end_time: "$.inputs.window_end"
+    on_failure: abort
+
+  metrics:
+    agent: metrics-analyst
+    require: [start_time, end_time]
+    join: all
+    required_edges: [triage, scope]
+    params:
+      bug: "$.nodes.triage.output.summary"
+      services: "$.nodes.scope.output.candidate_services"
+      start_time: "$.inputs.window_start"
+      end_time: "$.inputs.window_end"
+    on_failure: continue
+
+  # infra 用 check_infra/describe_pod（K8s 当前状态），**无时间参数**
+  infra:
+    agent: infra-locator
+    join: all
+    required_edges: [triage, scope]
+    params:
+      bug: "$.nodes.triage.output.summary"
+      services: "$.nodes.scope.output.candidate_services"
+    on_failure: continue
+
+  # join: all —— locate 的 target_service 取自 trace 输出，必须等 trace 完成。
+  # 默认 join: any 会让它在 triage 一完成就被调度（trace 尚未跑完 → failing_service 为 null，
+  # 导致 code-locator 只能按 ticket 的 subcategory 猜服务，可能定位错仓库）。
+  # 中断终点：任一环节判定「证据不足」时走这里，**跳过整条诊断链**。
+  # 存在的理由：条件边不满足时下游是 SKIPPED，而 SKIPPED 与 DONE 同属终态
+  # —— run 照样 done、API 照样 success，「没找到问题」与「跑完了」分不开。
+  #
+  # **不写 params**：halt 的 reason/missing 由 executor 从**触发它的那条入边**的
+  # 上游输出直接搬运（`_active_in_edges` → summary/missing）。写死指向某个节点是
+  # 踩过坑的——原先指向 scope，加了 rca 触发点后，rca 触发的 run 会把 scope 的
+  # summary（那次 scope 是成功的，在讲它定位到的服务）当中断理由，读起来完全误导。
+  halt:
+    kind: halt
+  locate:
+    agent: code-locator
+    join: all
+    required_edges: [triage, trace]
+    params:
+      bug: "$.nodes.triage.output.summary"
+      target_service: "$.nodes.trace.output.failing_service"
+    on_failure: abort
+
+  know:
+    agent: knowledge-lookup
+    params: { bug: "$.nodes.triage.output.summary" }
+    on_failure: continue
+
+  rca:
+    agent: root-cause
+    # ⚠️ join: all —— **六个取证上游全部完成才启动**，缺一不可。
+    #
+    # 默认 join: any 时，`know → rca` 是**无条件**边，而 know 只依赖 triage：
+    # triage 一完成 know 就绪并跑掉 → rca 在**下一波**被判 ready，于是与
+    # logs/trace/metrics/infra **同波并发**启动。而 params 是在节点启动时解析的，
+    # 那一刻四大取数节点还是 PENDING → 五个摘要全部解析成 None。
+    #
+    # 实测（run_8df33e75f4）：infra/logs/metrics/rca/trace 的 started_at 精确到
+    # **同一微秒**，rca 落库的 params 是
+    # `logs/trace/metrics/infra/code: None`——只有 `know` 有值。
+    # 即"把五维摘要交给 rca 做交叉判断"这条设计**从未生效过**；因为 root-cause
+    # 自带全部 5 个数据工具、自己又查了一遍，结论看着仍合理，所以一直没暴露。
+    #
+    # locate 早就躲过了同一个坑（见上面那条 join: all 的注释），rca 漏了。
+    join: all
+    required_edges: [logs, trace, metrics, infra, locate, know]
+    # root-cause 也会自行取证（可用全部 5 个数据工具），故同样需要时间窗
+    require: [start_time, end_time]
+    params:
+      logs: "$.nodes.logs.output.summary"
+      trace: "$.nodes.trace.output.summary"
+      metrics: "$.nodes.metrics.output.summary"
+      infra: "$.nodes.infra.output.summary"
+      code: "$.nodes.locate.output.summary"
+      know: "$.nodes.know.output.summary"
+      # design-v5.7 §6：scope 的定位（基于 CMDB，早、宽、有业务语义）与 trace 的
+      # failing_service（晚、窄，但是**真实运行时证据**）一起交给根因节点做**交叉判断**。
+      # 两者不一致往往正说明"症状服务 ≠ 根因服务"——那是有价值的信号，不要丢掉一方。
+      scope_primary: "$.nodes.scope.output.primary_service"
+      start_time: "$.inputs.window_start"
+      end_time: "$.inputs.window_end"
+    on_failure: abort
+
+  # ===== 计划审批（前置审批：plan 定稿 → 人工决策 → 才允许动手）=====
+  # 为什么必须加：`plan → fix` 原先**是无条件直连**——plan 一出，fix 立刻改代码，
+  # 而代码路上唯一的审批 `approve-commit` 在 fix/test/review **之后**、且只 gate `commit`。
+  # 于是"修复计划"这个人本该拍板的东西，没有任何决策点。
+  #
+  # 实测代价（run_b156f65142）：plan 自己写着「第 3、4 步落地前必须先核对代码与实际
+  # 生效配置，**否则可能修错位置**」，而第 3、4 步正是 code_fix —— 它们已经跑完了。
+  #
+  # `on_reject: abort` —— 驳回计划 = 这次修复不做，**中止整条 run**。
+  # 注意本节点**没有** `approved == false → recap` 边，这是有意的：abort 下那条边不可达，
+  # 写了就是骗人。驳回留痕在审批记录（approver + comment）与节点状态 REJECTED 里。
+  approve-plan:
+    kind: approval
+    name: "审批修复计划"
+    params:
+      plan: "$.nodes.plan.output"
+      rca: "$.nodes.rca.output"
+    approvers: ["lead-engineer"]
+    timeout: 7200
+    # 驳回计划 = 这次修复不做 → **中止整条 run**（on_reject 的 abort 语义）。
+    # 本节点**没有** `approved == false → recap` 边，这是有意的：abort 下那条边不可达，
+    # 写了就是骗人。驳回留痕在审批记录（approver + comment）与节点状态 REJECTED 里。
+    on_reject: abort
+
+  plan:
+    agent: fix-planner
+    params: { rca: "$.nodes.rca.output" }
+    on_failure: abort
+
+  # ===== 修复阶段 =====
+  fix:
+    agent: fix-implementer
+    params:
+      plan: "$.nodes.plan.output"
+      repo_url: "$.nodes.locate.output.repo_url"
+      # 工作区工具的 service 必须是已 prepare 的仓库名（= trace 定位到的故障服务）
+      service: "$.nodes.locate.output.service"
+    retry: 1
+
+  test:
+    agent: tester
+    params:
+      fix: "$.nodes.fix.output"
+      plan: "$.nodes.plan.output"
+      service: "$.nodes.locate.output.service"
+    retry: 1
+
+  review:
+    agent: reviewer
+    params:
+      diff: "$.nodes.fix.output.diff"
+      service: "$.nodes.locate.output.service"
+
+  # ===== 提交审批（前置审批）=====
+  approve-commit:
+    kind: approval
+    name: "审批代码提交"
+    params:
+      diff: "$.nodes.fix.output.diff"
+      test: "$.nodes.test.output"
+    approvers: ["lead-engineer"]
+    timeout: 7200
+    # 驳回沿 `approved == false → recap` 边路由（图里有显式去处），不中止 run。
+    on_reject: continue
+
+  commit:
+    agent: committer
+    params:
+      diff: "$.nodes.fix.output.diff"
+      test: "$.nodes.test.output"
+      service: "$.nodes.locate.output.service"
+      # 幂等：external_operation_id = PR number
+
+  recap:
+    agent: postmortem
+    params:
+      rca: "$.nodes.rca.output"
+      fix: "$.nodes.fix.output"
+      status: "$.nodes.commit.status"
+
+edges:
+  # 诊断链
+  - { from: triage, to: scope }
+  - { from: triage, to: locate }
+  - { from: triage, to: know }
+  # ⚠️ 四个取数节点各有**两条**入边：`triage` 与 `scope`。
+  # `_check_join_consistency`（core/dag.py:212）要求 `required_edges` 必须是**直接**上游
+  # （`node.upstreams`），**传递上游不算**——只写 `scope → logs` 会报
+  # "required_edges 不是其上游: ['triage']"。两条都必须显式声明。
+  - { from: triage, to: logs }
+  - { from: triage, to: trace }
+  - { from: triage, to: metrics }
+  - { from: triage, to: infra }
+  - { from: scope, to: logs, when: "$.nodes.scope.output.insufficient == false" }
+  - { from: scope, to: trace, when: "$.nodes.scope.output.insufficient == false" }
+  - { from: scope, to: metrics, when: "$.nodes.scope.output.insufficient == false" }
+  - { from: scope, to: infra, when: "$.nodes.scope.output.insufficient == false" }
+  - { from: trace, to: locate }
+  - { from: logs, to: rca }
+  - { from: trace, to: rca }
+  - { from: metrics, to: rca }
+  - { from: infra, to: rca }
+  - { from: locate, to: rca }
+  - { from: know, to: rca }
+  - { from: rca, to: plan }
+  # plan **不直达** fix：中间必须有「计划审批」这个人工决策点。
+  - { from: plan, to: approve-plan }
+  - { from: approve-plan, to: fix, when: "$.nodes.approve-plan.output.approved == true" }
+
+  # 修复 → 测试 → 审查
+  - { from: fix, to: test }
+  - { from: test, to: review, when: "$.nodes.test.output.passed == true" }
+  - { from: test, to: recap, when: "$.nodes.test.output.passed == false" }
+
+  # 审查 → 提交审批
+  - { from: review, to: approve-commit, when: "$.nodes.review.output.approved == true" }
+  - { from: review, to: recap, when: "$.nodes.review.output.approved == false" }
+
+  # 审批 → 提交 → 复盘
+  - { from: approve-commit, to: commit, when: "$.nodes.approve-commit.output.approved == true" }
+  - { from: approve-commit, to: recap, when: "$.nodes.approve-commit.output.approved == false" }
+  - { from: commit, to: recap }
+  # 定位失败 → 直接到终点（halt）。此时上面四条边全 INACTIVE，
+  # 取数节点 SKIPPED 级联到 rca/plan/fix…，只花到 scope 为止的代价。
+  - { from: scope, to: halt, when: "$.nodes.scope.output.insufficient == true" }
+  # 第二个中断点：**根因环节**判定证据不足（rca 不再被迫编一个根因类型）。
+  # scope 那条管「不知道该查谁」，这条管「查了但证不出根因」——两者是不同环节的失败。
+  - { from: rca, to: halt, when: "$.nodes.rca.output.insufficient == true" }
+  # 第三个中断点：**代码定位环节**拿不到目标服务（`target_service` 为空 → locate 输
+  # `found: false`）。没有仓库就没有"改哪里"，继续往下只会让 fix **凭 plan 的文字猜一个
+  # 仓库**——而 ws_* 工具只校验该 service「备过工作区没有」，三个仓库默认全备，
+  # 猜错就静默改错仓库。实测踩过（run_c9eb2fe68d）：locate 明说 found=false，
+  # fix 却自己挑中 order-service 改了 QuotationService.java——对了是运气。
+  - { from: locate, to: halt, when: "$.nodes.locate.output.found == false" }
+

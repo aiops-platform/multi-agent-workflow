@@ -54,6 +54,13 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["agentflow*"]
 
+[tool.setuptools.package-data]
+# 新租户的默认数据种子（非 .py 资源）。**必须显式声明**：`packages.find` 只收 .py，
+# 非 editable 安装（`pip install .` / wheel）会**静默丢掉**这些 YAML，症状是新租户
+# 零 workflow、零 agent 绑定。而 Dockerfile.worker 用的是 `pip install -e .`，源码树在，
+# 会侥幸不丢 —— 于是本地怎么测都测不出来。
+"agentflow.seed" = ["README.md", "*.yaml", "workflows/*.yaml"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

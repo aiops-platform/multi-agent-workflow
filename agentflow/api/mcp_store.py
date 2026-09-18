@@ -145,6 +145,30 @@ class MCPStore:
         await self._c.commit()
         return mid
 
+    async def insert_if_absent(self, data: dict[str, Any]) -> str | None:
+        """按**给定 id** 插入；`name` 已存在 → 不插入，返回 None（播种用）。
+
+        冲突目标用 **name** 而不是 id：本表 PK 是 id、但 **`name` 有 UNIQUE 约束**。
+        播种器靠"表空才播"守卫，这里兜的是并发 `_build`（以及 name 撞车）。
+
+        返回 None 不等于失败——播种器要据此**按名读回真实 id** 再写 agent 绑定
+        （见 `agentflow/seed/__init__.py`）：撞名的可能是租户自己已有的 server，
+        绑定必须指向它，而不是种子里那个没插进去的假想 id。
+        """
+        await self.connect()
+        col = _to_row(data)
+        cur = await self._c.execute(
+            "INSERT INTO mcp_servers"
+            "(id, name, transport, config, is_stateful, enable_tools, disable_tools,"
+            " tools, enabled, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO NOTHING",
+            (data["id"], col["name"], col["transport"], col["config"], col["is_stateful"],
+             col["enable_tools"], col["disable_tools"], col["tools"],
+             col["enabled"], col["updated_at"], col["updated_at"]),
+        )
+        await self._c.commit()
+        return data["id"] if cur.rowcount == 1 else None
+
     async def list(self) -> list[dict[str, Any]]:
         """全部记录（按创建时间倒序）。"""
         await self.connect()
@@ -300,6 +324,22 @@ class PgMCPStore:
             raise
         await self._c.commit()
         return mid
+
+    async def insert_if_absent(self, data: dict[str, Any]) -> str | None:
+        """按给定 id 插入；name 已存在 → 返回 None。语义同 sqlite 版（见其 docstring）。"""
+        await self.connect()
+        col = _to_row(data)
+        cur = await self._c.execute(
+            "INSERT INTO mcp_servers"
+            "(id, name, transport, config, is_stateful, enable_tools, disable_tools,"
+            " tools, enabled, created_at, updated_at)"
+            " VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (name) DO NOTHING",
+            (data["id"], col["name"], col["transport"], col["config"], col["is_stateful"],
+             col["enable_tools"], col["disable_tools"], col["tools"],
+             col["enabled"], col["updated_at"], col["updated_at"]),
+        )
+        await self._c.commit()
+        return data["id"] if cur.rowcount == 1 else None
 
     async def list(self) -> list[dict[str, Any]]:
         await self.connect()

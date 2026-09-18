@@ -188,6 +188,107 @@ async def test_router_fallback_for_unregistered_tenant(tmp_path, monkeypatch) ->
 
 
 # ======================================================================
+# 新租户默认数据播种（接在 router._build 上——建库即可用）
+#
+# 这里验的是**接线**（播种真的发生在建库路径上、跨实例幂等、不碰老租户）；
+# 播种语义本身（绑定指向真实 id / 不覆盖）在 test_seed_defaults.py。
+# ======================================================================
+async def test_router_seeds_new_tenant_and_is_idempotent(tmp_path, monkeypatch) -> None:
+    """`router.get(新租户)` → 三张表都是种子内容；**换一个 router 实例再来一次** → 数量不变。
+
+    跨实例重跑是关键：真机上同一个新租户常被 API 进程与 Worker 进程各建一次
+    （`router.get` 缓存未命中时无并发保护），空表守卫必须在**进程/连接之外**也成立。
+    """
+    from agentflow.config import get_settings
+    from agentflow.seed import load_dataplane_seed, load_workflow_seeds
+
+    s = get_settings()
+    monkeypatch.setattr(s, "seed_defaults", True)
+    monkeypatch.setattr(s, "state_db_path", tmp_path / "data" / "agentflow.db")
+
+    router = TenantStoresRouter(s, None)
+    try:
+        bundle = await router.get("fresh-a")
+        assert len(await bundle.workflow.list()) == len(load_workflow_seeds())
+        assert len(await bundle.mcp.list()) == len(load_dataplane_seed()["servers"])
+        assert len(await bundle.agent_config.list()) == len(load_dataplane_seed()["bindings"])
+    finally:
+        await router.aclose()
+
+    # 换实例（= 换进程）再开同一个租户：一条都不该多出来
+    router2 = TenantStoresRouter(s, None)
+    try:
+        bundle2 = await router2.get("fresh-a")
+        assert len(await bundle2.workflow.list()) == len(load_workflow_seeds())
+        assert len(await bundle2.agent_config.list()) == len(load_dataplane_seed()["bindings"])
+    finally:
+        await router2.aclose()
+
+
+async def test_router_seed_respects_switch_and_is_per_tenant(tmp_path, monkeypatch) -> None:
+    """开关关掉 → 不播；开着时两个租户**各自**拿到一份。"""
+    from agentflow.config import get_settings
+    from agentflow.seed import load_workflow_seeds
+
+    s = get_settings()
+    monkeypatch.setattr(s, "state_db_path", tmp_path / "data" / "agentflow.db")
+
+    monkeypatch.setattr(s, "seed_defaults", False)
+    off = TenantStoresRouter(s, None)
+    try:
+        assert await (await off.get("no-seed")).workflow.list() == []
+    finally:
+        await off.aclose()
+
+    monkeypatch.setattr(s, "seed_defaults", True)
+    on = TenantStoresRouter(s, None)
+    try:
+        a, b = await on.get("iso-a"), await on.get("iso-b")
+        n = len(load_workflow_seeds())
+        assert len(await a.workflow.list()) == n
+        assert len(await b.workflow.list()) == n   # 各拿一份，不是共享同一份
+        assert (tmp_path / "data" / "tenants" / "iso-a.db").exists()
+        assert (tmp_path / "data" / "tenants" / "iso-b.db").exists()
+    finally:
+        await on.aclose()
+
+
+async def test_router_seed_leaves_existing_tenant_alone(tmp_path, monkeypatch) -> None:
+    """**已有数据的租户不被碰**——"绝不覆盖"在接线层的兜底。
+
+    生产上最危险的场景：给一个**早就存在**的租户（它有自己攒下的 workflow）后来打开
+    播种，或重跑 provision / migrate —— 结果把它的 workflow 冲成默认。
+
+    注意场景的构造顺序：必须**先在播种关闭时**把租户建出来并写进自己的数据，再
+    **开着播种**重开它。因为播种只在建库那一次起作用——第一次 `router.get` 就会把
+    空库播满，之后再想造"已有数据的租户"就来不及了。
+    """
+    from agentflow.config import get_settings
+    from agentflow.seed import load_workflow_seeds
+
+    s = get_settings()
+    monkeypatch.setattr(s, "state_db_path", tmp_path / "data" / "agentflow.db")
+
+    # ① 播种关闭时建租户 + 写自己的 workflow（模拟"功能上线前就存在的租户"）
+    monkeypatch.setattr(s, "seed_defaults", False)
+    old = TenantStoresRouter(s, None)
+    try:
+        mine = await (await old.get("veteran")).workflow.save("我自己改过的流程", SIMPLE_YAML)
+    finally:
+        await old.aclose()
+
+    # ② 打开播种，换实例重开（模拟进程重启 / 重跑 provision）
+    monkeypatch.setattr(s, "seed_defaults", True)
+    new = TenantStoresRouter(s, None)
+    try:
+        rows = await (await new.get("veteran")).workflow.list()
+        assert [r["id"] for r in rows] == [mine], "已有 workflow 的租户被播种碰了"
+        assert len(rows) != len(load_workflow_seeds())  # 确认种子一条都没进去
+    finally:
+        await new.aclose()
+
+
+# ======================================================================
 # TenantRegistry：from_management + default-deny
 # ======================================================================
 async def test_registry_from_management_and_default_deny(mgmt) -> None:

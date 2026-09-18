@@ -88,8 +88,16 @@ make lint      # ruff 检查
      （已发起的 run 不受影响——它们用 snapshot 冻结）。
    - 原设计的 DAG 形态（节点类型 / when / join / 审批门禁）见 `design-v5.2.md` §8.1（**仓库上一级目录**，不在 `backend/docs/`——v5.6 §8 是「残余风险」不是这个）；
      当前两条流程的节点结构见 `docs/design-v5.7.md` §7.2。
-   - **新租户的坑**：`tenantctl provision` 只建库建表、**不播种 workflow**，新租户
-     `workflows` 表是空的 → `POST /tickets/{tid}/run` 直接 400。见 `docs/TODO.md` §13。
+   - **新租户的默认数据 = `agentflow/seed/`（种子，2026-09-18 起）**：租户库建好时，
+     `TenantStoresRouter._build()` 会往**三张表**写默认数据，让新租户开箱可用——
+     `workflows` + `mcp_servers` + `agent_configs`（agent↔server 绑定）。
+     只播 workflow 不够：绑定为空 ⇒ **每个 agent 零工具**，run 会跑完但全在空转。
+     - **语义：空表才播、绝不覆盖**（每张表各自判断）。所以**改了 seed 文件对已存在的租户
+       没有任何效果**——改已开通租户仍走 `PUT /workflows/{wid}`。
+     - id 一律 `seed-` 前缀（`save()` 产出 12 位 hex，永不撞），一眼可辨来源。
+     - 逃生阀 `AGENTFLOW_SEED_DEFAULTS=0`；数据面 server 地址走
+       `AGENTFLOW_MCP_DATASOURCE_URL`（URL 环境相关，不在种子里写死）。
+     - 详见 `agentflow/seed/README.md`、`docs/TODO.md` §13。
 
 6.1 **Worker/双队列**（§6/§8.6，`AGENTFLOW_RUN_MODE`）：`inline`（默认，进程内直跑）|
    `queue`（API 只发布 run.trigger.{tenant} / run.command.{tenant}，Worker 消费；
