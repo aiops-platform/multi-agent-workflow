@@ -12,6 +12,10 @@
 > - **编排层**（`service-scoper` agent + `scope` 节点 + 四个取数节点改 `join` + `rca` 交叉核对）
 >   —— 全链 E2E 跑通至审批节点
 >
+> **补记（2026-09-17 / 09-18，实施后另落地）**：§3.6「实施现状」的 `kind: halt`；
+> §7.2 末「补记：审批决策点与 `on_reject` 的落地形态」；§7.2 第 3 点的
+> **新租户播种**（已由 `docs/TODO.md` §13 解决）。
+>
 > **未实施**：① 意图分类只落到了 `scope` 的**输出字段**（`intent`），尚未按它分支路由召回策略；
 > ② §3.6 的「信息不足 → 停止让用户补充」——**部分实施（2026-09-17）**：流程**会真的停下来**了，
 > 但走的是 **(A) 停止本次 run**（`kind: halt`），**不是 §3.6 推荐的 (B) `kind: clarification` 原地暂停**
@@ -41,7 +45,12 @@
 
 而工单上其实**带着** `bug_report.cmdb_ci.name`，`create_ticket` 把它落到 ticket 的
 `service` 列——**但它只被存储和展示，不参与任何路由**（`_ticket_inputs()` 只把
-`bug_report` + 时间窗放进 `inputs`；`cmdb_ci` 在整个 `workflows/` 目录里出现 0 次）。
+`bug_report` + 时间窗放进 `inputs`）。
+
+> **本节描述的是 v5.7 实施前的状态**（决策依据，保留不改写）。现状已不同：
+> `scope` 节点会读 `cmdb_ci.name`（§3.1），且当时用于核实的 `workflows/*.yaml`
+> 仓库目录**已于 2026-09-16 删除**——workflow 的真源是数据库，种子在
+> `agentflow/seed/workflows/`（见 `CLAUDE.md` 6.0）。
 
 ### 1.2 目标
 
@@ -669,7 +678,7 @@ POST /runs/{id}/resume  →  {"ok": true, "status": "resumed"}      ← 接口�
 Worker 日志             →  [run_xxx] run 已终态，忽略 resume      ← 实际什么都没做
 ```
 
-（`worker.py:171` 拿 `TERMINAL` 拦下；实测复核见 `docs/TODO.md` §20。
+（`worker.py:171` 拿 `TERMINAL` 拦下；已登记为 `docs/TODO.md` §23.2。
 **接口回 `ok: true` 而实际 no-op 是个独立的小缺陷，值得单独修。**）
 即便绕过这道门，executor 侧也会立刻再全跳过一遍——`_process_skips` 第一句就是
 「halt 已触发 → 其余 PENDING 全 SKIPPED」，而 halt 是 DONE、随 checkpoint 恢复。
@@ -800,8 +809,17 @@ Worker 日志             →  [run_xxx] run 已终态，忽略 resume      ← 
    （本次就差点漏掉——库里那份是改之前保存的）。
    **这是"新租户初始化缺播种"的一个侧面**：`tenantctl provision` 只建库建表、
    不播种 workflow 与数据面绑定，新租户的 `workflows` 表是空的 → 起不来诊断。
-   **已登记为 `docs/TODO.md` §13**（含要做的事：provision 时从仓库 YAML 幂等播种、
-   数据面绑定配置化、补同步命令）。
+
+   > **✅ 已解决（2026-09-18，`docs/TODO.md` §13）**：租户库建好时，
+   > `TenantStoresRouter._build()` 会往**三张表**一起播默认数据——
+   > `workflows` + `mcp_servers` + `agent_configs`（agent↔server 绑定），新租户开箱可用。
+   > **只播 workflow 不够**：绑定为空 ⇒ 每个 agent 零工具，run 会跑完但全在空转。
+   > 语义是**空表才播、绝不覆盖**，id 一律 `seed-` 前缀，逃生阀
+   > `AGENTFLOW_SEED_DEFAULTS=0`；数据面 server 地址走 `AGENTFLOW_MCP_DATASOURCE_URL`
+   > （URL 环境相关，不在种子里写死）。种子在 `agentflow/seed/`。
+   >
+   > ⚠️ **但上面这条「改完 YAML 必须写回」对已开通租户仍然成立**——种子只在**空表**时播，
+   > 改了 seed 文件对已存在的租户没有任何效果。改已有租户仍走 `PUT /workflows/{wid}`。
 
 #### E2E 实测（工单「订单服务打印结账单无反应」，租户 `otr`）
 
@@ -814,6 +832,41 @@ Worker 日志             →  [run_xxx] run 已终态，忽略 resume      ← 
 - 全链跑通至审批节点（13 done / 1 `waiting_approval`），817k tokens / $0.07
 - **诚实度符合预期**：`scope` 主动标注"1 跳映射为**静态拓扑而非运行时观测**"；
   `rca` 在证据缺失时写"窗口内全服务日志 0 条…**不可当作 0**"而非编造
+
+#### 补记（2026-09-18）：审批决策点与 `on_reject` 的落地形态
+
+§7.2 那张表记的是 2026-09-16 的形态，**当时诊断链上没有任何人工决策点**：
+`plan → fix` 直连，plan 一出 `fix` 立刻改代码。实测暴露过——
+`run_b156f65142` 的 plan 自己写着「第 3、4 步落地前必须先核对…否则可能修错位置」，
+而它第 3、4 步（`code_fix`）**已经跑完了**。现已补上，形状变成：
+
+```
+scenario1（含 K8s 止血分支）: plan → approve-plan → { fix , approve-remediate → remediate }
+scenario2（纯代码修复）      : plan → approve-plan → fix
+```
+
+审批节点总数 **5 个**：两条 pipeline 都有 `approve-plan` 与 `approve-commit`；
+`approve-remediate` 是 scenario1 独有的（只有它有 `remediate` 分支）。
+命名遵守 v5.6 §4.5.3 那条约束（**approval node id 用稳定语义命名**）——
+那条写的是"将来 compiler 该这么命名"，现在被静态图先印证了。
+
+**`on_reject` 的语义（`abort` | `continue`，默认 `abort`）**，每个审批节点必须**显式声明**：
+
+- `abort` → 驳回 = **中止整条 run**（run 判 `failed`，节点状态保留 `rejected`）；
+- `continue` → 沿图上 `when: approved == false` 的边路由（**图里必须写了那条边**）。
+
+⚠️ 两条踩过的坑，都是**静默**的：
+
+1. **不写 = `abort`**。若图里同时又写了 `approved == false → recap` 边，那条边
+   **永远不可达**——图在骗人，但加载与运行都不报错。
+2. **判据看状态、不看动作**。queue 模式下 Worker 经 `from_checkpoint` 重建后直接
+   `run()`，**不经过 `approve()`** → 写在 `approve()` 里的中止逻辑**完全不生效**，
+   run 照样报 `done`，只有下游被 SKIPPED。故判据是 `rejected_abort_node()`
+   （`executor/dag_executor.py:291`，读节点状态 + 图上的 `on_reject` 声明）。
+   此前 `on_reject` 是**死配置**——全仓只有解析那三行，没有任何消费方。
+
+约定全文见 `CLAUDE.md` 约束 4.1，缺陷与实测见 `docs/TODO.md` §21。
+**超时不走这条**（`REJECTED_CANCELED` 是 `on_timeout` 的语义，尚未实现）。
 
 ### 7.3 验收判据
 
