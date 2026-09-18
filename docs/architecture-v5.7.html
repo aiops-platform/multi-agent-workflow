@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AIOps 智能体平台部署架构 · v5.7</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #eb6c36;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1360px; width: 100%; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 0.5rem;
+    }
+
+    .subtitle {
+      font-size: 0.86rem;
+      color: var(--color-muted);
+      margin-bottom: 1.75rem;
+      max-width: 72ch;
+      line-height: 1.55;
+    }
+
+    .subtitle strong { color: var(--color-ink); font-weight: 600; }
+    .subtitle code {
+      font-family: var(--font-mono);
+      font-size: 0.82em;
+      background: rgba(45,49,66,0.05);
+      padding: 0.08em 0.34em;
+      border-radius: 3px;
+    }
+
+    svg { width: 100%; min-width: 1040px; display: block; overflow-x: auto; }
+
+    .notes {
+      margin-top: 1.5rem;
+      border-top: 1px solid rgba(45,49,66,0.10);
+      padding-top: 1.25rem;
+      display: grid;
+      grid-template-columns: 1.15fr 1fr;
+      gap: 1.5rem;
+    }
+
+    .note h3 {
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--color-ink);
+      margin-bottom: 0.4rem;
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+
+    .note h3 .badge {
+      font-family: var(--font-mono);
+      font-size: 0.62rem;
+      font-weight: 500;
+      color: var(--color-accent);
+      border: 1px solid rgba(235,108,54,0.45);
+      border-radius: 2px;
+      padding: 0.05em 0.35em;
+      line-height: 1.4;
+    }
+
+    .note p {
+      font-size: 0.8rem;
+      line-height: 1.6;
+      color: var(--color-muted);
+    }
+
+    .note p code {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      color: var(--color-ink);
+    }
+
+    .colophon {
+      margin-top: 1.5rem;
+      padding-top: 0.9rem;
+      border-top: 1px solid rgba(45,49,66,0.10);
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      letter-spacing: 0.06em;
+      color: rgba(45,49,66,0.42);
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">部署架构 · v5.7</p>
+    <h1>AIOps 智能体平台</h1>
+    <p class="subtitle">
+      执行面按<strong>密钥边界</strong>切分：worker 容器持有全部凭据
+      （DeepSeek key / DB DSN / MCP 凭证 / git PAT），沙箱容器<strong>一个都不给</strong>，
+      只承接"写文件"与"跑测试"这两件会执行仓库代码的事。判据一句话——
+      <strong>谁持有密钥，谁不执行不可信代码</strong>。
+    </p>
+
+    <svg viewBox="0 0 1280 860" xmlns="http://www.w3.org/2000/svg" role="img"
+         aria-labelledby="aiops-arch-v57-title aiops-arch-v57-desc">
+      <title id="aiops-arch-v57-title">AIOps 智能体平台部署架构（v5.7 沙箱密钥边界）</title>
+      <desc id="aiops-arch-v57-desc">
+        平台分三段：控制面的 API 进程发布 run.trigger 到 Kafka；Worker Pod 内的 worker 容器消费并执行
+        DAG，沙箱容器承接写文件与跑测试，两者共享网络命名空间并共享 /workspace 工作区卷；
+        worker 通过 MCP 访问数据面、通过 SQL 访问租户库与管理库。
+        图下方标出两个已知缺口：工作区由 API 进程准备而消费在 Worker Pod，以及沙箱与 worker 共享网络命名空间导致无法单独控制出口。
+      </desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+      <!-- ============ ZONES（先画，最后被节点覆盖） ============ -->
+      <rect x="40" y="44" width="1200" height="180" rx="8" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.12)" stroke-width="0.8" stroke-dasharray="4,4"/>
+      <rect x="52" y="48" width="136" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="120" y="57" fill="rgba(45,49,66,0.42)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">① 控制面 · 宿主进程</text>
+
+      <rect x="40" y="248" width="1200" height="320" rx="8" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.12)" stroke-width="0.8" stroke-dasharray="4,4"/>
+      <rect x="52" y="252" width="188" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="146" y="261" fill="rgba(45,49,66,0.42)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">② WORKER POD · 每租户一个</text>
+
+      <rect x="40" y="592" width="1200" height="180" rx="8" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.12)" stroke-width="0.8" stroke-dasharray="4,4"/>
+      <rect x="52" y="596" width="120" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="112" y="605" fill="rgba(45,49,66,0.42)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">③ 依赖 · 集群内外</text>
+
+      <!-- 缺口②：共享网络命名空间（虚线框把两个容器圈在一起；卷在框外——它不占 netns） -->
+      <rect x="72" y="280" width="716" height="148" rx="8" fill="none" stroke="rgba(45,49,66,0.28)" stroke-width="0.8" stroke-dasharray="4,4"/>
+      <rect x="84" y="272" width="176" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="172" y="281" fill="rgba(45,49,66,0.45)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.10em">共享 NETNS · 见 ②</text>
+
+      <!-- ============ ARROWS（先于节点，保证线在盒下） ============ -->
+
+      <!-- API → Kafka：发布 run.trigger（走左侧走廊，避开 worker） -->
+      <path d="M 88 140 H 72 A 8 8 0 0 0 64 148 V 672 A 8 8 0 0 0 72 680 H 88"
+            fill="none" stroke="#4f5d75" stroke-width="1"/>
+      <rect x="72" y="428" width="88" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="116" y="437" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">TRIGGER</text>
+
+      <!-- worker → Kafka：消费（正下方，直连） -->
+      <path d="M 164 412 V 628" fill="none" stroke="#4f5d75" stroke-width="1"
+            marker-end="url(#arrow)"/>
+      <rect x="172" y="508" width="56" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="200" y="517" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">CONSUME</text>
+
+      <!-- worker → MCP -->
+      <path d="M 240 412 V 500 A 8 8 0 0 0 248 508 H 572 A 8 8 0 0 1 580 516 V 628"
+            fill="none" stroke="#2e5aa8" stroke-width="1" marker-end="url(#arrow-link)"/>
+      <rect x="404" y="488" width="32" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="420" y="497" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MCP</text>
+
+      <!-- worker → PG -->
+      <path d="M 316 412 V 528 A 8 8 0 0 0 324 536 H 924 A 8 8 0 0 1 932 544 V 628"
+            fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)"/>
+      <rect x="620" y="516" width="32" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="636" y="525" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SQL</text>
+
+      <!-- worker → sandbox：loopback（本图的焦点交互） -->
+      <path d="M 388 356 H 468" fill="none" stroke="#2d3142" stroke-width="1.2"
+            marker-end="url(#arrow)"/>
+      <rect x="404" y="336" width="52" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="430" y="345" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">:44772</text>
+
+      <!-- sandbox → 工作区卷 -->
+      <path d="M 768 356 H 828" fill="none" stroke="#4f5d75" stroke-width="1"
+            marker-end="url(#arrow)"/>
+
+      <!-- API → 工作区卷：工作区准备（缺口①，accent 虚线） -->
+      <path d="M 408 140 H 988 A 8 8 0 0 1 996 148 V 336"
+            fill="none" stroke="#eb6c36" stroke-width="1.2" stroke-dasharray="5,4"
+            marker-end="url(#arrow-accent)"/>
+      <rect x="632" y="120" width="152" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="708" y="129" fill="#a8562c" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">CLONE @ BASE_SHA</text>
+
+      <!-- ============ NODES ============ -->
+
+      <!-- 控制面：API 进程 -->
+      <rect x="88" y="84" width="320" height="116" rx="6" fill="#f5f5f5"/>
+      <rect x="88" y="84" width="320" height="116" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="96" y="92" width="28" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="110" y="101" fill="rgba(45,49,66,0.80)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">API</text>
+      <text x="248" y="136" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">API 进程</text>
+      <text x="248" y="154" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">RunService · 配额 CAS · snapshot</text>
+      <rect x="100" y="168" width="296" height="24" rx="4" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="0.8"/>
+      <text x="108" y="184" fill="#2d3142" font-size="12" font-family="'Geist', sans-serif">agentflow-api（宿主，无镜像）</text>
+
+      <!-- Worker Pod：worker 容器 -->
+      <rect x="88" y="296" width="300" height="116" rx="6" fill="#f5f5f5"/>
+      <rect x="88" y="296" width="300" height="116" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="96" y="304" width="28" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="110" y="313" fill="rgba(45,49,66,0.80)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">POD</text>
+      <text x="238" y="344" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">worker 容器</text>
+      <text x="238" y="360" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">DAGExecutor → AgentNodeRunner → DeepSeek</text>
+      <text x="238" y="376" fill="#eb6c36" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">持全部密钥：LLM / DSN / MCP / PAT</text>
+      <rect x="100" y="384" width="276" height="20" rx="4" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="0.8"/>
+      <text x="108" y="398" fill="#2d3142" font-size="12" font-family="'Geist', sans-serif">agentflow-worker:{tenant}-{sha}</text>
+
+      <!-- Worker Pod：sandbox 容器（焦点） -->
+      <rect x="468" y="296" width="300" height="116" rx="6" fill="#f5f5f5"/>
+      <rect x="468" y="296" width="300" height="116" rx="6" fill="rgba(235,108,54,0.06)" stroke="#eb6c36" stroke-width="1.2"/>
+      <rect x="476" y="304" width="28" height="12" rx="2" fill="transparent" stroke="rgba(235,108,54,0.50)" stroke-width="0.8"/>
+      <text x="490" y="313" fill="rgba(168,86,44,0.95)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">POD</text>
+      <text x="618" y="344" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">sandbox 容器</text>
+      <text x="618" y="360" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">exec 服务 · 只绑 127.0.0.1:44772</text>
+      <text x="618" y="376" fill="#a8562c" font-size="9" font-weight="600" font-family="'Geist Mono', monospace" text-anchor="middle">零密钥 · 不装 git · JDK 21</text>
+      <rect x="480" y="384" width="276" height="20" rx="4" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="0.8"/>
+      <text x="488" y="398" fill="#2d3142" font-size="12" font-family="'Geist', sans-serif">agentflow-sandbox-java21</text>
+
+      <!-- 共享工作区卷（在 netns 虚线框之外） -->
+      <rect x="828" y="336" width="328" height="36" rx="4" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="0.8"/>
+      <text x="840" y="352" fill="#2d3142" font-size="12" font-family="'Geist', sans-serif">/workspace 共享卷</text>
+      <text x="1144" y="352" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">emptyDir</text>
+      <text x="840" y="366" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace">repos/{service} @ base_sha · 分支 aiops/RUN_{run_id}</text>
+
+      <!-- ③ 依赖：Kafka -->
+      <rect x="88" y="628" width="280" height="104" rx="6" fill="#f5f5f5"/>
+      <rect x="88" y="628" width="280" height="104" rx="6" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+      <rect x="96" y="636" width="56" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.30)" stroke-width="0.8"/>
+      <text x="124" y="645" fill="rgba(45,49,66,0.62)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">MANAGED</text>
+      <text x="228" y="676" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Kafka</text>
+      <text x="228" y="694" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">topic-per-tenant</text>
+      <text x="228" y="712" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">run.trigger.{tenant}</text>
+
+      <!-- ③ 依赖：数据面 MCP -->
+      <rect x="440" y="628" width="280" height="104" rx="6" fill="#f5f5f5"/>
+      <rect x="440" y="628" width="280" height="104" rx="6" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+      <rect x="448" y="636" width="56" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.30)" stroke-width="0.8"/>
+      <text x="476" y="645" fill="rgba(45,49,66,0.62)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">MANAGED</text>
+      <text x="580" y="676" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">数据面 MCP</text>
+      <text x="580" y="694" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">ES / Prometheus / kubectl / CMDB</text>
+      <text x="580" y="712" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">aiops-datasource-mcp-server</text>
+
+      <!-- ③ 依赖：PG -->
+      <rect x="792" y="628" width="280" height="120" rx="6" fill="#f5f5f5"/>
+      <rect x="792" y="628" width="280" height="120" rx="6" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+      <rect x="800" y="636" width="56" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.30)" stroke-width="0.8"/>
+      <text x="828" y="645" fill="rgba(45,49,66,0.62)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">MANAGED</text>
+      <text x="932" y="672" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PostgreSQL</text>
+      <rect x="804" y="680" width="256" height="24" rx="4" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="0.8"/>
+      <text x="812" y="696" fill="#2d3142" font-size="12" font-family="'Geist', sans-serif">agentflow-{tenant}</text>
+      <text x="1052" y="696" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="end">每租户一库</text>
+      <rect x="804" y="712" width="256" height="24" rx="4" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="0.8"/>
+      <text x="812" y="728" fill="#2d3142" font-size="12" font-family="'Geist', sans-serif">agentflow</text>
+      <text x="1052" y="728" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="end">管理库</text>
+
+      <!-- ============ 缺口标记（①②，与下方说明条对应） ============ -->
+      <circle cx="1016" cy="300" r="8" fill="#f5f5f5" stroke="#eb6c36" stroke-width="1"/>
+      <text x="1016" y="304" fill="#eb6c36" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">1</text>
+
+      <circle cx="800" cy="300" r="8" fill="#f5f5f5" stroke="#4f5d75" stroke-width="1"/>
+      <text x="800" y="304" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">2</text>
+
+      <!-- ============ LEGEND（底部横条，不进图区） ============ -->
+      <line x1="40" y1="796" x2="1240" y2="796" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <text x="40" y="816" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+
+      <rect x="148" y="804" width="16" height="12" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="174" y="816" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace">本仓组件</text>
+
+      <rect x="276" y="804" width="16" height="12" rx="2" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+      <text x="302" y="816" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace">外部服务</text>
+
+      <rect x="396" y="804" width="16" height="12" rx="2" fill="rgba(235,108,54,0.06)" stroke="#eb6c36" stroke-width="1.2"/>
+      <text x="422" y="816" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace">密钥边界（零凭据）</text>
+
+      <line x1="548" y1="812" x2="576" y2="812" stroke="#eb6c36" stroke-width="1.2" stroke-dasharray="5,4"/>
+      <text x="586" y="816" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace">工作区准备</text>
+
+      <rect x="692" y="804" width="24" height="16" rx="3" fill="none" stroke="rgba(45,49,66,0.28)" stroke-width="0.8" stroke-dasharray="4,4"/>
+      <text x="726" y="816" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace">共享网络命名空间</text>
+
+      <circle cx="872" cy="812" r="8" fill="none" stroke="#eb6c36" stroke-width="1"/>
+      <text x="872" y="816" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">1</text>
+      <text x="890" y="816" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace">已知缺口（见下）</text>
+    </svg>
+
+    <div class="notes">
+      <div class="note">
+        <h3><span class="badge">缺口 1</span>工作区由 API 准备，却在 Worker Pod 被消费</h3>
+        <p>
+          <code>RunService._create()</code> 在 <strong>API 进程</strong>里 clone 到
+          <code>{workspace_root}/{tenant}/{run}/repos/{service}</code>，而消费方是
+          <strong>Worker Pod</strong> 里的 <code>ws_read_file</code> / <code>ws_git</code>。
+          本地单机同路径成立；集群形态下 API 跑在宿主、Worker 挂的是
+          <code>emptyDir</code>，<strong>两者不是同一个文件系统</strong>——Worker 会看不到仓库。
+        </p>
+      </div>
+      <div class="note">
+        <h3><span class="badge">缺口 2</span>沙箱与 worker 共享网络命名空间</h3>
+        <p>
+          sidecar 与 worker <strong>同 Pod 同 netns</strong>，因此无法"只掐沙箱的出口、放行 worker"：
+          NetworkPolicy 按 Pod 选，而 <code>hostNetwork</code> 下多数 CNI 根本不生效。
+          当前能兜底的只有<strong>沙箱没有任何凭据</strong>——它够不着需要认证的东西，
+          剩下能做的只是探测内网与外泄仓库内容。取舍见 <code>docs/TODO.md §3</code>。
+        </p>
+      </div>
+    </div>
+
+    <p class="colophon">
+      对应提交 2c48f4c · 与 architecture-v5.5.html 并存（后者为数据面 MCP 化的历史快照）
+    </p>
+  </div>
+</body>
+</html>
