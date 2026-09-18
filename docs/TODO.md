@@ -31,7 +31,7 @@
 | 21 | ~~`plan → fix` 无人拍板 + `on_reject` 死配置~~ | ✅ 已修——修复计划没有任何决策点；且 queue 模式下中止逻辑压根不生效 |
 | 22 | `remediate` 只产计划、不执行 | `ActionExecutor` 全仓没接线；**附租户 namespace 边界也是开的** |
 | 23 | **静默错误行为**（4 条，均已核实） | 表面全正常，只有核数据形状才发现是空的/没接线——最费排查时间的一类 |
-| 24 | **密钥卫生**：`Settings` 密钥字段全是裸 `str` | 安全。`repr(Settings)` 明文带出 key，CI 失败回溯即泄——**修起来很小** |
+| 24 | ~~密钥卫生：`Settings` 密钥字段全是裸 `str`~~ | ✅ 已修——六个字段改 `SecretStr` + 6 条守卫测试；顺带修掉一个被误诊的长期红测试。残留见文末 |
 
 > **中断语义（halt）不在本清单里**——它已实施并实测通过（`8841d20` / `2821ac5`），
 > 约定见 `CLAUDE.md` 约束 3 与 `docs/E2E_VERIFICATION_zh-CN.md` §四验收点。
@@ -341,6 +341,16 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 > kube 依赖 + 上述陈旧用例 + `test_agent_runner` 需真实 DeepSeek key。
 > **与本次改动无关**（`git stash` 前后结果完全一致）。
 > **后果：回归信号目前不可信**——这是本项最该先清的理由。
+>
+> ⚠️ **2026-09-18 更正一条误诊**：上面「`test_agent_runner` 需真实 DeepSeek key」
+> **是错的**。真因是 `Settings` 带 `validation_alias` 的字段默认只认别名 →
+> `Settings(deepseek_api_key="sk-x")` **静默忽略**该 kwarg、读回空串 → 回退 ScriptedJsonModel。
+> 加 `populate_by_name=True` 后该用例**已通过**，**不需要真实 key**。详见 §24。
+> 教训：把"测试红了"归因成"环境没配"之前，先确认**参数真的传进去了没有**——
+> 静默忽略的入参会让"环境缺失"看起来和"代码路径没走到"一模一样。
+>
+> **当前基线（2026-09-18）**：**3 failed / 397 passed / 4 errors**。
+> 3 failed 全是 `test_sandbox.py`（kube 依赖 + `use_mock` 陈旧用例），4 errors 同前。
 
 ---
 
@@ -1363,44 +1373,54 @@ Worker 日志             →  [run_xxx] run 已终态，忽略 resume      ← 
 
 ---
 
-## 24. 密钥卫生：`Settings` 全部用 `str` 存，`repr()` 明文带出
+## 24. ~~密钥卫生：`Settings` 全部用 `str` 存，`repr()` 明文带出~~ ✅ 已修（2026-09-18）
 
-> 2026-09-18 记录，**未修**。发现路径：本轮改 `deploy/worker-deployment.yaml`
-> 加 DeepSeek key 时，回头核"这个 key 会不会被写进 git / 日志"。
+> 发现路径：给 `deploy/worker-deployment.yaml` 加 DeepSeek key 时，回头核
+> "这个 key 会不会被写进 git / 日志"。**Settings 部分已修**，尾巴见文末"残留"。
 
-### 现状（源码事实，未读取任何真实值）
+### 原缺陷（源码事实，未读取任何真实值）
 
-`agentflow/config.py` 里五个密钥字段全是裸 `str`，且**全文件 `SecretStr` 出现 0 次**：
+`agentflow/config.py` 里六个字段是裸 `str`，且**全文件 `SecretStr` 出现 0 次**：
+`deepseek_api_key` / `jwt_secret` / `secret_key` / `open_sandbox_api_key` /
+`langfuse_secret_key` / `postgres_dsn`（连接串含明文口令）。
 
-```
-:27  deepseek_api_key: str      :59  jwt_secret: str       :65  secret_key: str
-:138 open_sandbox_api_key: str  :158 langfuse_secret_key: str
-```
+`str` 是 pydantic 的默认显示类型 → **`repr(Settings)` / `str(Settings)` 原样打印全部密钥**。
 
-`str` 是 pydantic 的默认显示类型 → **`repr(Settings)` / `str(Settings)` 原样打印全部密钥**
-（已实测确认 `deepseek_api_key` 与 `jwt_secret` 明文出现在 `repr` 里）。
+**为什么不是"理论风险"**：pytest / CI 的失败回溯**默认打印局部变量**，本仓已出现过
+`settings = Settings(deepseek_api_key='...')` 这种输出形态。本地那次是 monkeypatch 的假 key，
+**CI 里注入的是真 key，同一形态就会把真 key 打进构建日志**。另两条路径：任何
+`log.info("... %s", settings)`；接了 Sentry 一类错误上报后自动采集局部变量。
 
-### 为什么这是个隐患（不是"理论风险"）
+### ✅ 已修
 
-任何把 settings 对象带进输出的路径都会泄：
+1. 六个字段改 `pydantic.SecretStr`；取明文处显式 `.get_secret_value()`
+   （`scopes.py` ×2、`auth.py` ×1、`management_store.py` ×2、`postgres_dsn()` helper ×1）。
+   未加 `.get_secret_value()` 的只剩**真值判断**（`if not settings.jwt_secret`）——
+   `bool(SecretStr(""))` 为 `False`，与裸 str 一致，已用测试钉住。
+2. 新增 `tests/test_config_secrets.py`（6 条）：字段必须是 SecretStr、
+   `repr`/`str`/`model_dump_json` 不含明文、**校验错误信息**也不含明文、
+   明文仍可取出、真值判断与裸 str 一致、赋值走校验。
+   全部用哨兵值，不读也不断言任何真实凭证。
 
-1. **pytest / CI 的失败 traceback**——pytest 默认打印**局部变量**。本仓已有过这种输出形态
-   （跑 `tests/test_worker.py` 失败时，回溯里就有一行完整的 `settings = Settings(...)`）。
-   本地那次是 monkeypatch 的假 key，但 **CI 里注入的是真 key，同一形态就会把真 key 打进构建日志**。
-2. 任何 `log.info("... %s", settings)`（当前全仓没有，但没有任何东西**阻止**下一个人写）。
-3. 接了错误上报（Sentry 一类）后会自动采集局部变量。
+### ⚠️ 顺带修掉一个**被误诊**的长期失败测试
 
-### 目标
+`test_build_reasoning_model_thinking_enabled_with_key` 一直红，`§10` 把它记成
+「需真实 DeepSeek key」。**真因是别名陷阱**：带 `validation_alias` 的字段默认只认别名，
+于是 `Settings(deepseek_api_key="sk-x")` **静默忽略**这个 kwarg、读回空串 →
+一路回退 `ScriptedJsonModel`。与 §23 是同一族（**不报错、行为静默走错**）。
+修法：`model_config` 加 `populate_by_name=True`（环境变量仍走别名）+ `validate_assignment=True`
+（否则 `monkeypatch.setattr(s, "jwt_secret", "x")` 塞进裸 str，`.get_secret_value()` 报 AttributeError）。
+**该测试现已通过**，§10 的"需真实 key"描述作废。
 
-把密钥字段改成 `pydantic.SecretStr`（`repr` 显示 `**********`），取值处显式 `.get_secret_value()`；
-`config.py` 的 `postgres_dsn`（含明文口令）同样处理。加一条测试：`repr(get_settings())`
-**不得包含**任一密钥字段的真实值。
+### 残留（未修）
 
-### 顺带（K8s 侧，非本仓代码）
-
-- `kubectl create secret --from-literal=...` 会把明文放进 **进程 argv**（`ps` 可见）；
-  改用 `--from-env-file` 或 stdin。
-- K8s Secret 默认**只是 base64**，`kubectl get secret -o yaml` 即可读；etcd 未配
-  encryption-at-rest 时落盘也是明文。生产需 sealed-secret / 外部 secrets manager。
-- `deploy/worker-deployment.yaml` 的注释里写的是 `$AGENTFLOW_DEEPSEEK_API_KEY`
-  （**变量引用**形式）：shell 历史记录的是未展开的文本，不会因它泄 key。
+- **`tenantctl.py` 三处 stdout 打印解密后的 db_ref DSN**（`:161` / `:288` / `:290`，
+  另 `:155` 的变更提示）：DSN 含明文口令，会留在终端回滚、CI 日志、截图里。
+  与 `CLAUDE.md` 既有的「任何 API 不回显 DSN」是同一原则。改法很轻
+  （只打 host/port/dbname、口令打码），但**可能有人在解析这行输出**，故未擅自改。
+- **K8s 侧（非本仓代码）**：`kubectl create secret --from-literal=...` 把明文放进
+  **进程 argv**（`ps` 可见），改用 `--from-env-file` / stdin；Secret 默认**只是 base64**，
+  `kubectl get secret -o yaml` 即可读，etcd 未配 encryption-at-rest 时落盘也是明文
+  —— 生产需 sealed-secret / 外部 secrets manager。
+  （注：`deploy/worker-deployment.yaml` 注释里写的是 `$AGENTFLOW_DEEPSEEK_API_KEY`
+  **变量引用**形式，shell 历史记的是未展开文本，不会因它泄 key。）
