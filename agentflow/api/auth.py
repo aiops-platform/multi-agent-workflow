@@ -36,7 +36,7 @@ def tenant_from_token(token: str, settings: Settings) -> TenantContext:
     """解码并校验 JWT → TenantContext。失败抛 HTTPException(401)。"""
     try:
         payload = pyjwt.decode(
-            token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
+            token, settings.jwt_secret.get_secret_value(), algorithms=[settings.jwt_algorithm]
         )
     except pyjwt.ExpiredSignatureError as exc:
         raise HTTPException(status_code=401, detail="JWT 已过期") from exc

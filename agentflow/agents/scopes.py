@@ -64,7 +64,8 @@ def build_model(settings: Settings | None = None) -> ChatModelBase:
 
     return OpenAIChatModel(
         credential=OpenAICredential(
-            api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url
+            api_key=settings.deepseek_api_key.get_secret_value(),
+            base_url=settings.deepseek_base_url,
         ),
         model=settings.deepseek_model,
         stream=True,
@@ -88,7 +89,8 @@ def build_reasoning_model(settings: Settings | None = None) -> ChatModelBase:
 
     return DeepSeekChatModel(
         credential=DeepSeekCredential(
-            api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url
+            api_key=settings.deepseek_api_key.get_secret_value(),
+            base_url=settings.deepseek_base_url,
         ),
         model=settings.deepseek_model,
         parameters=DeepSeekChatModel.Parameters(thinking_enable=True),

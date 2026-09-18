@@ -53,9 +53,9 @@ CREATE TABLE IF NOT EXISTS schema_versions (
 def derive_secret_key(settings: Settings) -> tuple[bytes, bool]:
     """返回 (Fernet key, 是否派生)。显式 AGENTFLOW_SECRET_KEY 优先；缺省从 jwt_secret 派生。"""
     if settings.secret_key:
-        return settings.secret_key.encode(), False
+        return settings.secret_key.get_secret_value().encode(), False
     if settings.jwt_secret:
-        derived = hashlib.sha256(settings.jwt_secret.encode()).digest()
+        derived = hashlib.sha256(settings.jwt_secret.get_secret_value().encode()).digest()
         return base64.urlsafe_b64encode(derived), True
     return b"", False
 

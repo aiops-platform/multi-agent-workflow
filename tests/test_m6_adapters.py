@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from pydantic import SecretStr
 
 from agentflow.lock.redis import RedisLock
 from agentflow.queue.kafka import KafkaQueue
@@ -201,7 +202,9 @@ async def test_postgres_replace_node_traces_writes_via_cursor() -> None:
 
 class _SettingsStub:
     state_store = "postgres"
-    postgres_dsn = "localhost:5432/agentflow?user=agentflow&password=agentflow"
+    # 镜像 `Settings.postgres_dsn` 的**真实类型**（SecretStr）——stub 是契约替身，
+    # 类型漂了就会在 `postgres_dsn(settings)` 里报 AttributeError（见 docs/TODO.md §24）。
+    postgres_dsn = SecretStr("localhost:5432/agentflow?user=agentflow&password=agentflow")
 
 
 # ======================================================================

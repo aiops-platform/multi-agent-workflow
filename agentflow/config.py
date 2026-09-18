@@ -8,7 +8,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -20,18 +20,35 @@ class Settings(BaseSettings):
         env_prefix="AGENTFLOW_",
         env_nested_delimiter="__",
         extra="ignore",
+        # 密钥字段是 SecretStr：**赋值也要走校验**，否则 `settings.jwt_secret = "x"`
+        # 会把裸 str 直接塞进 __dict__，之后 `.get_secret_value()` 报 AttributeError
+        # （测试广泛用 monkeypatch.setattr 改这些字段，实测踩过）。
+        validate_assignment=True,
+        # ⚠️ 带 `validation_alias` 的字段（deepseek_*）默认**只认别名**——于是
+        # `Settings(deepseek_api_key="sk-x")` 会**静默忽略**这个 kwarg、读回空串，
+        # 然后一路回退成 mock runner（run 照样 done）。这就是
+        # `test_build_reasoning_model_thinking_enabled_with_key` 长期失败的真因，
+        # 它被记成了"需真实 DeepSeek key"（TODO §10）——**是误诊**。
+        # 打开后字段名与别名都可用（环境变量仍走别名），赋值/构造两条路行为一致。
+        populate_by_name=True,
     )
 
     # ---- LLM（design §16.3：deepseek-v4-flash）----
     # 兼容两种环境变量：AGENTFLOW_DEEPSEEK_API_KEY（本库）与 DEEPSEEK_API_KEY（spike/.env 惯例）
-    deepseek_api_key: str = Field(default="", validation_alias=AliasChoices("AGENTFLOW_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"))
-    deepseek_base_url: str = Field(default="https://api.deepseek.com/v1", validation_alias=AliasChoices("AGENTFLOW_DEEPSEEK_BASE_URL", "DEEPSEEK_BASE_URL"))
+    # SecretStr：`repr(Settings)` 只显示 **********，取值处显式 `.get_secret_value()`。
+    # 裸 str 曾让 key 明文出现在 repr 里 —— pytest/CI 失败回溯默认打印局部变量，
+    # 会把真 key 打进构建日志（见 docs/TODO.md §24）。取原始值的写法是**故意啰嗦**的：
+    # 它让每一处"我要用明文密钥了"在 code review 里显形，也让 `grep get_secret_value` 可审计。
+    deepseek_api_key: SecretStr = Field(default=SecretStr(""), validation_alias=AliasChoices("AGENTFLOW_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"))
+    deepseek_base_url: str = Field(default="https://api.deepseek.com/v1", validation_alias=AliasChoices("AGENTFLOW_DEEPSEEK_BASE_URL", "DEEPSEEK_BASE_URL"))  # 非密钥，保持 str
     deepseek_model: str = Field(default="deepseek-v4-flash", validation_alias=AliasChoices("AGENTFLOW_DEEPSEEK_MODEL", "DEEPSEEK_MODEL"))
 
     # ---- StateStore ----
     state_store: str = "sqlite"  # sqlite | memory | postgres(M6)
     state_db_path: Path = ROOT / "data" / "agentflow.db"
-    postgres_dsn: str = "localhost:5432/agentflow?user=agentflow&password=agentflow"
+    # 连接串里带明文口令 → 同样按密钥处理。**取原始值统一走下方 `postgres_dsn(settings)`**，
+    # 那是唯一的归一化点（补 postgresql:// 前缀），别在别处直接读字段。
+    postgres_dsn: SecretStr = SecretStr("localhost:5432/agentflow?user=agentflow&password=agentflow")
 
     # ---- Queue ----
     queue: str = "memory"  # memory | kafka(M6)
@@ -56,13 +73,13 @@ class Settings(BaseSettings):
     # JWT 密钥（HS256）。非空 = 强制 Bearer JWT，tenant_id 由 claim 派生（org_id/
     # tenant_id），客户端提交的 tenant 一律忽略；为空 = dev 模式，回退显式传参
     # （本地联调，启动时告警）。
-    jwt_secret: str = ""
+    jwt_secret: SecretStr = SecretStr("")
     jwt_algorithm: str = "HS256"
     # 租户配置文件（§9.3 配额/审批人）；空 = 全部用内置默认（不限制）。
     # v5.3 起降级为 bootstrap 种子：首启导入管理库，运行时以管理库为准。
     tenants_file: str = ""
     # db_ref/凭证加密密钥（Fernet, 32B urlsafe base64，§5.3）；缺省从 jwt_secret 派生（告警）
-    secret_key: str = ""
+    secret_key: SecretStr = SecretStr("")
 
     # ---- 新租户默认数据播种（`agentflow/seed/`，见其 README）----
     # 租户库建好之后往里写一份默认数据，让它**开箱可用**：默认 workflow +
@@ -135,7 +152,7 @@ class Settings(BaseSettings):
 
     # ---- 沙箱（M4）----
     open_sandbox_domain: str = "localhost:8080"
-    open_sandbox_api_key: str = ""
+    open_sandbox_api_key: SecretStr = SecretStr("")
 
     # ---- 仓库映射（工作区准备用，§8.7.2）----
     # 工作区准备发生在 run 创建期（早于任何 agent 节点），此时还没有 MCP 调用，
@@ -154,8 +171,8 @@ class Settings(BaseSettings):
     workspace_root: Path = Path("/tmp/agentflow-workspace")
 
     # ---- 观测（可选）----
-    langfuse_public_key: str = ""
-    langfuse_secret_key: str = ""
+    langfuse_public_key: str = ""  # 公开 key，非密钥
+    langfuse_secret_key: SecretStr = SecretStr("")
     langfuse_host: str = "https://cloud.langfuse.com"
 
 
@@ -169,5 +186,7 @@ def postgres_dsn(settings: Settings) -> str:
 
     唯一归一化点：运行期 StateStore 与控制面配置 store（MCP/workflow）都复用，
     避免各处重复拼前缀漂移。
+
+    也是 ``postgres_dsn`` 这个 ``SecretStr`` **唯一取明文的地方**——调用方一律走本函数。
     """
-    return f"postgresql://{settings.postgres_dsn}"
+    return f"postgresql://{settings.postgres_dsn.get_secret_value()}"
