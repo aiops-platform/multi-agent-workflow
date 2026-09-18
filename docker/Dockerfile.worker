@@ -12,6 +12,18 @@
 #             "postgresql://agentflow:agentflow@<pg-pod-ip>:5432/agentflow"]
 FROM docker.io/library/python:3.12-slim
 
+# git：本镜像必须自带 `git` 可执行文件——`workspace.manager.GitShell` 与
+# `agents/workspace_tools.ws_git` 都是直接 `exec` git 子进程（克隆 / 提交 / 推送）。
+# 缺了它，容器形态下 committer 节点的提交会以 `git: not found` 失败。
+#
+# **不必装 ca-certificates**：基础镜像已自带且实测可用
+# （/etc/ssl/certs/ca-certificates.crt 301 条，能验证 https://github.com）。
+# `openssh-client` 也**没装**：只有 ssh:// 形式的仓库才需要；https + PAT 是当前路径，
+# 真要用 ssh 再加（届时还需 known_hosts 做主机身份校验，别用 StrictHostKeyChecking=no）。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # 先拷依赖清单，利用层缓存（仅 pyproject 变化才重跑 install）
