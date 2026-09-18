@@ -36,6 +36,15 @@ spec:
           image: agentflow-worker:local
           imagePullPolicy: IfNotPresent
           env:
+            # ⚠️ 必须给 key，否则 Worker 起得来、run 也报 done，但**每个节点都是 mock**
+            # （DAGExecutor._default_runner：睡 10ms 返回 {"ok": True}，不调 LLM、不调工具）。
+            # 这不是报错，只有 worker 日志里一行 warning（见 worker.build_node_runner）。
+            # 本地：`kubectl -n agentflow-team-alpha create secret generic agentflow-secrets
+            #        --from-literal=deepseek-api-key=$AGENTFLOW_DEEPSEEK_API_KEY`
+            # 然后解开下面两行（生产用 sealed-secret / 外部 secrets manager）。
+            # - name: AGENTFLOW_DEEPSEEK_API_KEY
+            #   valueFrom:
+            #     secretKeyRef: { name: agentflow-secrets, key: deepseek-api-key }
             - name: AGENTFLOW_QUEUE
               value: "kafka"
             - name: AGENTFLOW_KAFKA_BOOTSTRAP

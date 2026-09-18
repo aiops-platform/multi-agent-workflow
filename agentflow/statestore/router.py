@@ -115,21 +115,7 @@ class TenantStoresRouter:
         # **ensure 语义**（它已经做 CREATE DATABASE + CREATE TABLE IF NOT EXISTS），
         # 且是所有入口（provision / migrate / API 启动 / Worker 装配 / 请求路径…）的
         # 唯一咽喉，将来多一个入口也不会漏。
-        if self._settings.seed_defaults:
-            from ..seed import seed_defaults  # 惰性：与上面的 store import 同风格
-
-            try:
-                counts = await seed_defaults(workflow, mcp, agent_config, settings=self._settings)
-                if any(counts.values()):
-                    log.info(
-                        "租户 %s 播种默认数据：workflows=%d servers=%d agents=%d"
-                        "（种子非真源，见 agentflow/seed/README.md）",
-                        tenant_id, counts["workflows"], counts["servers"], counts["agents"],
-                    )
-            except Exception:
-                # 播种失败**绝不能**拖垮建库/连接——那会让该租户的所有请求 500。
-                # seed 内部已按表兜底，这里是最后一道。
-                log.exception("租户 %s 播种默认数据失败（已跳过，不影响连接）", tenant_id)
+        await _seed_if_enabled(self._settings, tenant_id, workflow, mcp, agent_config)
 
         return TenantStores(
             tenant_id=tenant_id, state=state, workflow=workflow,
@@ -147,6 +133,64 @@ class TenantStoresRouter:
         for _tid, bundle in self._cache.items():
             await bundle.aclose()
         self._cache.clear()
+
+
+async def _seed_if_enabled(
+    settings: Settings, tenant_id: str, workflow, mcp, agent_config
+) -> None:
+    """播种默认数据（空表才播、绝不覆盖）；失败**只记日志**。
+
+    抽成函数是为了让 `_build()` 与 `build_tenant_stores_at_dsn()` **共用同一份语义**
+    ——两条路径都是「拿到一个可用的租户库」，播种行为必须一致，否则 `--dsn` 部署
+    会静默拿到一个空库（有库、有表、没有 workflow 与 MCP 绑定 → run 跑完全空转）。
+    """
+    if not settings.seed_defaults:
+        return
+    from ..seed import seed_defaults  # 惰性：与上面的 store import 同风格
+
+    try:
+        counts = await seed_defaults(workflow, mcp, agent_config, settings=settings)
+        if any(counts.values()):
+            log.info(
+                "租户 %s 播种默认数据：workflows=%d servers=%d agents=%d"
+                "（种子非真源，见 agentflow/seed/README.md）",
+                tenant_id, counts["workflows"], counts["servers"], counts["agents"],
+            )
+    except Exception:
+        # 播种失败**绝不能**拖垮建库/连接——那会让该租户的所有请求 500。
+        # seed 内部已按表兜底，这里是最后一道。
+        log.exception("租户 %s 播种默认数据失败（已跳过，不影响连接）", tenant_id)
+
+
+async def build_tenant_stores_at_dsn(
+    dsn: str, tenant_id: str, settings: Settings, *, state=None
+) -> TenantStores:
+    """按**给定 DSN 直接**构造租户 bundle（不经管理库 / db_ref）。
+
+    K8s 容器形态用（`worker --dsn`）：容器内能连到的库地址与 provision 时写进管理库
+    的 db_ref **网络不同**（provision 在宿主上跑，记的是 localhost），Router 那条路
+    在容器里连不上。
+
+    但 bundle 的**形状必须与 Router 一致**：`workflows` / `mcp_servers` / `agent_configs`
+    **都在这个库里**，装配 node_runner 要读后两者。只换 StateStore 会把 MCP 绑定与
+    agent 配置一起丢掉 —— 旧 `--dsn` 分支正是如此（`agents` 零工具、run 全空转）。
+
+    ``state`` 可传入已建好的 StateStore（调用方通常已经连过一次，避免重复连接）。
+    """
+    if state is None:
+        state = PostgresStateStore(dsn)
+        await state.connect()
+    workflow = build_workflow_store_at("postgres", dsn)
+    mcp = build_mcp_store_at("postgres", dsn)
+    agent_config = build_agent_config_store_at("postgres", dsn)
+    ticket = build_ticket_store_at("postgres", dsn)
+    for s in (workflow, mcp, agent_config, ticket):
+        await s.connect()
+    await _seed_if_enabled(settings, tenant_id, workflow, mcp, agent_config)
+    return TenantStores(
+        tenant_id=tenant_id, state=state, workflow=workflow,
+        mcp=mcp, agent_config=agent_config, ticket=ticket,
+    )
 
 
 def _default_db_ref(tenant_id: str, settings: Settings) -> dict:

@@ -270,6 +270,79 @@ class WorkerPool:
             await asyncio.sleep(self._rescan_interval)
 
 
+async def build_node_runner(settings, stores: Any) -> NodeRunner | None:
+    """装配真实 node_runner（DeepSeek + per-tenant MCP + DB agent 配置）。
+
+    ``stores``：满足 ``async get(tenant_id) -> TenantStores`` 契约的对象——
+    Router 形态传 ``TenantStoresRouter``，``--dsn`` 直连形态传
+    ``_FixedStores``（同一个契约，两种取库方式）。
+
+    **两条路径必须都走到这里**：``--dsn`` 分支曾在这段装配**之前** `return`，
+    于是容器形态下每个节点都落到 ``_default_runner``（睡 10ms、返回
+    ``{"ok": True}``）——不调 LLM、不调工具，run 照样报 `done`。
+    未配置 DeepSeek key 时返回 None（mock runner 回退，本地/CI 语义）。
+    """
+    if not settings.deepseek_api_key:
+        # 显式告警：这条回退**不报错、run 照样 done**，只留一行日志——部署形态漏配
+        # 这个变量时，整条链会"跑得很成功"地空转（每个节点 `{"ok": True}`）。
+        log.warning(
+            "未配置 DeepSeek key（AGENTFLOW_DEEPSEEK_API_KEY / DEEPSEEK_API_KEY）"
+            "→ node_runner 回退为 mock：节点不调 LLM、不调工具，run 仍报 done"
+        )
+        return None
+
+    from .agents.config_sync import TenantConfigSync
+    from .agents.mcp_manager import MCPClientManager
+    from .agents.runner import AgentNodeRunner
+    from .agents.scopes import build_model
+
+    async def _mcp_store_provider(tenant_id: str | None):
+        bundle = await stores.get(tenant_id or "local")
+        return bundle.mcp
+
+    mcp_manager = MCPClientManager(stores, stores_provider=_mcp_store_provider)
+
+    # 配置热载：Worker 是独立进程，看不到 API 侧的内存代际计数器，只能按**库内指纹**
+    # 判定配置是否变过（见 agents/config_sync.py）。此前这里是永久缓存 → 绑定新 MCP
+    # server 后必须重启 Worker 才生效。
+    sync = TenantConfigSync(stores, mcp_manager, interval=settings.config_refresh_sec)
+
+    async def _agent_config_provider(tenant_id: str | None):
+        """agent 配置解析器（租户库 agent_configs 覆盖行），按指纹自动热载。"""
+        return await sync.resolver(tenant_id)
+
+    async def _server_ids_for(agent_name: str, tenant_id: str | None = None):
+        """agent → 绑定的 MCP server id 子集（租户库 agent_configs 行）。"""
+        resolver = await _agent_config_provider(tenant_id)
+        return resolver.server_ids_for(agent_name)
+
+    mcp_manager.server_ids_for = _server_ids_for
+    await mcp_manager.load()
+    runner = AgentNodeRunner(
+        build_model(settings),
+        mcp_manager=mcp_manager,
+        agent_config_provider=_agent_config_provider,
+    )
+    log.info("node_runner=agent（DeepSeek）数据源经 MCP")
+    return runner
+
+
+class _FixedStores:
+    """把一个固定 bundle 适配成 Router 的 ``.get()`` 契约（``--dsn`` 直连形态）。
+
+    为什么不能把 ``--dsn`` 分支的 StateStore 塞给装配：装配要的是
+    ``workflows`` / ``mcp_servers`` / ``agent_configs`` **三张表**所在的那个库
+    （见 ``statestore/router.build_tenant_stores_at_dsn``），只给 StateStore
+    会让 MCP 绑定与 agent 配置一起消失。
+    """
+
+    def __init__(self, bundle: Any) -> None:
+        self._bundle = bundle
+
+    async def get(self, tenant_id: str) -> Any:  # noqa: ARG002 —— 单租户形态，恒返回同一 bundle
+        return self._bundle
+
+
 async def main(argv: list[str] | None = None) -> None:
     """独立 Worker 进程入口（v5.3 §6.2 多租户形态）。
 
@@ -285,11 +358,11 @@ async def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--tenant", default=None, help="只消费该租户 topic（本地调试，无需 provision）")
     ap.add_argument("--dsn", default=None,
                     help="postgres:// 直连单库（不装配管理库/Router——K8s 容器内 DB 与 provision 时"
-                         "记录的 db_ref 网络不同时用；Worker(单库, tenant_id) 直连共享库）")
+                         "记录的 db_ref 网络不同时用；Worker(单库, tenant_id) 直连共享库。"
+                         "该 DSN 即 MCP 绑定与 agent 配置所在的那个库，node_runner 照常装配）")
     args = ap.parse_args(argv)
     settings = get_settings()
     queue = build_queue(settings)
-    node_runner = None
     # v5.3：管理库 + Router（租户 → 租户库）。Worker 未 provision 的租户时，Router 按默认
     # 策略回退（sqlite per-tenant 文件 / postgres 共享 DSN），与 API 侧一致 → 读得到 run。
     from .api.management_store import build_management_store
@@ -299,11 +372,18 @@ async def main(argv: list[str] | None = None) -> None:
     router = TenantStoresRouter(settings, mgmt)
 
     if args.tenant and args.dsn:
-        # K8s 容器直连形态：跳过管理库/Router（db_ref 网络不适用容器），单租户 topic + 单库
+        # K8s 容器直连形态：不装配管理库/Router（db_ref 网络不适用容器），单租户 topic + 单库。
+        # ⚠️ 但**只换 StateStore 会让装配丢失**：bundle 里还有这个库的 mcp_servers /
+        # agent_configs（MCP 绑定与 agent 配置），所以按同一个 DSN 把整套 bundle 建出来。
         from .statestore.postgres import PostgresStateStore
+        from .statestore.router import build_tenant_stores_at_dsn
 
         store = PostgresStateStore(args.dsn)
         await store.connect()
+        bundle = await build_tenant_stores_at_dsn(
+            args.dsn, args.tenant, settings, state=store
+        )
+        node_runner = await build_node_runner(settings, _FixedStores(bundle))
         log.info("Worker(tenant=%s, dsn 直连)：消费 %s / %s",
                  args.tenant, topic_trigger(args.tenant), topic_command(args.tenant))
         await Worker(store, queue, node_runner=node_runner, tenant_id=args.tenant).run_forever()
@@ -312,42 +392,7 @@ async def main(argv: list[str] | None = None) -> None:
     # node_runner 装配（需 router 已建：per-tenant MCP store + agent 配置路由）。
     # 此前 Worker 只传 model → 租户 MCP 绑定与 DB agent 配置全部丢失；此处补齐
     # API 侧同款装配。数据源查询全部经 MCP（design-v5.6），无进程内直连。
-    if settings.deepseek_api_key:
-        from .agents.config_sync import TenantConfigSync
-        from .agents.mcp_manager import MCPClientManager
-        from .agents.runner import AgentNodeRunner
-        from .agents.scopes import build_model
-
-        async def _mcp_store_provider(tenant_id: str | None):
-            bundle = await router.get(tenant_id or "local")
-            return bundle.mcp
-
-        mcp_manager = MCPClientManager(router, stores_provider=_mcp_store_provider)
-
-        # 配置热载：Worker 是独立进程，看不到 API 侧的内存代际计数器，只能按**库内指纹**
-        # 判定配置是否变过（见 agents/config_sync.py）。此前这里是永久缓存 → 绑定新 MCP
-        # server 后必须重启 Worker 才生效。
-        sync = TenantConfigSync(
-            router, mcp_manager, interval=settings.config_refresh_sec
-        )
-
-        async def _agent_config_provider(tenant_id: str | None):
-            """agent 配置解析器（租户库 agent_configs 覆盖行），按指纹自动热载。"""
-            return await sync.resolver(tenant_id)
-
-        async def _server_ids_for(agent_name: str, tenant_id: str | None = None):
-            """agent → 绑定的 MCP server id 子集（租户库 agent_configs 行）。"""
-            resolver = await _agent_config_provider(tenant_id)
-            return resolver.server_ids_for(agent_name)
-
-        mcp_manager.server_ids_for = _server_ids_for
-        await mcp_manager.load()
-        node_runner = AgentNodeRunner(
-            build_model(settings),
-            mcp_manager=mcp_manager,
-            agent_config_provider=_agent_config_provider,
-        )
-        log.info("node_runner=agent（DeepSeek）数据源经 MCP")
+    node_runner = await build_node_runner(settings, router)
     if args.tenant:
         log.info("Worker(tenant=%s)：消费 %s / %s",
                  args.tenant, topic_trigger(args.tenant), topic_command(args.tenant))

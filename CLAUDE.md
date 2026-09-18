@@ -104,6 +104,11 @@ make lint      # ruff 检查
    memory=进程内 WorkerPool 自动接 active 租户，kafka=`python -m agentflow.worker`
    [--tenant <id>] [--dsn postgres://…]）。**--dsn**：容器/共享库直连单租户（管理库
    db_ref 的 localhost DSN 在 k8s 容器不可达）；**--tenant**：只消费该租户 topic。
+   ⚠️ **`--dsn` 换的不只是 StateStore**：该 DSN 即 `mcp_servers`/`agent_configs` 所在
+   的库，node_runner 要按**同一个 DSN** 把整套 bundle 建出来（`build_tenant_stores_at_dsn`）。
+   只换 StateStore 会让 MCP 绑定与 agent 配置一起消失 → agent 零工具。两条路径共用
+   `worker.build_node_runner`——**别让任何分支在它之前 return**（曾如此：容器形态下
+   每个节点落到 `_default_runner`，不调 LLM、不调工具，而 run 照样报 done）。
    executor 一律经 `resume_executor` checkpoint 重建（`load_snapshot_workflow` 的
    `await` 不可删——曾缺失导致 resume 全挂）。queue 模式 approve 只做 CAS+发命令，
    零进程内 executor 依赖。pause=波间暂停。Worker 镜像 `docker/Dockerfile.worker` +
