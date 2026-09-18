@@ -160,11 +160,12 @@ curl -s --max-time 8 -X POST "http://localhost:18080/checkout?orderId=ORD2026081
 ### 6.1 构建沙箱镜像 + 加载
 ```bash
 cd $BACKEND
-# exec 服务是纯 stdlib（http.server），零 pip 依赖 → 离线可建
-docker build -t agentflow-sandbox:latest -f docker/sandbox/Dockerfile .
-# 需要 Java 编译（fix-implementer/tester 编译 Java 代码）时：
-#   docker build --build-arg WITH_JDK=1 -t agentflow-sandbox:latest -f docker/sandbox/Dockerfile .
-minikube image load agentflow-sandbox:latest
+# exec 服务是纯 stdlib（http.server），零 pip 依赖 → 基础镜像离线可建
+docker build -t agentflow-sandbox:local -f docker/sandbox/Dockerfile .
+# Java 服务的写/测试需要变体（JDK21；这一步要联网装 JDK，基础镜像不受影响）
+docker build -t agentflow-sandbox-java21:local -f docker/sandbox/Dockerfile.java21 .
+minikube image load agentflow-sandbox:local
+minikube image load agentflow-sandbox-java21:local
 ```
 
 ### 6.2 K8s 端到端验证
@@ -206,8 +207,10 @@ minikube stop                        # 停集群（保留集群数据）
 | 场景2 根因误判为场景1 的磁盘问题 | **日志窗口被污染** → 恢复上一场景 + `curl -X DELETE :19200/app-logs` 清窗后重注入 |
 | trace-analyst 把 order-service（Feign 超时）当故障服务 | get_trace 会区分「业务根因」（warranty fin 缺参）与「下游调用症状」（feign/timeout）；若仍误判，重跑一次或确保窗口干净 |
 | AgentScope streaming 收尾警告 | 无碍功能；可 `stream=False` 消除 |
-| 沙箱 Pod Error / 无法连接 | 查 `kubectl -n agentflow logs <pod>`；本地连沙箱必须 port-forward（pod IP 不可路由） |
-| 沙箱镜像构建卡死 | 网络受限 → 用纯 stdlib exec 服务（`docker/sandbox/Dockerfile` 默认无 apt/pip）；需 Java 才开 `WITH_JDK=1` |
+| 沙箱 Pod Error / 无法连接 | 查 `kubectl -n agentflow logs <pod>`；本地连沙箱必须 port-forward（exec 服务只绑 loopback，port-forward 打进 Pod loopback 正好可用） |
+| 沙箱**基础**镜像构建卡死 | 基础镜像本不该联网（无 apt/pip）——卡在 apt 说明拉错了变体 |
+| 沙箱 **java21 变体**构建卡在 `apt-get update` | 实测反复卡在拉 trixie 索引（9.6MB，`--network=host` 也一样）；同样的 apt 在普通容器里正常，属 build 环境偶发。换 registry 镜像源或重试即可，**基础镜像不受影响** |
+| `ws_write_file`/`ws_run_tests` 报"需要沙箱" | 未配 `AGENTFLOW_SANDBOX_URL` 或 sidecar 没起来。**这是设计内行为**：它们执行仓库代码，不会回退到 worker 本地跑 |
 
 ## 9. 依赖
 

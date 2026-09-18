@@ -84,9 +84,9 @@ Agent 运行在 AgentScope（锁定 2.0.3，模型 DeepSeek deepseek-v4-flash）
 - ⚠️ 新租户 provision 后 `workflows` 表是空的，**发不了 run**——见 `docs/TODO.md` §13
 
 ### Docker
-- 职责：沙箱镜像：纯 stdlib http.server 的 exec 服务（零 pip 依赖、离线可建），带可选 `WITH_JDK` 构建参数以支持 Java 编译。
+- 职责：沙箱镜像，**分两层**——基础镜像（纯 stdlib http.server 的 exec 服务，零 pip 依赖、**永远可离线构建**，不含工具链/git/密钥）+ 按 runtime 叠加的变体（如 `Dockerfile.java21` 加 JDK21）。工具链与"零依赖离线可建"是矛盾的，所以不揉进一个 Dockerfile。
 - 位置：`docker/sandbox/**`
-- 入口：`docker/sandbox/Dockerfile`
+- 入口：`docker/sandbox/Dockerfile`（基础）/ `docker/sandbox/Dockerfile.java21`（Java 变体）
 - 何时可跳过：除非你在改沙箱镜像或新增运行时（例如 Java）。
 
 ## 踩坑清单

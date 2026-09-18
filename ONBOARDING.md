@@ -67,9 +67,9 @@ Skip unless: Skip unless you are authoring or extending workflow definitions.
 ⚠️ A freshly provisioned tenant has an **empty** `workflows` table and cannot start a run — see `docs/TODO.md` §13.
 
 ### Docker
-What it does: Sandbox image: pure-stdlib http.server exec service (zero pip deps, offline-buildable), with an optional WITH_JDK build arg for Java compilation.
+What it does: Sandbox images, in two layers — a base image (pure-stdlib http.server exec service, zero pip deps, always offline-buildable, no toolchains/git/secrets) plus per-runtime variants (e.g. Dockerfile.java21 adds JDK21). Toolchains and "zero-dep offline build" contradict each other, so they are not merged into one Dockerfile.
 Where it lives: `docker/sandbox/**`
-Entry point: `docker/sandbox/Dockerfile`
+Entry point: `docker/sandbox/Dockerfile` (base) / `docker/sandbox/Dockerfile.java21` (Java variant)
 Skip unless: Skip unless you are modifying the sandbox image or adding a runtime (e.g. Java).
 
 ## Gotchas

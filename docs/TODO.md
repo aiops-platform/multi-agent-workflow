@@ -115,6 +115,38 @@
 够不着任何需要认证的东西；能做的只剩探测内网与外泄仓库内容。这个边界够不够，
 取决于租户仓库里有没有本身敏感的代码——**这是你要拍的**。
 
+#### 换成 B 的代价（2026-09-18 核实，**当前建议保持 A**）
+
+**对 agent 的调用方式零差别**——`SandboxClient` 接口、工具签名、fail-closed 语义都不变，
+唯一变的是 `AGENTFLOW_SANDBOX_URL` 的值。差别全在"沙箱什么时候可用、能不能看见代码"：
+
+| | sidecar（A） | 独立 Pod（B） |
+|---|---|---|
+| 工作区共享 | `emptyDir` 够用（同 Pod 天然共享） | **必须 RWX PVC** |
+| 冷启动 | 随 Pod 就绪 | `_wait_ready(timeout=180)`，**最长等 3 分钟** + 拉 JDK 镜像 |
+| gradle 缓存 | **跨 run 复用**（worker Pod 处理该租户多个 run，卷是 Pod 级） | 每 run 重下 ~130MB 发行版 + 全部依赖 |
+| 故障域 | 沙箱崩 = worker 一起崩 | 沙箱崩 worker 还在，但多一套 Pod 生命周期 |
+
+⚠️ **B 现在有条走不通的默认路径**：`sandbox/orchestrator.py:98` 的默认分支是
+`empty_dir={}`，而 **`emptyDir` 跨 Pod 不可共享**——独立沙箱 Pod 拿到的是它自己的空目录，
+**看不见 worker clone 的仓库**。必须显式传 `workspace_pvc` 才成立。而 RWX 在本地
+minikube 上一般没有（只有 hostPath / RWO），RWO **不能被两个节点同时挂** →
+worker 与沙箱必须同节点。**本地单节点能跑通，多节点生产集群不成立。**
+
+**不可兼得的一对**：
+
+```
+要出口控制（NetworkPolicy 按 Pod 生效）  →  必须独立 Pod
+要 gradle 缓存 + 零冷启动              →  必须 sidecar
+```
+
+共享 netns 就没法区分两者，这是 A 的固有代价。
+
+**改口的时机**：仓库数涨到几十个，或租户仓库里确实有敏感内容（如带凭据的配置文件）
+——那时"外泄仓库内容"成了真威胁，"多等一次 gradle 下载"就不算什么了。
+在此之前，把 `hostNetwork: true` 去掉（生产本就不该有，不去掉任何策略都是空转）
+比换 B 更划算。
+
 - 仍未做：exec 服务 token 校验（若走 B，它就是主要控制；走 A 时 loopback 已覆盖大部分）
 
 ---

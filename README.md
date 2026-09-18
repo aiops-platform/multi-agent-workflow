@@ -122,7 +122,8 @@ scripts/
 ├── mock_mcp_server.py      # MCP 配置页测试用 mock server（mcp v1 FastMCP）
 └── verify_sandbox.py       # 沙箱 K8s 端到端验证
 docker/
-├── sandbox/               # 沙箱镜像（stdlib-only，离线可建；WITH_JDK=1 加 Java）
+├── sandbox/               # 沙箱镜像：Dockerfile（基础，stdlib-only 离线可建）
+│                          #          + Dockerfile.java21（变体：JDK21，按 runtime 叠加）
 └── Dockerfile.worker      # Worker 镜像（python:3.12-slim + 在线 pip 装 agentflow）
 deploy/
 └── worker-deployment.yaml # v5.3 §6.2 每租户 Worker Deployment（示例 team-alpha）
@@ -134,9 +135,12 @@ tests/                 # 300+ tests（DAG/幂等/Resume/审批/Worker/队列/多
 ## M4 沙箱（独立执行 Pod）
 
 ```bash
-# 1. 构建沙箱镜像（stdlib-only 离线可建；需要 Java 编译时加 --build-arg WITH_JDK=1）
-docker build -t agentflow-sandbox:latest -f docker/sandbox/Dockerfile .
-minikube image load agentflow-sandbox:latest
+# 1. 构建沙箱镜像（基础镜像离线可建）
+docker build -t agentflow-sandbox:local -f docker/sandbox/Dockerfile .
+# Java 服务的写/测试需要变体（JDK21；需联网，基础镜像不受影响）
+docker build -t agentflow-sandbox-java21:local -f docker/sandbox/Dockerfile.java21 .
+minikube image load agentflow-sandbox:local
+minikube image load agentflow-sandbox-java21:local
 
 # 2. K8s 端到端验证（拉起沙箱 Pod → exec → 销毁）
 ./venv/bin/python scripts/verify_sandbox.py

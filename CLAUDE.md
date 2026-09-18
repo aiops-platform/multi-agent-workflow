@@ -213,7 +213,11 @@ make lint      # ruff 检查
    HEAD 必须 == base_sha，漂移报 `FrozenVersionMismatch`。每个 Run 用 `aiops/RUN_{run_id}` 分支隔离。
 9. **工具权限**（§9.5）：`build_agent` 默认 DONT_ASK + agent 注册工具的 allow 规则。
    没有 allow 规则时 DONT_ASK 下工具全部 DENY（联调踩过：agent 只能靠提示词推理）。
-   `build_permission_context` 生成上下文；租户 deny 规则 M5 接入。
+   `build_permission_context` 生成上下文。
+   ⚠️ **原写的"租户 deny 规则 M5 接入"是未兑现的承诺**——`sandbox/policy.ToolPolicy`
+   全类**零运行期消费方**，`build_permission_context` 只从 tool registry 生成 allow、
+   完全不读它，所以**租户 deny 规则从未生效过**（另：`runner.py` 调它时没传
+   `tenant_id`，一律落到默认 `"local"`）。见 `docs/TODO.md` §23.3。
 9.4 **生产适配器（M6）**：`queue/kafka.py`（kafka-python 双队列）、`statestore/postgres.py`
    （§8.8 完整 PG schema）、`lock/redis.py`（SET NX PX + token 校验防误删，**注意 redis get
    返回 bytes，token 比较需 decode**）。配置驱动切换（config.py）。真实 broker/DB 的故障恢复
@@ -223,11 +227,38 @@ make lint      # ruff 检查
    （无字段）与 `.output.field` 都必须正确解析——"output" 是标准访问器，**不能当字段遍历**
    （曾因遍历 `output["output"]` 返回 None，导致所有 workflow params 静默失效；`when` 条件
    用 expressions.get_path 无此问题）。改 params 解析必跑 `test_param_resolution_output_accessor`。
-9.6 **沙箱（M4）**：`sandbox/exec_service.py` 是**纯 stdlib http.server**（镜像零 pip 依赖，
-   离线可建；加 Java 用 `--build-arg WITH_JDK=1`，默认关）。SandboxClient 本地联调经
-   `kubectl port-forward`（macOS 宿主不可路由 pod IP；生产 Worker 在集群内直连 ClusterIP）。
-   ActionExecutor 动作是**有限集合 + 白名单**（§10.3），新增动作需评审。
-   ToolPolicy：deny 优先 → allow → 兜底 DENY（§9.5）。
+9.6 **沙箱（M4）——写与测试的执行边界**。判据一句话：**谁持有密钥，谁不执行不可信代码。**
+
+   - **镜像分两层**：`docker/sandbox/Dockerfile`（基础）**永远可离线构建**，只跑 exec
+     服务、不含工具链/不含 git/不含密钥；按 runtime 叠加变体
+     `Dockerfile.java21`（JDK21 + `GRADLE_USER_HOME` 卷）。**没有 `WITH_JDK` 构建参数了**
+     ——工具链与"零依赖离线可建"是矛盾的，揉在一起会让基础镜像的构建条件看开关。
+     Java 服务只装 JDK、不装 gradle：`./gradlew` 自带 wrapper（`java -jar
+     gradle-wrapper.jar` 下载，不需要 wget/curl/unzip）。
+   - **exec 服务默认只绑 loopback**（`SBX_HOST` 是显式逃生阀）。它**没有认证**，
+     绑 `0.0.0.0` 会顺着 `hostNetwork` 暴露到节点网络。
+   - **worker Pod 加 sidecar + 共享卷**（`deploy/worker-deployment.yaml`），两容器同挂
+     `/workspace`；worker 的 `AGENTFLOW_WORKSPACE_ROOT` 必须与沙箱 `SBX_WRITABLE`
+     指向**同一挂载点**，否则写校验必失败。沙箱容器**零 `AGENTFLOW_*`**。
+   - **哪些工具经沙箱**（`agents/tools.WORKSPACE_SANDBOXED`）：
+     `ws_write_file` / `ws_run_tests` **必须经**（它们执行仓库代码）；
+     `ws_read_file` / `ws_list_files` **刻意不经**——诊断链的 `code-locator` 靠它们，
+     读也依赖沙箱会让沙箱一挂、整条诊断链就跑不起来。`ws_git` 留在 worker（要 PAT，
+     且已禁仓库 hook）。**未接线沙箱时那两个工具调用即报错，绝不回退本地执行。**
+   - **`AGENTFLOW_TEST_CMDS`（JSON）决定每服务能跑什么命令**，`ws_run_tests` **不接受
+     调用方传参**。旧实现让 LLM 传自由命令再拿前缀白名单去猜，而白名单里含 `bash `，
+     等于没有白名单。
+   - **`ws_git` 一律带 `-c core.hooksPath=/dev/null`**：`git commit` 会执行仓库自带的
+     `pre-commit`，而 `.git/hooks/` 也在可写的工作区里——不堵就是"不可信仓库在持有
+     全部密钥的 worker 里执行任意代码"。
+   - **网络隔离在当前形态下做不到**（sidecar 与 worker 共享 netns；NetworkPolicy 按 Pod
+     选且 hostNetwork 下不生效）。分叉与理由见 `docs/TODO.md` §3。
+   - ActionExecutor 动作是**有限集合 + 白名单**（§10.3），新增动作需评审。
+     ⚠️ **`ToolPolicy`（deny 优先 → allow → 兜底 DENY）目前是空转**：那个类没有任何
+     运行期消费方，真正生效的是 `build_permission_context`（只生成 allow、不读它），
+     **租户 deny 规则从未生效**。别照着这行写代码，见 `docs/TODO.md` §23.3。
+   - SandboxClient 本地联调仍可经 `kubectl port-forward`（打进 Pod loopback，绑
+     127.0.0.1 不受影响）。
 10. **真实数据源 = MCP server**（v5.5）：查询逻辑在
     `aiops-mcp-servers/servers/aiops-datasource-mcp-server`（独立仓库）。要点：
     - **查询必须带时间区间与目标**：`start_time`/`end_time` 必填（ISO8601），窗口由
