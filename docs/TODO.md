@@ -86,6 +86,37 @@
 - 无 egress 控制（沙箱可外联）
 - 目标：exec 服务加 token 校验 + NetworkPolicy 限定出口
 
+### ✅ 部分已实施（2026-09-18）
+
+- **默认只绑 loopback**（原为 `0.0.0.0`）。它没有认证，绑 0.0.0.0 会顺着
+  `hostNetwork` 直接暴露到**节点网络**——同集群任何能路由到该节点的东西都能
+  POST /exec 执行任意命令。loopback 下只有同 Pod 的 worker 够得着，
+  本地 `kubectl port-forward`（打进 Pod loopback）不受影响。
+  `SBX_HOST` 是显式逃生阀，跨 Pod 访问要自己承担风险。
+
+### ⚠️ 遗留：出口控制**在当前形态下做不到**（需要先做设计分叉）
+
+原目标里的"NetworkPolicy 限定出口"**在 sidecar 形态下无法实现**，两条硬约束：
+
+1. **NetworkPolicy 按 Pod 选，而 sidecar 与 worker 共享网络命名空间**——
+   没有写法能"只掐沙箱的网、放行 worker 的网"。
+2. 本地 Pod 是 `hostNetwork: true`，而 hostNetwork Pod **在多数 CNI 下不走
+   NetworkPolicy**——即使写了策略也是空转。
+
+**分叉（需定）**：
+
+| | 形态 | 出口控制 | 工作区共享 | 代价 |
+|---|---|---|---|---|
+| **A（当前）** | sidecar + emptyDir | ❌ 做不到 | ✅ 同 Pod 卷 | 最小；靠"沙箱无凭据"兜底 |
+| **B** | 沙箱独立 Pod | ✅ 按 Pod 生效 | ❌ 需换 PVC | 多一套生命周期；对应 §9.3 那个一直没实现的 `max_sandboxes` |
+| C | sidecar + Pod 内出口代理 | ⚠️ 部分 | ✅ | 代理本身要维护，且绕不过 hostNetwork |
+
+选 A 的兜底逻辑是：沙箱**没有任何凭据**（拿不到 PAT / DB DSN / 模型 key），
+够不着任何需要认证的东西；能做的只剩探测内网与外泄仓库内容。这个边界够不够，
+取决于租户仓库里有没有本身敏感的代码——**这是你要拍的**。
+
+- 仍未做：exec 服务 token 校验（若走 B，它就是主要控制；走 A 时 loopback 已覆盖大部分）
+
 ---
 
 ## 4. ⭐⭐ JWT 生产化：JWKS + 前端 Bearer（阻塞 JWT 模式上线）

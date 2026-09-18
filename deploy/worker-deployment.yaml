@@ -7,6 +7,16 @@
 #   - Worker 经 `--dsn` 直连共享 PG（单库 + 租户 topic 形态），不读管理库 db_ref（容器内不可达 localhost）。
 #
 # 生产（每租户真分支镜像）：image=registry/agentflow:{tenant}-{sha}，同 ns 内 ClusterIP 连中间件。
+#
+# ⚠️ **网络隔离在本形态下做不到，别以为加了 sidecar 就隔离了网络**（2026-09-18 核实）：
+#   1. K8s NetworkPolicy **按 Pod 选**，而 sidecar 与 worker **共享网络命名空间**——
+#      没有任何写法能"只掐沙箱的网、放行 worker 的网"。
+#   2. 本 Pod 是 `hostNetwork: true`，而 hostNetwork Pod **在多数 CNI 下根本不走
+#      NetworkPolicy**。也就是说本地这套即使写了策略也是空转。
+#   现状下沙箱的网络可达性与 worker 完全相同；真正兜底的是"**沙箱没有任何凭据**"
+#   （拿不到 PAT / DB DSN / 模型 key，够不着任何需要认证的东西）。
+#   要真正的出口控制，得把沙箱拆成**独立 Pod**（配 PVC 共享工作区），届时
+#   NetworkPolicy 才按 Pod 生效——见 docs/TODO.md §3 的分叉。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
