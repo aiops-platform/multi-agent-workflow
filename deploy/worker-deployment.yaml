@@ -51,6 +51,10 @@ spec:
               value: "10.89.0.9:9092"
             - name: AGENTFLOW_RUN_MODE
               value: "queue"
+            # 工作区根：必须与沙箱的挂载点一致（sidecar 里 SBX_WRITABLE=/workspace）。
+            # 默认是 /tmp/agentflow-workspace，两个容器挂不到一起，会一直踩写校验失败。
+            - name: AGENTFLOW_WORKSPACE_ROOT
+              value: "/workspace"
           command:
             - python
             - -m
@@ -59,6 +63,51 @@ spec:
             - team-alpha
             - --dsn
             - "postgresql://agentflow:agentflow@10.89.0.2:5432/agentflow"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
           resources:
             requests: { cpu: "500m", memory: "1Gi" }
             limits: { cpu: "2", memory: "4Gi" }
+
+        # ---- 沙箱 sidecar：写文件 + 跑测试（§10.2）----
+        #
+        # ⚠️ **这个容器一个凭据都不能有**。它执行的是仓库里的代码
+        # （`build.gradle` 本身就是可执行脚本），而 worker 持有 DeepSeek key /
+        # DB DSN / MCP 凭证 / git PAT。判据：**谁持有密钥，谁不执行不可信代码。**
+        # 所以这里**没有** AGENTFLOW_DEEPSEEK_API_KEY、没有 --dsn、没有 PAT。
+        #
+        # 定位靠 loopback：两容器同 Pod 同网络命名空间，worker 用
+        # http://127.0.0.1:44772 寻址；exec 服务默认只绑 loopback（它**没有认证**，
+        # 绑 0.0.0.0 会顺着 hostNetwork 暴露到节点网络）。
+        - name: sandbox
+          image: agentflow-sandbox-java21:local
+          imagePullPolicy: IfNotPresent
+          env:
+            # 与 worker 的 AGENTFLOW_WORKSPACE_ROOT 必须**指向同一个挂载点**，
+            # 否则 exec 服务的写校验（writable_allowlist）会拒绝 worker 拉下来的仓库。
+            - name: SBX_WRITABLE
+              value: "/workspace:/tmp"
+          # 只读根文件系统 + 禁提权：sandbox 只该往共享卷和 /tmp 写
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false  # gradle 需要写 $GRADLE_USER_HOME
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: gradle-home
+              mountPath: /gradle-home
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "2", memory: "4Gi" }
+
+      volumes:
+        # 工作区：run 级临时数据，Pod 一死即回收（不需要 PVC 生命周期管理）。
+        # 布局 {root}/{tenant}/{run}/repos/{service} —— root 由 worker 的
+        # AGENTFLOW_WORKSPACE_ROOT 指定，两个容器挂同一份。
+        - name: workspace
+          emptyDir: {}
+        # gradle 发行版 + 依赖缓存。**首次构建要联网**（~130MB + Maven Central），
+        # 预热后即可断网跑测试。缓存与 gradle 版本绑定，多服务时按服务分卷。
+        - name: gradle-home
+          emptyDir: {}

@@ -173,7 +173,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": f"unknown: {self.path}"})
 
 
-def create_server(host: str = "0.0.0.0", port: int = 44772) -> ThreadingHTTPServer:
+def create_server(host: str = "127.0.0.1", port: int = 44772) -> ThreadingHTTPServer:
+    """默认只绑 **loopback**。
+
+    本服务**没有认证**（只要连上就能 POST /exec 执行任意 shell）。绑 ``0.0.0.0`` 等于
+    把它挂到网络上——在 ``hostNetwork: true`` 的 Pod 里就直接暴露到**节点网络**。
+    需要它的只有同 Pod 的 worker（走 127.0.0.1），所以默认不对外。
+
+    ``kubectl port-forward`` 打进的是 Pod 的 loopback，绑 127.0.0.1 依然可用，
+    本地联调不受影响。真要跨 Pod 访问（不推荐）再显式设 ``SBX_HOST``。
+    """
     return ThreadingHTTPServer((host, port), _Handler)
 
 
@@ -190,6 +199,9 @@ if __name__ == "__main__":  # pragma: no cover
         _self_test()
     else:
         port = int(os.environ.get("SBX_PORT", 44772))
-        srv = create_server(port=port)
-        print(f"sandbox-exec listening on :{port}", flush=True)
+        # 默认 loopback（见 create_server 的 docstring）：本服务无认证，
+        # 绑 0.0.0.0 会把 exec 能力暴露到节点网络。跨 Pod 访问需显式设 SBX_HOST。
+        host = os.environ.get("SBX_HOST", "127.0.0.1")
+        srv = create_server(host=host, port=port)
+        print(f"sandbox-exec listening on {host}:{port}", flush=True)
         srv.serve_forever()
