@@ -1412,12 +1412,23 @@ Worker 日志             →  [run_xxx] run 已终态，忽略 resume      ← 
 （否则 `monkeypatch.setattr(s, "jwt_secret", "x")` 塞进裸 str，`.get_secret_value()` 报 AttributeError）。
 **该测试现已通过**，§10 的"需真实 key"描述作废。
 
+### ✅ 顺带修掉：`tenantctl` 五处回显解密后的 db_ref DSN
+
+DSN 含明文口令，打进终端回滚 / CI 日志 / 截图就收不回来；`CLAUDE.md` 早有
+「任何 API 不回显 DSN」，CLI 只是没被那条规则覆盖。改为统一经
+`tenants.mask_dsn()`：**只打口令，host/port/库名/用户名原样保留**
+（排查要用），两种凭据位置（netloc 与 query）都覆盖。实测输出：
+
+```
+[tenantctl] 🆕 已创建租户库 postgresql://agentflow:***@10.89.0.2:5432/agentflow-team-x
+```
+
+守卫方式不是靠人眼——`tests/test_dsn_masking.py` 用 **AST 扫描** tenantctl 的每个
+`print(...)`：凡取出 `'dsn'` 值而未过 `mask_dsn` 的即报错（含一条**自检**，
+确保守卫本身在重构后不会静默失效）。
+
 ### 残留（未修）
 
-- **`tenantctl.py` 三处 stdout 打印解密后的 db_ref DSN**（`:161` / `:288` / `:290`，
-  另 `:155` 的变更提示）：DSN 含明文口令，会留在终端回滚、CI 日志、截图里。
-  与 `CLAUDE.md` 既有的「任何 API 不回显 DSN」是同一原则。改法很轻
-  （只打 host/port/dbname、口令打码），但**可能有人在解析这行输出**，故未擅自改。
 - **K8s 侧（非本仓代码）**：`kubectl create secret --from-literal=...` 把明文放进
   **进程 argv**（`ps` 可见），改用 `--from-env-file` / stdin；Secret 默认**只是 base64**，
   `kubectl get secret -o yaml` 即可读，etcd 未配 encryption-at-rest 时落盘也是明文

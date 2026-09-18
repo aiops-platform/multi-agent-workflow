@@ -32,6 +32,7 @@ from .tenants import (
     _default_db_ref,
     drop_tenant_database,
     ensure_tenant_database,
+    mask_dsn,
 )
 
 log = logging.getLogger("agentflow.tenantctl")
@@ -151,14 +152,14 @@ async def provision(args) -> int:
             if old and old.get("dsn") and old["dsn"] != db_ref.get("dsn"):
                 print(
                     f"[tenantctl] ⚠ 租户 {args.tenant} 的库引用已变更：\n"
-                    f"            旧 → {old['dsn']}\n"
-                    f"            新 → {db_ref.get('dsn')}\n"
+                    f"            旧 → {mask_dsn(old['dsn'])}\n"
+                    f"            新 → {mask_dsn(db_ref.get('dsn'))}\n"
                     f"            旧库数据**不会**自动搬迁，仍保留在原处。"
                 )
 
         # 建库（幂等）：postgres 下每租户一个独立 database
         if await ensure_tenant_database(db_ref, settings):
-            print(f"[tenantctl] 🆕 已创建租户库 {db_ref['dsn']}")
+            print(f"[tenantctl] 🆕 已创建租户库 {mask_dsn(db_ref['dsn'])}")
 
         await mgmt.upsert_tenant({
             "tenant_id": args.tenant,
@@ -192,7 +193,7 @@ async def provision(args) -> int:
             ensure_namespace(args.namespace or f"agentflow-{args.tenant}")
         print(
             f"[tenantctl] ✅ provision {args.tenant}: isolation={isolation} "
-            f"db={db_ref.get('dsn') or db_ref.get('path')} "
+            f"db={mask_dsn(db_ref.get('dsn') or db_ref.get('path'))} "
             f"namespace={args.namespace or f'agentflow-{args.tenant}'} "
             f"schema={SCHEMA_VERSION} "
             f"workflows={seeded['workflows']} servers={seeded['servers']} "
@@ -285,9 +286,12 @@ async def deprovision(args) -> int:
                 Path(db_ref["path"]).unlink(missing_ok=True)
                 print(f"[tenantctl] 🗑  已删除租户库文件 {db_ref['path']}")
             elif await drop_tenant_database(db_ref, settings):
-                print(f"[tenantctl] 🗑  已删除租户库 {db_ref['dsn']}")
+                print(f"[tenantctl] 🗑  已删除租户库 {mask_dsn(db_ref['dsn'])}")
             else:
-                print(f"[tenantctl] ⚠ 未删除租户库（指向共享基础库或不存在）：{db_ref.get('dsn')}")
+                print(
+                    "[tenantctl] ⚠ 未删除租户库（指向共享基础库或不存在）："
+                    f"{mask_dsn(db_ref.get('dsn'))}"
+                )
         return 0
     finally:
         await mgmt.close()

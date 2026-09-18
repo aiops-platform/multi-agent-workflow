@@ -11,6 +11,7 @@ v5.3 起**运行时以管理库为准**：``TenantRegistry.from_management`` 从
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -189,6 +190,53 @@ def dsn_with_db(dsn: str, dbname: str) -> str:
 
     u = urlsplit(dsn)
     return urlunsplit((u.scheme, u.netloc, "/" + dbname, u.query, u.fragment))
+
+
+#: query 形态的口令键（大小写不敏感）。**必须连分隔符一起捕获**——只捕获键名的话
+#: 替换会把 `&` 吃掉，`?user=u&password=p` 会变成 `?user=u password=***`。
+#: 值用 `[^&]+`（非空）：`password=` 本就为空，打码成 `***` 反而是误导。
+_PASSWORD_KV = re.compile(r"(?i)(^|&)((?:password|pwd))=[^&]+")
+
+
+def mask_dsn(dsn: str | None) -> str:
+    """DSN → 可安全打印的形式：**只把口令打码，其余原样保留**。
+
+    为什么要有这个函数：DSN 里带明文口令，一旦打进终端回滚 / CI 日志 / 截图就收不回来。
+    但 ``tenantctl`` 需要"建了哪个库"这个信息——host / port / 库名 / 用户名都有用，
+    **只有口令没有**。这与 `CLAUDE.md` 既有的「任何 API 不回显 DSN」是同一条原则，
+    CLI 只是没被那条规则覆盖到（见 `docs/TODO.md` §24）。
+
+    两种凭据位置都要处理——本仓**两种都存在**（见 `dsn_with_db` 的注释）：
+
+    - netloc：``postgresql://user:pass@host:5432/db`` → ``postgresql://user:***@host:5432/db``
+      （``--db-dsn`` / K8s manifest 走这条）
+    - query ：``postgresql://host:5432/db?user=u&password=p`` → ``…&password=***``
+      （``postgres_dsn(settings)`` 产出的形态）
+
+    空值原样返回（``None`` → ``"None"``）：调用方靠它区分"没有 DSN"，别在这里改语义。
+    非 URL 串（如 sqlite 路径）原样返回，不报错。
+
+    > 另有一处**语义不同**的打码，别合并：``workspace/manager.py`` 的
+    > ``GitShell._sanitize`` 处理的是 git 的 http(s) URL——那里的 userinfo 往往
+    > **整段就是 PAT**（没有 ``user:pass`` 结构），所以它把 userinfo 整个打掉。
+    > 本函数要保留用户名（排查用），只打口令。两者目标不同，各留各的。
+    """
+    if not dsn:
+        return str(dsn)
+
+    from urllib.parse import urlsplit, urlunsplit
+
+    u = urlsplit(dsn)
+
+    netloc = u.netloc
+    if "@" in netloc:
+        userinfo, _, host = netloc.rpartition("@")
+        user, sep, _pw = userinfo.partition(":")
+        # 无口令（`user@host`）时原样保留，别凭空造一个 `user:***`
+        netloc = f"{user}:***@{host}" if sep else netloc
+
+    query = _PASSWORD_KV.sub(r"\1\2=***", u.query)
+    return urlunsplit((u.scheme, netloc, u.path, query, u.fragment))
 
 
 def tenant_db_name(base_dsn: str, tenant_id: str) -> str:
