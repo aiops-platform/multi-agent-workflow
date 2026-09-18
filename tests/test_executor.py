@@ -363,6 +363,55 @@ edges:
     assert "requestId" in fin_output["params"]["ev"]["error"]
 
 
+async def test_on_failure_continue_negative_evidence_is_readable_downstream() -> None:
+    """负证据的形状必须**与正常输出同构**——否则下游读到的不是"失败"而是 null。
+
+    缺陷形态：executor 只返回 ``{"found": False, "error": ...}``，而四个取证 agent 的
+    schema 都把 ``summary`` 列为 ``required``、下游 ``rca`` 读的也正是
+    ``$.nodes.<id>.output.summary``。于是**「这一路取证失败了」在下游眼里变成
+    「这一路什么都没说」**——负证据要能被读到，才叫负证据。
+    """
+    from agentflow.core.workflow import Workflow
+
+    yaml_text = """
+name: negative-evidence-shape
+version: "1.0.0"
+inputs: {}
+nodes:
+  logs:
+    agent: log-analyst
+    on_failure: continue
+  rca:
+    agent: root-cause
+    params: { logs: "$.nodes.logs.output.summary" }
+edges:
+  - { from: logs, to: rca }
+"""
+    wf = Workflow.load_yaml(yaml_text)
+
+    async def runner(node, params):
+        if node.id == "logs":
+            raise RuntimeError("ES 连接超时")
+        return {"node": node.id, "params": params}
+
+    ex = DAGExecutor(
+        "run_neg", "t", wf.dag, InMemoryStateStore(), node_runner=runner, inputs={}
+    )
+    assert await ex.run() == "done"
+
+    ev = ex.get_output("logs")
+    assert ev["found"] is False
+    assert isinstance(ev["summary"], str) and ev["summary"]
+    assert "ES 连接超时" in ev["summary"]
+    # 负证据必须自述"不是无异常"——下游最容易误读的就是这一点
+    assert "不是" in ev["summary"]
+
+    # 关键判据：下游按图里写的方式读，拿到的是**字符串**，不是 None
+    got = ex.get_output("rca")["params"]["logs"]
+    assert got is not None
+    assert got == ev["summary"]
+
+
 async def test_node_wallclock_timeout_marks_failed() -> None:
     """node.timeout 墙钟上限：慢 runner 超时 → 节点失败 → 整条链 abort。"""
     from agentflow.core.workflow import Workflow

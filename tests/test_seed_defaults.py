@@ -7,9 +7,12 @@ agent↔server 绑定的话，run 能跑完但**每个 agent 零工具**（"看�
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from agentflow.agents.agent_config import AgentConfigResolver
+from agentflow.agents.prompts import AGENT_SCHEMAS
 from agentflow.agents.registry import DIAGNOSE_AGENTS, FIX_AGENTS
 from agentflow.api.agent_store import AgentConfigStore
 from agentflow.api.mcp_store import MCPStore
@@ -64,6 +67,61 @@ def test_seed_corpus_is_valid_and_nonempty() -> None:
     server_names = {s["name"] for s in plane["servers"]}
     for agent, names in plane["bindings"].items():
         assert set(names) <= server_names, f"{agent} 绑了未声明的 server: {names}"
+
+
+def test_seed_params_reference_real_schema_fields() -> None:
+    """种子里每个 ``$.nodes.<id>.output.<field>`` 都必须指向**真实存在**的字段。
+
+    为什么值一条测试：``params`` 引用不存在的字段**不报错、不加载失败**，只是**恒解析为
+    None**——节点照跑、run 照报 done，只有去核数据形状才发现入参是空的。
+
+    实际踩到过：两个 workflow 的 ``recap`` 都写 ``status: "$.nodes.commit.status"``
+    （注意**连 ``.output`` 访问器都没有**），而 ``CommitSchema`` 里没有任何叫 ``status``
+    的字段（只有 pr_url / pr_number / base_sha）——``_walk`` 遇失配键返回 None，
+    实测 20+ 条 run 该入参**全是 null**，"这次提交到底成没成"从来没到达复盘 agent。
+    这条测试就是那次漏网的补网。
+
+    两种写法都要查：``$.nodes.X.output.<field>`` 与漏了访问器的 ``$.nodes.X.<field>``
+    ——后者在前缀剥离后**同样**是在节点输出字典里查键（`_resolve_param` 只在
+    ``field.startswith("output")`` 时才剥前缀），所以用同一套 schema 判据即可。
+    """
+    pat = re.compile(r"^\$\.nodes\.([\w-]+)(?:\.(.+))?$")
+
+    checked = 0
+    for w in load_workflow_seeds():
+        dag = Workflow.load_yaml(w["yaml"]).dag
+        for nid, node in dag.nodes.items():
+            for pname, path in (node.params or {}).items():
+                if not isinstance(path, str):
+                    continue
+                m = pat.match(path.strip())
+                if m is None:
+                    continue
+                src, rest = m.group(1), m.group(2)
+                assert src in dag.nodes, f"{w['id']} {nid}.{pname} 引用了不存在的节点 {src}"
+                if not rest:
+                    continue  # `$.nodes.X` → 整个输出，无字段可查
+                field = rest
+                if field.startswith("output"):
+                    field = field[len("output"):].lstrip(".")
+                if not field or field.startswith("["):
+                    continue  # 整个 output / 纯下标：取的是值本身，非字段
+                head = field.split(".")[0].split("[")[0]
+                if not head:
+                    continue
+                agent = dag.nodes[src].agent
+                schema = AGENT_SCHEMAS.get(agent)
+                assert schema is not None, (
+                    f"{w['id']} {nid}.{pname}：{src} 的 agent={agent!r} 没有输出 schema，"
+                    "无法核对字段是否存在"
+                )
+                assert head in schema.get("properties", {}), (
+                    f"{w['id']} {nid}.{pname} -> {path}：字段 {head!r} 不在 {agent} 的"
+                    f"输出 schema 里（可用：{sorted(schema.get('properties', {}))}）"
+                    "——引用不存在的字段不会报错，只会**恒为 null**"
+                )
+                checked += 1
+    assert checked > 0, "一条 params 引用都没查到——正则或种子结构变了，本测试已失效"
 
 
 def test_seed_missing_source_is_noop(monkeypatch) -> None:

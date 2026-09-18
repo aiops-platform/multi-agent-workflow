@@ -278,7 +278,14 @@ nodes:
       rca: "$.nodes.rca.output"
       fix: "$.nodes.fix.output"
       remediate: "$.nodes.remediate.output"
-      status: "$.nodes.commit.status"
+      # 原为 `status: "$.nodes.commit.status"` —— 但 CommitSchema 里**没有** `status`
+      # （只有 pr_url / pr_number / base_sha），该入参实测**恒为 null**（20+ 条 run 全是）。
+      # 于是"这次提交到底成没成"从来没到达复盘 agent。
+      #
+      # 改成传 commit 的**整个输出**：有 `pr_url` ⇒ 已提交；`null` ⇒ 这条路径根本没走到
+      # 提交（被 test / review / 审批驳回，见 downstream 那几条入边）——两种含义在下游
+      # 都能读出来，比一个恒空的字段诚实。
+      commit: "$.nodes.commit.output"
 
 edges:
   # 诊断链

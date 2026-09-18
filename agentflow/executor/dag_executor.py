@@ -92,6 +92,36 @@ def _usable(value: Any) -> bool:
     return True
 
 
+def negative_evidence(node_id: str, exc: Exception) -> dict:
+    """``on_failure: continue`` 的负证据 —— **形状与正常输出同构**。
+
+    为什么必须带 ``summary``：四个取证 agent 的输出 schema（logs / metrics /
+    infra / know）都把 ``summary`` 列为 ``required``，下游 ``rca`` 读的也正是
+    ``$.nodes.<id>.output.summary``。此前这里只返回 ``{"found": False, "error": ...}``
+    —— 参数解析拿到 ``None``，于是**「这一路取证失败了」在下游眼里变成「这一路什么都没说」**。
+
+    这两件事对根因判断的含义**相反**：前者要求降低置信度、别用这一维下结论；
+    后者会被读成"查过、无异常"。负证据要能被读到，才叫负证据。
+
+    ``missing`` 与 ``scope`` / ``rca`` / ``locate`` 的负证据出口同形（写清**缺什么**）。
+    """
+    if isinstance(exc, NodeInputError):
+        reason = f"入参不满足 require {exc.missing}"
+        missing = list(exc.missing)
+    else:
+        reason = f"{type(exc).__name__}: {exc}"
+        missing = []
+    return {
+        "found": False,
+        "summary": (
+            f"【本路取证失败，**不是**「无异常」】{reason}。"
+            "该维度没有证据，判断根因时不得当作已验证过。"
+        ),
+        "missing": missing,
+        "error": str(exc),
+    }
+
+
 class WorkflowStalledError(Exception):
     """ready 集为空、无 waiting_approval、又未全部终态 —— DAG 死锁或逻辑错误。"""
 
@@ -549,7 +579,7 @@ class DAGExecutor:
         async def on_error(exc: Exception) -> Any:
             if node.on_failure == "continue":
                 log.info("[%s] %s on_failure=continue，产出负证据", self.run_id, node.id)
-                return {"found": False, "error": str(exc)}
+                return negative_evidence(node.id, exc)
             raise WorkflowNodeFailed(node.id, exc) from exc
 
         # ── 入参预检：输入有问题 → 立即失败，而非交给 agent 空转 ──
