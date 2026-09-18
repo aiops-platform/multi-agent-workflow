@@ -29,6 +29,9 @@
 | 19 | ~~`rca` 的 `join: any`~~ | ✅ 已修——**根因节点从来没拿到过取证输出**（五维摘要恒为 None），见下 |
 | 20 | ~~缺 `trace_id` 的工单炸整条 run~~ | ✅ 已修——把"证据缺失"表达成了"执行失败"；修完暴露了下游无守卫，一并补 `locate → halt` |
 | 21 | ~~`plan → fix` 无人拍板 + `on_reject` 死配置~~ | ✅ 已修——修复计划没有任何决策点；且 queue 模式下中止逻辑压根不生效 |
+| 22 | `remediate` 只产计划、不执行 | `ActionExecutor` 全仓没接线；**附租户 namespace 边界也是开的** |
+| 23 | **静默错误行为**（4 条，均已核实） | 表面全正常，只有核数据形状才发现是空的/没接线——最费排查时间的一类 |
+| 24 | **密钥卫生**：`Settings` 密钥字段全是裸 `str` | 安全。`repr(Settings)` 明文带出 key，CI 失败回溯即泄——**修起来很小** |
 
 > **中断语义（halt）不在本清单里**——它已实施并实测通过（`8841d20` / `2821ac5`），
 > 约定见 `CLAUDE.md` 约束 3 与 `docs/E2E_VERIFICATION_zh-CN.md` §四验收点。
@@ -1301,3 +1304,103 @@ agents/tools.py:150   elif spec.name in ("scale_deployment","restart_pod",...) \
 
 把 `ActionExecutor` 构出来并传进 `build_toolkit`（`sandbox/action_executor.py` 已实现，
 动作受白名单约束）。注意与沙箱的 `SandboxClient` 是同一条 L2 链路的两个分支，接线时要一起看。
+
+**接线时必看（2026-09-18 补记）**：`ActionExecutor.execute(..., tenant_id=None)`
+里 tenant 尺度是**开着**的——`_check_ns` 第一句就是 `if tenant_id is not None`
+（`sandbox/action_executor.py:101`），而 `agents/tools.py:126` 的 `_l2_action`
+**只传 namespace、不传 tenant_id** → §8 P3 的「租户只能操作自己 namespace」这条边界
+**从来没生效过**。接线时必须把 `exec_context.current_tenant` 一路透传进去，
+否则白名单只剩 `namespace_whitelist` 的静态部分。
+
+---
+
+## 23. 静默错误行为（已核实、未修）
+
+> 2026-09-18 记录，**均未修**。这一批的共同点：**表面上一切正常**——run 报 `done`、
+> 接口回 `ok: true`、节点有输出，**只有去核数据形状才发现字段是空的/能力没接线**。
+> 前两条是数据契约缺陷，后两条是"整段能力有管道、无接线"。
+
+### 23.1 `GET /runs/{id}` 的 `pending_approvals[].trigger` 恒为 `null`
+
+```python
+api/app.py:918   - ``pending_approvals``：[{node_id, trigger, upstream}]，upstream 取上游节点输出
+```
+
+`trigger` 是接口**承诺返回**的字段，但实测 **30 条审批记录的 `params` 里无一含 `trigger`**
+→ 该入参全是 `null`。前端拿它区分"是哪条边触发了这个审批门"，拿不到就只能猜。
+与 §21 的 `on_reject` 同族（都是审批门的元数据没落进 params）。
+
+### 23.2 resume 对终态 run 回 `ok: true`，实际是 no-op
+
+```
+POST /runs/{id}/resume  →  {"ok": true, "status": "resumed"}      ← 接口说"已恢复"
+Worker 日志             →  [run_xxx] run 已终态，忽略 resume      ← 实际什么都没做
+```
+
+`worker.py` 拿 `TERMINAL` 拦下（`design-v5.7.md` §3.6 补记里有完整复现）。
+**接口回成功而实际没做**是最坏的一类返回：调用方据此以为恢复了，继续等一个永不到来的状态。
+修法二选一：回 `409` + 说明，或回 `{"ok": true, "status": "noop"}` 并让前端显式提示。
+
+### 23.3 `ToolPolicy` 整个类运行期**零消费方** → 租户 deny 规则从未生效
+
+`sandbox/policy.py` 的 `ToolPolicy`（§9.5 租户级工具策略 + §10.2 资源限制）**没有任何
+运行期调用方**——全仓仅在 docstring 里被提到。真实生效的是另一条路径：
+`agents/scopes.py:26 build_permission_context()`，它**只从 tool registry 生成 allow 规则，
+完全不读 `ToolPolicy`**。
+
+后果：`agents/scopes.py:38` 那句注释「叠加租户 deny 规则（M5 接入 tenant 配置）后取交集」
+是**未兑现的承诺**——**租户 deny 规则从来没有生效过**。
+（相邻小问题：`runner.py:175` 调 `build_permission_context(agent, allow_extra=...)`
+**没传 `tenant_id`** → 一律落到默认 `"local"`。）
+
+### 23.4 `SandboxClient` 未接入真实 run
+
+`SandboxClient` 已可用，但 runner 在真实诊断链路中尚未调用
+（详见 §9「真实 node_runner 接入 executor」那行；与 §22 是同一条 L2 链路的两个分支）。
+现状证据：`agents/runner.py:176` 是 `build_toolkit(agent, mcp_clients=clients)`——
+`sandbox_client` / `action_executor` **两个参数都没传**，于是
+`agents/tools.py:150` 的分支判断恒为假，L2 工具**根本不会被建出来**。
+
+---
+
+## 24. 密钥卫生：`Settings` 全部用 `str` 存，`repr()` 明文带出
+
+> 2026-09-18 记录，**未修**。发现路径：本轮改 `deploy/worker-deployment.yaml`
+> 加 DeepSeek key 时，回头核"这个 key 会不会被写进 git / 日志"。
+
+### 现状（源码事实，未读取任何真实值）
+
+`agentflow/config.py` 里五个密钥字段全是裸 `str`，且**全文件 `SecretStr` 出现 0 次**：
+
+```
+:27  deepseek_api_key: str      :59  jwt_secret: str       :65  secret_key: str
+:138 open_sandbox_api_key: str  :158 langfuse_secret_key: str
+```
+
+`str` 是 pydantic 的默认显示类型 → **`repr(Settings)` / `str(Settings)` 原样打印全部密钥**
+（已实测确认 `deepseek_api_key` 与 `jwt_secret` 明文出现在 `repr` 里）。
+
+### 为什么这是个隐患（不是"理论风险"）
+
+任何把 settings 对象带进输出的路径都会泄：
+
+1. **pytest / CI 的失败 traceback**——pytest 默认打印**局部变量**。本仓已有过这种输出形态
+   （跑 `tests/test_worker.py` 失败时，回溯里就有一行完整的 `settings = Settings(...)`）。
+   本地那次是 monkeypatch 的假 key，但 **CI 里注入的是真 key，同一形态就会把真 key 打进构建日志**。
+2. 任何 `log.info("... %s", settings)`（当前全仓没有，但没有任何东西**阻止**下一个人写）。
+3. 接了错误上报（Sentry 一类）后会自动采集局部变量。
+
+### 目标
+
+把密钥字段改成 `pydantic.SecretStr`（`repr` 显示 `**********`），取值处显式 `.get_secret_value()`；
+`config.py` 的 `postgres_dsn`（含明文口令）同样处理。加一条测试：`repr(get_settings())`
+**不得包含**任一密钥字段的真实值。
+
+### 顺带（K8s 侧，非本仓代码）
+
+- `kubectl create secret --from-literal=...` 会把明文放进 **进程 argv**（`ps` 可见）；
+  改用 `--from-env-file` 或 stdin。
+- K8s Secret 默认**只是 base64**，`kubectl get secret -o yaml` 即可读；etcd 未配
+  encryption-at-rest 时落盘也是明文。生产需 sealed-secret / 外部 secrets manager。
+- `deploy/worker-deployment.yaml` 的注释里写的是 `$AGENTFLOW_DEEPSEEK_API_KEY`
+  （**变量引用**形式）：shell 历史记录的是未展开的文本，不会因它泄 key。
