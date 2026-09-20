@@ -147,7 +147,8 @@ def _workflow_graph(wf: Workflow) -> dict:
     return {
         "name": wf.name,
         "nodes": [
-            {"id": nid, "agent": node.agent, "kind": node.kind}
+            {"id": nid, "agent": node.agent, "kind": node.kind,
+             "description": node.description}
             for nid, node in wf.nodes.items()
         ],
         "edges": [

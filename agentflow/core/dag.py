@@ -94,6 +94,10 @@ class Node:
     # 复用结果不重复执行。支持 `$.` 引用（按 params 同规则解析）或字面量；
     # 未声明时，副作用 agent（committer/infra-remediator）用 run+node 确定性键兜底。
     idempotency_key: str | None = None
+    #: 节点说明（YAML 里 authoring 时写）。**只用于展示**——前端悬停提示、
+    #: Workflow Studio 预览都读它；执行语义一概不看。
+    #: 注意别与审批节点的 `name` 混：那个被折叠进 params（是审批门的展示名）。
+    description: str = ""
 
     @property
     def is_approval(self) -> bool:
@@ -160,6 +164,7 @@ class DAG:
             if isinstance(require, str):
                 require = [require]
             timeout_raw = spec.pop("timeout", None)
+            description = str(spec.pop("description", "") or "")
             if kind == "approval":
                 # 审批节点的展示元数据折叠进 params（§8.1：approvers/timeout/name 为同级 key）
                 params = {
@@ -182,6 +187,7 @@ class DAG:
                 idempotency_key=idempotency_key,
                 require=require,
                 timeout=(float(timeout_raw) if timeout_raw is not None else None),
+                description=description,
             )
 
         # 2) 边：优先 edges 列表；否则内联 upstreams

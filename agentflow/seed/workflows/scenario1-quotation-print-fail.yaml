@@ -31,6 +31,7 @@ nodes:
   # 取数节点把时间窗透传给 agent，agent 再原样传给 MCP 数据工具（必填参数）。
   triage:
     agent: triage
+    description: "分诊：读工单，产出症状摘要与类型，供下游节点引用"
     require: [start_time, end_time]
     params:
       bug: "$.inputs.bug_report"
@@ -49,6 +50,7 @@ nodes:
   # 下游退回"不带 service 过滤"的宽查询（§3.6 的"停止让用户补充"机制尚未实现）。
   scope:
     agent: service-scoper
+    description: "定位问题服务：查 CMDB 业务域与拓扑，产出带置信度的候选服务集"
     join: all
     required_edges: [triage]
     params:
@@ -64,6 +66,7 @@ nodes:
   # `candidate_services` 是 None。这正是 `locate` 节点已经踩过的坑（见其注释）。
   logs:
     agent: log-analyst
+    description: "日志取证：按候选服务与时间窗查应用日志，找错误类型与可疑条目"
     require: [start_time, end_time]
     join: all
     required_edges: [triage, scope]
@@ -76,6 +79,7 @@ nodes:
 
   trace:
     agent: trace-analyst
+    description: "链路取证：按 trace_id 拉调用链，定位故障 span 与归因服务"
     require: [start_time, end_time]
     join: all
     required_edges: [triage, scope]
@@ -91,6 +95,7 @@ nodes:
 
   metrics:
     agent: metrics-analyst
+    description: "指标取证：查 CPU/内存/磁盘/错误率/延迟，看有无异常"
     require: [start_time, end_time]
     join: all
     required_edges: [triage, scope]
@@ -104,6 +109,7 @@ nodes:
   # infra 用 check_infra/describe_pod（K8s 当前状态），**无时间参数**
   infra:
     agent: infra-locator
+    description: "基础设施取证：查 Pod 状态、重启次数与事件（K8s 实时状态）"
     join: all
     required_edges: [triage, scope]
     params:
@@ -124,8 +130,10 @@ nodes:
   # summary（那次 scope 是成功的，在讲它定位到的服务）当中断理由，读起来完全误导。
   halt:
     kind: halt
+    description: "中断：证据不足时停在这里，不再往下走（不调 LLM）"
   locate:
     agent: code-locator
+    description: "代码定位：由服务名定位仓库，列出可疑文件"
     join: all
     required_edges: [triage, trace]
     params:
@@ -135,11 +143,13 @@ nodes:
 
   know:
     agent: knowledge-lookup
+    description: "知识检索：查历史相似事故与处置建议（当前为占位数据源）"
     params: { bug: "$.nodes.triage.output.summary" }
     on_failure: continue
 
   rca:
     agent: root-cause
+    description: "根因分析：交叉核对五维取证 + scope 定位与 trace 证据，给出根因与置信度"
     # ⚠️ join: all —— **六个取证上游全部完成才启动**，缺一不可。
     #
     # 默认 join: any 时，`know → rca` 是**无条件**边，而 know 只依赖 triage：
@@ -186,6 +196,7 @@ nodes:
   # 写了就是骗人。驳回留痕在审批记录（approver + comment）与节点状态 REJECTED 里。
   approve-plan:
     kind: approval
+    description: "人工门：审核修复计划（仅记录，不执行修复）"
     name: "审批修复计划"
     params:
       plan: "$.nodes.plan.output"
@@ -199,6 +210,7 @@ nodes:
 
   plan:
     agent: fix-planner
+    description: "制定修复计划：产出改动步骤与影响范围（本节点只出计划，不动代码）"
     params: { rca: "$.nodes.rca.output" }
     on_failure: abort
 
@@ -207,6 +219,7 @@ nodes:
   # （动作受白名单约束）。与 fix 并行：一个改代码治本，一个改 K8s 止血。
   remediate:
     agent: infra-remediator
+    description: "K8s 止血：产出扩缩容/重启/改配额的动作计划（与改代码并行）"
     join: all
     # 直接上游是审批节点，不是 plan —— 传递上游不算（见 edges 段的说明）
     required_edges: [approve-remediate]
@@ -218,6 +231,7 @@ nodes:
   # 止血要动生产环境，**前置审批**（与提交代码同款：kind: approval 节点）
   approve-remediate:
     kind: approval
+    description: "人工门：审核 K8s 止血动作，通过后才动线上资源"
     name: "审批基础设施止血动作"
     params:
       plan: "$.nodes.plan.output"
@@ -230,6 +244,7 @@ nodes:
   # ===== 修复阶段 =====
   fix:
     agent: fix-implementer
+    description: "代码修复：在工作区内改代码并提交到本 run 的隔离分支"
     params:
       plan: "$.nodes.plan.output"
       repo_url: "$.nodes.locate.output.repo_url"
@@ -239,6 +254,7 @@ nodes:
 
   test:
     agent: tester
+    description: "跑测试：在工作区执行该服务登记的测试命令"
     params:
       fix: "$.nodes.fix.output"
       remediate: "$.nodes.remediate.output"
@@ -248,6 +264,7 @@ nodes:
 
   review:
     agent: reviewer
+    description: "代码评审：审阅 diff 与测试结果，判断是否放行提交"
     params:
       diff: "$.nodes.fix.output.diff"
       service: "$.nodes.locate.output.service"
@@ -255,6 +272,7 @@ nodes:
   # ===== 提交审批（前置审批）=====
   approve-commit:
     kind: approval
+    description: "人工门：审核 diff + 测试证据，通过后才提交 PR"
     name: "审批代码提交"
     params:
       diff: "$.nodes.fix.output.diff"
@@ -266,6 +284,7 @@ nodes:
 
   commit:
     agent: committer
+    description: "提交：把工作区改动推到 PR"
     params:
       diff: "$.nodes.fix.output.diff"
       test: "$.nodes.test.output"
@@ -274,6 +293,7 @@ nodes:
 
   recap:
     agent: postmortem
+    description: "复盘：汇总根因、处置与后续事项"
     params:
       rca: "$.nodes.rca.output"
       fix: "$.nodes.fix.output"
