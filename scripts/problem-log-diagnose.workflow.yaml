@@ -1,14 +1,18 @@
-# ===== Problem Center「分析new」：日志分析 → 根因 → 修复计划 → 人工审批 =====
+# ===== Problem Center「分析new」：日志分析 → 根因 → 计划门 → 沙箱修复 → 证据门 → 提交 =====
 #
 # ⚠️ 本文件**不是运行时真源**：workflow 的真源是数据库（CLAUDE.md §6.0 / docs/TODO.md §13）。
 #    它只是 scripts/seed_problem_log_diagnose.py 的推送载荷——改完必须重跑该脚本（幂等 PUT），
 #    改这里的 YAML 而不同步到库，run 跑的还是旧流程，且没有任何提示。
 #
-# 场景：问题单（APM Problem Center）→ 日志证据 + 知识 + 代码定位 → 根因 → 修复计划 → 人工审批。
-# 本期**只做日志**（指标分析后续另起一条 workflow）；审批**只记录计划**，不执行任何修复动作。
+# 场景：问题单（APM Problem Center）→ 日志证据 + 代码定位 → 根因 → 修复计划 → 人工审批
+#       → 沙箱内改代码 → 测试 → 审查 → 人工审批 → 提交。
+# 本期**只做日志**（指标分析后续另起一条 workflow）。两道人工门的分工见
+# docs/todos/WORKFLOW_V2_REVIEW_GATES_zh-CN.md §1：
+#   计划门 approve-plan   —— 审**方案**（未动代码，便宜、早，抓错方向止损）
+#   证据门 approve-commit —— 压在**不可逆的 commit 之前**，人看的是 diff + 测试 + 审查意见
 name: problem-log-diagnose
 version: "1.0.0"
-description: "Problem Center 分析new：日志分析 → 根因 → 修复计划 → 人工审批（审批只记录，不执行修复）"
+description: "Problem Center 分析new：日志分析 → 根因 → 计划门 → 修复 → 测试 → 审查 → 证据门 → 提交"
 
 inputs:
   bug_report:
@@ -103,15 +107,31 @@ nodes:
       root_cause: "$.nodes.rca.output"
     on_failure: abort
 
-  # ── 人工审批（只记录，无下游动作）────────────────────────────────────────────
+  # ── 计划门：人工审核修复计划（通过才允许动手）────────────────────────────────
   # join: all + 两条入边：rca 与 plan 都是**直接**上游，审批卡片的 upstream 会把两者的
   # 完整输出都渲染出来（前端 renderRunApprovals 只画 upstream）——这就是"带根因上下文的计划门"。
   # ⚠️ 只写 plan 一条边 + 默认 join: any 会让 plan 一完成就弹审批；只写 rca 则在 plan 之前弹。
+  #
+  # `on_reject: continue` —— 驳回**不中止 run**，而是沿下面那条
+  # `approved == false → recap` 的边走，让复盘节点记下"方案被否"。
+  # 人工决策不是执行失败：run 仍判 done，留痕在 recap 与审批记录的 approver + comment 里。
+  #
+  # ⚠️ 必须显式写 `continue`，**且图上必须真有那条驳回边**。引擎里 `on_reject` 的默认值是
+  #    `abort`，而 `abort` 下 run 直接抛 WorkflowNodeFailed 中止 → 那条 `→ recap` 边
+  #    **永远不可达**（图看着有去处，实际是死的）。
+  #    这条现在有**加载期校验**兜底：`abort` + `approved == false` 出边 = 矛盾，
+  #    `Workflow.load_yaml` 直接报 `WorkflowDAGError`（`_check_on_reject_consistency`，
+  #    CLAUDE.md §4.1）。但**反方向不查**——`continue` 而没有驳回边是合法的，
+  #    所以"边到底有没有写"仍然靠人，校验救不了。
+  #    判据看**状态**不看**动作**：`rejected_abort_node()` 按节点状态判定，因为 queue 模式下
+  #    Worker 经 `from_checkpoint` 重建后直接 `run()`，**不经过 `approve()`**。
+  #    见 docs/TODO.md §21。
+  #
   # timeout 86400：审批由人驱动；inline 模式下超时后没有人消费 resume 命令（见 plan §7.1），
   # 给足一天，避免演示时被 sweeper 自动驳回。
   approve-plan:
     kind: approval
-    name: "审核修复计划（仅记录，不执行修复）"
+    name: "审核修复计划（通过后将在沙箱内实施修复）"
     join: all
     required_edges: [rca, plan]
     params:
@@ -119,28 +139,115 @@ nodes:
       plan: "$.nodes.plan.output"
     approvers: []
     timeout: 86400
-    # `on_reject: continue` —— 驳回**不中止 run**，而是沿下面那条
-    # `approved == false → recap` 的边走，让复盘节点记下"方案被否"。
-    #
-    # ⚠️ 必须显式写 `continue`。引擎里 `on_reject` 的默认值是 `abort`，而 `abort` 下
-    #    **run 直接抛 WorkflowNodeFailed 中止**，那条 `→ recap` 边**永远不可达**——
-    #    图看着有去处，实际是死的，且加载与运行都不报错。
-    #    （此前的注释写「on_reject 只解析、从不消费」是**过时**的：`rejected_abort_node()`
-    #    早在 2026-09-18 01:12 就落地了，见 docs/TODO.md §21 与 CLAUDE.md 约束 4.1。）
     on_reject: continue
 
-  # ── 复盘（仅拒绝/超时分支；批准路径被 skip 级联跳过）─────────────────────────
+  # ── 修复 ─────────────────────────────────────────────────────────────────────
+  # service / repo_url 取自 locate 的输出：`ws_*` 工具的 service 必须是**已 prepare 的仓库名**，
+  # 而工作区在 run 创建期就已按部署配置全量准备（workspace/prepare.py:79）。
+  # ⚠️ 所以 service 传错不会报错、只会**改错仓库**——这就是下面那条 halt 边存在的原因。
+  fix:
+    agent: fix-implementer
+    params:
+      plan: "$.nodes.plan.output"
+      repo_url: "$.nodes.locate.output.repo_url"
+      service: "$.nodes.locate.output.service"
+    retry: 1
+
+  test:
+    agent: tester
+    params:
+      fix: "$.nodes.fix.output"
+      plan: "$.nodes.plan.output"
+      service: "$.nodes.locate.output.service"
+    retry: 1
+
+  review:
+    agent: reviewer
+    params:
+      diff: "$.nodes.fix.output.diff"
+      service: "$.nodes.locate.output.service"
+
+  # ── 证据门：人工审核修复证据（压在不可逆的 commit 之前）──────────────────────
+  # join: all + `required_edges: [fix, test, review]`，理由与上面 approve-plan 那条**同构**：
+  # 卡片只渲染 node.upstreams（api/app.py:978 / executor/dag_executor.py:777），
+  # 只连 review 一条的话审批人只能看到审查意见，看不到 diff 与测试结果——而这两样
+  # 恰恰是"该不该提交"的主要依据。
+  # ⚠️ required_edges 必须是**直接**上游（core/dag.py:234），所以 fix / test 两条
+  # 直达本节点的边**必须显式写**，不是冗余。
+  approve-commit:
+    kind: approval
+    name: "审核代码提交"
+    join: all
+    required_edges: [fix, test, review]
+    params:
+      fix: "$.nodes.fix.output"
+      test: "$.nodes.test.output"
+      review: "$.nodes.review.output"
+    approvers: []
+    timeout: 86400
+    # continue：驳回沿 `approved == false → recap` 边路由（图里写了那条边），**不中止 run**。
+    # 与计划门同为 continue：两道门驳的都是"人的决定"，不是执行失败，故都走 recap 留痕。
+    # 差别在**驳的是什么**——计划门驳"要不要做这件事"，证据门驳"这次做的行不行"。
+    on_reject: continue
+
+  # ── 提交 ─────────────────────────────────────────────────────────────────────
+  # ⚠️ 语义澄清（别照着 `committer` 这个名字想当然）：
+  # 它的提示词只让 agent 调 `ws_git` 的 add / commit / rev-parse，产出
+  # `{pr_url, pr_number, base_sha}`——即**在本 run 的工作区分支（aiops/RUN_<run_id>）
+  # 内建一个 commit**。平台**没有任何开 PR 的能力**（全仓无 github/gitlab API），
+  # 那两个字段目前是形态占位。
+  # ⚠️ 但**不能**写成"ws_git 不允许 push"——`push` 在 `_GIT_ALLOWED` 白名单里
+  # （workspace_tools.py:37），白名单只禁 pull/fetch/reset（§4.6 版本冻结）。
+  # 拦住它的是"提示词不引导 + schema 不产出远端地址"，**不是一道权限**——
+  # 要真封死得改白名单。见 docs/TODO.md §25。
+  # 幂等不用声明：committer 在 SIDE_EFFECT_AGENTS 里（executor/dag_executor.py:52），
+  # 自动用 run_id:node_id 作 external_operation_id（§8.4.2）。
+  commit:
+    agent: committer
+    params:
+      diff: "$.nodes.fix.output.diff"
+      test: "$.nodes.test.output"
+      service: "$.nodes.locate.output.service"
+
+  # ── 中断终点 ─────────────────────────────────────────────────────────────────
+  # **不写 params**：halt 的 reason/missing 由 executor 从**触发它的那条入边**的上游输出
+  # 直接搬运（_halt_output ← _edge_active）。写死指向某个节点是踩过坑的——换个触发点就会
+  # 把不相关的摘要当中断理由，读起来完全误导。
+  # 它不经 runner：不调 LLM、不重试、不做幂等（CLAUDE.md §3.1）。
+  # 一旦执行，其余 PENDING 节点全部 SKIPPED（_process_skips 统一裁决）。
+  halt:
+    kind: halt
+
+  # ── 复盘（修复段的各条失败/驳回路径汇到这里）─────────────────────────────────
+  # ⚠️ 入参一律传**整个输出对象**、不传某个字段：这条流程里 recap 有四条入边
+  # （test 不过 / review 不过 / 证据门驳回 / commit 完成），具体走到哪条决定了哪些键有值、
+  # 哪些是 null——而"null ⇒ 这条路径根本没走到"正是下游要读出来的信息。
+  # 反例是 bug-fix-scenario2 踩过的：那里原写 `commit.status`，而 CommitSchema 里**没有**
+  # `status`，该入参实测恒为 null（20+ 条 run 全是）——"这次提交到底成没成"从来没到达复盘 agent。
   recap:
     agent: postmortem
     params:
       rca: "$.nodes.rca.output"
       plan: "$.nodes.plan.output"
-      approved: "$.nodes.approve-plan.output.approved"
-      approver: "$.nodes.approve-plan.output.approver"
-      comment: "$.nodes.approve-plan.output.comment"
+      fix: "$.nodes.fix.output"
+      test: "$.nodes.test.output"
+      review: "$.nodes.review.output"
+      # 两道审批门的**完整裁定**（各含 status / approved / approver / comment）。
+      #
+      # ⚠️ 刻意**不**沿用原来那三个标量名（`approved` / `approver` / `comment`）：
+      # 那时只有一道门，名字没有歧义；现在这条流程有**两道**门、recap 又有五条入边，
+      # 一个叫 `approved` 的标量会在下面两种情形下含义相反，读起来必错：
+      #   计划门驳回 → plan_gate 有值、evidence_gate 为 **null**（证据门压根没启动）
+      #   证据门驳回 → 两者都有值，且 plan_gate.approved == **true**
+      plan_gate: "$.nodes.approve-plan.output"
+      evidence_gate: "$.nodes.approve-commit.output"
+      # 有 pr_url ⇒ 已提交；null ⇒ 这条路径没走到提交（被测试/审查/审批驳回）。
+      # 见下方 commit 节点与 bug-fix-scenario2 的教训（传 `commit.status` 恒为 null）。
+      commit: "$.nodes.commit.output"
     on_failure: continue
 
 edges:
+  # ── 诊断链 ───────────────────────────────────────────────────────────────────
   - { from: triage, to: logs }
   - { from: triage, to: locate }
   - { from: triage, to: rca }
@@ -149,5 +256,39 @@ edges:
   - { from: rca,  to: plan }
   - { from: rca,  to: approve-plan }
   - { from: plan, to: approve-plan }
-  # 唯一进 recap 的边：人工拒绝与超时自动驳回都落在这里（超时写的是 {"approved": false}）
+
+  # ── 修复段：计划门 → 修复 → 测试 → 审查 → 证据门 → 提交 ──────────────────────
+  # plan **不直达** fix：中间必须有「计划门」这个人工决策点（CLAUDE.md §4.2）。
+  - { from: approve-plan, to: fix, when: "$.nodes.approve-plan.output.approved == true" }
+  # 计划门的驳回出路。**与上面那条 `approved == true` 是一对，缺一不可**：
+  # 节点声明了 `on_reject: continue`，而 `continue` 的语义就是"沿图上那条驳回边路由"——
+  # 那条边不存在的话，驳回后下游全部失活，run 照样 done 却什么都不记。
+  # （加载期校验只拦 `abort` + 驳回边这种矛盾组合，**不拦** `continue` 却没有边——
+  #  反方向是合法的，所以这条边只能靠人写对，见节点上的注释。）
   - { from: approve-plan, to: recap, when: "$.nodes.approve-plan.output.approved == false" }
+  - { from: fix,  to: test }
+  # fix / test → approve-commit 是**无条件**边，只为让二者成为证据门的**直接**上游
+  # （required_edges 的静态校验认直接上游），从而进审批卡片的 upstream。
+  - { from: fix,  to: approve-commit }
+  - { from: test, to: approve-commit }
+  - { from: test, to: review,         when: "$.nodes.test.output.passed == true" }
+  - { from: test, to: recap,          when: "$.nodes.test.output.passed == false" }
+  - { from: review, to: approve-commit, when: "$.nodes.review.output.approved == true" }
+  - { from: review, to: recap,          when: "$.nodes.review.output.approved == false" }
+  - { from: approve-commit, to: commit, when: "$.nodes.approve-commit.output.approved == true" }
+  - { from: approve-commit, to: recap,  when: "$.nodes.approve-commit.output.approved == false" }
+  - { from: commit, to: recap }
+
+  # ── 中断点（halt）────────────────────────────────────────────────────────────
+  # 判据必须是**图上的 kind**（halt_triggered()），且**只需加一条 when 边**——
+  # 不要用"给每条通往修复链的边加 when"来实现中断：漏一条边就前功尽弃（实测踩过）。
+  #
+  # ① 根因环节判定证据不足（rca 不再被迫编一个根因类型）。
+  - { from: rca, to: halt, when: "$.nodes.rca.output.insufficient == true" }
+  # ② 代码定位环节拿不到目标服务（locate 输 `found: false`，或 require 预检失败后
+  #    走 negative_evidence() 产出的负证据——两条路径都带 `found: false`）。
+  #    没有仓库就没有"改哪里"：继续往下 fix 会**从 plan 的文字里猜一个仓库**去改，
+  #    而工作区默认全量准备、service 传错也不报错 → **猜错静默通过**。
+  #    实测踩过（docs/TODO.md §20，run_c9eb2fe68d）：locate 明说 found=false，
+  #    fix 却自己挑中 order-service 改了 QuotationService.java——对了是运气。
+  - { from: locate, to: halt, when: "$.nodes.locate.output.found == false" }

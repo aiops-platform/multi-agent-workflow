@@ -1519,3 +1519,64 @@ DSN 含明文口令，打进终端回滚 / CI 日志 / 截图就收不回来；`
   —— 生产需 sealed-secret / 外部 secrets manager。
   （注：`deploy/worker-deployment.yaml` 注释里写的是 `$AGENTFLOW_DEEPSEEK_API_KEY`
   **变量引用**形式，shell 历史记的是未展开文本，不会因它泄 key。）
+
+---
+
+## 25. `ws_git` 白名单**允许 `push`**：「建 commit」与「推远端」之间没有权限边界，只有提示词
+
+> 2026-09-20 发现。路径：给 `problem-log-diagnose` 补修复段（`fix → test → review →
+> approve-commit → commit`）时，要写清 `commit` 节点到底做了什么，于是去核
+> `committer` 的提示词与 `ws_git` 的白名单——**两处对不上**。
+
+### 源码事实
+
+`agents/workspace_tools.py:37`：
+
+```python
+_GIT_ALLOWED = {"status", "diff", "add", "commit", "push", "rev-parse", "branch", "checkout", "log"}
+```
+
+`push` **在白名单里**。白名单只禁 `pull`/`fetch`/`reset`（§4.6 版本冻结——防 HEAD 漂移），
+与"能否写远端"是两件事。
+
+而 `committer` 的提示词（`agents/prompts.py`）只让它调
+`ws_git(service, ['add'|'commit'|'rev-parse', ...])`，并在规则里写
+「分支已由工作区准备时建好（`aiops/RUN_<run_id>`）；**不要用 pull/fetch/reset（被白名单拒绝）**」。
+——它把「白名单拒绝」当作约束的**唯一理由**来陈述，而 `push` 恰好不在被拒之列。
+一个照着"白名单就是边界"去推理的模型，会得出「push 没被禁 ⇒ 可以 push」。
+
+另外确认：平台**没有任何开 PR 的能力**（全仓无 github/gitlab API），
+`committer` schema 的 `pr_url`/`pr_number` 是形态占位。
+
+### 为什么不是理论风险
+
+**风险完全取决于 `origin` 指向，而这是部署配置、不是代码**：
+
+- `AGENTFLOW_REPO_ROOT` 指本地 `file://` 源（本仓 `tests/test_workspace.py` 的用法）→ push 只是写本地目录，无害；
+- 生产接真实远端（`https://…` 且 PAT 在 URL 里）→ agent 一旦调 `push`，
+  **在真实远端建分支**。这是个**对外可见、难以撤回**的动作，而审批人在 `approve-commit`
+  卡片上看到的是 diff + 测试 + 审查意见——**没有任何一处告诉他"这一步会推远端"**。
+
+`ws_git` 对 `commit` 强制要 `message`（`WorkspaceToolError("git commit 需要 message")`），
+对 `push` 则**无任何前置条件**。
+
+### 与 §23.5 同族
+
+§23.5 记的是 `ws_git(service, args, message="", remote="origin")` 里
+**`remote` 参数只校验、从不生效**（push 的目标实际由 `args` 决定）。
+本条是它的邻接面：**`push` 这个子命令本身没被当作"需要单独把关的动作"**。
+两条合起来的效果是——想控制"这次到底推不推、推到哪"，当前**没有任何落点**。
+
+### 改法（未实施，需评审）
+
+三选一，取决于产品意图：
+
+1. **收紧白名单**：`push` 从 `_GIT_ALLOWED` 移除。若"提交 = 只在本 run 分支内落 commit"，
+   这是最诚实的一刀——平台的产物应当是分支 + diff，推送由平台外的流程做。
+2. **给 push 单独设门**：保留 `push`，但要求显式 `remote` 白名单（同时修 §23.5 那个死参数），
+   并把它做成**独立的审批节点**或至少进 `approve-commit` 卡片要展示的内容。
+3. **显式声明为设计边界**：在 `committer` 提示词里写清"可以 push、推到 `origin`，
+   即配置的远端"——**消除"白名单即边界"这个错误推理**，风险交由部署方评估。
+
+在定下来之前，`problem-log-diagnose` 的 YAML 里已写明这条**不是**权限约束
+（`scripts/problem-log-diagnose.workflow.yaml` 的 `commit` 节点注释）。
