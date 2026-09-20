@@ -32,6 +32,11 @@ _READ_MAX_BYTES = 200_000
 _GIT_OUTPUT_LIMIT = 40_000
 # 测试输出上限（保留尾部：gradle 结论在末尾）
 _TEST_OUTPUT_LIMIT = 8_000
+# 测试超时：**与 ToolSpec 注册值和 SBX_MAX_EXEC_SECONDS 三者对齐到 300**。
+# 此前函数默认 120 < ToolSpec 300 —— 小的那个**静默覆盖**大的，
+# 看 ToolSpec 的人会以为有 300 秒。真实 Java 构建跑几分钟很常见，
+# 120 秒会把「还在编译」误报成「测试失败」。
+_TEST_TIMEOUT_SEC = 300
 
 # git 子命令白名单（§4.6：无 pull/fetch/reset——run 期间禁止漂移）
 _GIT_ALLOWED = {"status", "diff", "add", "commit", "push", "rev-parse", "branch", "checkout", "log"}
@@ -217,7 +222,7 @@ def test_cmd_for(service: str) -> str:
     return cmd
 
 
-async def ws_run_tests(service: str, timeout: int = 120) -> dict:
+async def ws_run_tests(service: str, timeout: int = _TEST_TIMEOUT_SEC) -> dict:
     """在工作区执行**该服务配置的**测试命令。
 
     ⚠️ **无 command 参数**——命令来自部署配置（``test_cmd_for``），不接受 LLM 传参。
@@ -242,7 +247,7 @@ async def ws_run_tests(service: str, timeout: int = 120) -> dict:
     return _test_result(cmd, rc, timed_out, out.decode("utf-8", "replace"), where="本地")
 
 
-async def ws_run_tests_sandboxed(sandbox, service: str, timeout: int = 120) -> dict:
+async def ws_run_tests_sandboxed(sandbox, service: str, timeout: int = _TEST_TIMEOUT_SEC) -> dict:
     """经沙箱执行**该服务配置的**测试命令（跑的是仓库代码，必须在无密钥容器里）。"""
     repo = _resolve_repo(service)
     cmd = test_cmd_for(service)
