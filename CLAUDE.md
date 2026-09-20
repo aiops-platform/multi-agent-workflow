@@ -94,6 +94,11 @@ make lint      # ruff 检查
      `from_checkpoint` 重建后直接 `run()`，**不经过 `approve()`**——写在 `approve()` 里的
      中止逻辑在 queue 模式下**完全不生效**，run 照样报 `done`，只有下游被 SKIPPED。
    - **超时**（`REJECTED_CANCELED`）不走这条——那是 `on_timeout` 的语义，尚未实现。
+   - **加载期会拦**：`abort` + `approved == false` 出边 = 矛盾，`Workflow.load_yaml`
+     直接报 `WorkflowDAGError`（`_check_on_reject_consistency`）。
+     **反方向不查**——`continue` 而没有驳回边是**合法**的（= 驳回后下游全部失活、
+     正常收敛），加进去会打掉 4 个既有测试。
+   - ⚠️ 但这条校验**只对编写路径生效**，加载冻结快照必须 `strict=False`（见约束 6.1）。
 
 4.2 **审批节点的位置就是"要不要人工拍板"的落点**：
    `plan → fix` 若直连，则 plan 一出 `fix` 立刻改代码——**没有任何决策点**。
@@ -110,6 +115,25 @@ make lint      # ruff 检查
    cp 的冗余投影——GET /runs 读列、Resume 读 cp）。只写列不写 cp 曾导致审批超时后
    Resume 永卡 waiting_approval（回归测试 `test_approval_timeout_resume_converges_sqlite`）。
 6. **版本冻结**（`core/workflow.py`）：Run 用 `workflow_hash` 复用 snapshot，Resume 只读原 snapshot。
+
+6.1 ⚠️ **静态校验只拦「编写路径」，绝不拦「加载冻结数据」**（2026-09-20 血的教训）
+   `DAG.build(..., strict=)` / `Workflow.load_yaml(..., strict=)`：`strict=True`（默认）
+   跑全部静态校验，`strict=False` **只跑结构性校验**（环 / 悬空 / join），跳过
+   `_check_on_reject_consistency` 这类**内容规则**。
+
+   **三处加载冻结数据的地方必须传 `strict=False`**：
+   `api/app.py` 的 run 列表（取 workflow 名）、run 详情（重建图）、
+   **`executor/resume.py`（从 checkpoint 恢复）**。
+
+   为什么是硬规则而不是风格：snapshot 是**冻结数据、永远不能被重新编辑**。
+   加一条新校验却让它作用到快照上 = **用新规则判旧数据有罪**，后果是
+   已经跑过的 run **永久读不出来**。实测代价（加 `on_reject` 校验后）：
+   `GET /runs/{id}` 35 个 run 里 **30 个图变空白**，`resume` 直接抛异常。
+   而 API 那处 `except: graph = {}` **把异常吞了**，症状表现为"前端图空白"，
+   排查方向完全指错（已加 `log.warning(exc_info=True)`）。
+
+   **判据**：这条校验拦的是「**还没保存的图**」还是「**已经跑过的 run**」？
+   后者一律 `strict=False`。
 
 6.0 ⚠️ **工作流的真源是数据库，不是仓库文件**（2026-09-16 起明确）
    - **存**：`POST /workflows` → `workflow_store.py` 的 `INSERT INTO workflows(id,name,yaml,created_at)`
