@@ -858,6 +858,31 @@ def _db_run_status(api_status: str) -> str:
     return _RUN_STATUS_TO_DB.get(api_status, api_status)
 
 
+def _halted_node(wf: Workflow | None, nodes_raw: dict) -> str | None:
+    """run 的 halt 落点：图上 ``kind: halt`` 的节点**且它 DONE** → 那个节点 id，否则 None。
+
+    ``status=success`` 只说明"没有节点失败"，**不说明诊断出了结果**：条件边不满足时
+    下游节点是 SKIPPED，而 SKIPPED 与 DONE 同属终态 → run 照样 ``done`` → API 照样
+    ``success``。实测踩过：一条零证据的 run（scope 定不了位、四个取证节点全负证据、
+    rca 自述"证据完全缺失"）走完全程报了 success。
+
+    **现算而不落库**：判据来自冻结的 snapshot（``kind == "halt"``）与 checkpoint，
+    两者都不可变，所以现算的结果**天然可复现**——也就不用动状态机：
+    run.status / TERMINAL / Worker 接单 CAS / 审批终态判定全都不用改。
+
+    ⚠️ 「列表」与「详情」必须共用这一份实现：两处各写一遍的话，同一条 run 会在
+    列表里显示"跑完了"、在详情里显示"中断"——这正是 ``_RUN_STATUS_TO_API`` 那张表
+    当初被抽出来的原因（同样是跑完的 run，列表说 done、详情说 success）。
+    """
+    if wf is None:
+        return None
+    for nid, cp in nodes_raw.items():
+        node = wf.dag.nodes.get(nid)
+        if node is not None and node.is_halt and cp.get("status") == DONE:
+            return nid
+    return None
+
+
 @app.get("/runs")
 async def list_runs(
     status: str | None = None,
@@ -893,12 +918,16 @@ async def list_runs(
     for run in rows:
         rid = run["run_id"]
         # workflow 名从原 snapshot 取（与 GET /runs/{id} 同源；workflow 被删也显示得出）
+        # wf 同时喂给 _halted_node —— 名字与 outcome 出自**同一份快照**，
+        # 不会出现"名字读到了、outcome 读不到"的半截状态。
         name = None
+        wf = None
         try:
             snap = await store.get_snapshot(run["workflow_snapshot_id"])
             if snap:
                 # strict=False：冻结快照（同上）
-                name = Workflow.load_yaml(snap["workflow_yaml"], strict=False).name
+                wf = Workflow.load_yaml(snap["workflow_yaml"], strict=False)
+                name = wf.name
         except (ValueError, yaml.YAMLError, WorkflowDAGError):
             name = None
 
@@ -906,10 +935,17 @@ async def list_runs(
         tokens = sum((cp.get("tokens") or 0) for cp in nodes_raw.values())
         cost = sum((cp.get("cost") or 0.0) for cp in nodes_raw.values())
 
+        halted_node = _halted_node(wf, nodes_raw)
+
         out.append({
             "run_id": rid,
             "workflow": name,
             "status": _api_run_status(run["status"]),
+            #: 与 GET /runs/{id} 同义（见 _halted_node）：``completed`` / ``halted``。
+            #: **列表里也必须给**——Ticket Inbox 要据此把"中断"从"进行中"里分出来，
+            #: 只有 status 的话它只能看到 ``success``，也就是"跑完了、没问题"。
+            "outcome": "halted" if halted_node else "completed",
+            "halted_at": halted_node,
             "total_tokens": tokens,
             "total_cost": cost,
             "inputs": run.get("inputs") or {},
@@ -993,23 +1029,8 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
             "upstream": upstream_out,
         })
 
-    # ---- outcome：**按图走完** 还是 **中途中断** ----
-    #
-    # ``status=success`` 只说明"没有节点失败"，**不说明诊断出了结果**：条件边不满足时
-    # 下游节点是 SKIPPED，而 SKIPPED 与 DONE 同属终态 → run 照样 ``done`` → API 照样
-    # ``success``。实测踩过：一条零证据的 run（scope 定不了位、四个取证节点全负证据、
-    # rca 自述"证据完全缺失"）走完全程报了 success。
-    #
-    # 这里**现算**而不落库：判据来自冻结的 snapshot（``kind == "halt"``）与 checkpoint，
-    # 两者都不可变，所以现算的结果**天然可复现**——也就不用动状态机：
-    # run.status / TERMINAL / Worker 接单 CAS / 审批终态判定全都不用改。
-    halted_node = None
-    if wf is not None:
-        for nid, cp in nodes_raw.items():
-            node = wf.dag.nodes.get(nid)
-            if node is not None and node.is_halt and cp.get("status") == DONE:
-                halted_node = nid
-                break
+    # ---- outcome：**按图走完** 还是 **中途中断** ----（判据与列表共用，见 _halted_node）
+    halted_node = _halted_node(wf, nodes_raw)
 
     return {
         "run_id": run_id,
