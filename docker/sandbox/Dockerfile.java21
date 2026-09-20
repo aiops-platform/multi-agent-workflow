@@ -17,19 +17,35 @@ FROM localhost/agentflow-sandbox:local
 # 测试床三个服务实测：JavaLanguageVersion.of(21) + gradle-8.10（wrapper 自带）。
 # 只装 JDK：`./gradlew` 会自己下发行版（Gradle 8.x 的 wrapper 是
 # `java -jar gradle-wrapper.jar` 下载，**不需要 wget/curl，也不需要 unzip**）。
-RUN apt-get update \
- && apt-get install -y --no-install-recommends openjdk-21-jdk-headless \
+# `Acquire::Retries`：apt 默认**不重试**，一个包校验和对不上就整次构建失败。JDK 这一坨
+# 实测有 ~123MB（jre-headless 40.8MB + jdk-headless 82.1MB），慢链路下偶发 `Hash Sum
+# mismatch` 是常态而不是意外——本地实测就栽过一次：16 个包成功、1 个下载损坏、整体 exit 100。
+# 加 5 次重试把这个概率压下去；不换镜像源（实测 deb.debian.org 反而是最快的那个：
+# 98 KB/s vs 阿里云 63 / 清华 23，换了更慢）。
+RUN apt-get -o Acquire::Retries=5 update \
+ && apt-get -o Acquire::Retries=5 install -y --no-install-recommends openjdk-21-jdk-headless \
  && rm -rf /var/lib/apt/lists/*
 
-# ---- gradle 发行版与依赖缓存 ----
-# `./gradlew test` 首次运行要下 gradle 本体（~130MB）+ Maven Central 全部依赖。
-# 这与"沙箱默认断网"直接冲突，解法是**预热**：把 GRADLE_USER_HOME 指到一个可挂载的
-# 路径，CI 里预先跑一次 `./gradlew dependencies` 填满，之后即可断网跑测试。
+# ---- gradle 发行版与依赖缓存：**烤进镜像** ----
 #
-# 注意缓存与 **gradle 版本 + 项目** 绑定：换 gradle 版本会重下。多服务时按服务分卷
-# （`gradle-home/{service}`），共用一份会在版本不一致时互相覆盖。
+# 为什么是"烤进镜像"而不是"运行时挂卷预热"：实测冷启动跑一次 `./gradlew test`
+# 要 **9 分 20 秒**（560s），而 `ws_run_tests` 的超时是 300s
+# → **首次调用必然超时**，tester 拿到的是 `passed: false` 的假失败，
+# 然后会去"修"一个并不存在的测试问题。预热后同一套测试 **11 秒**。
+# 所以预热不是性能优化，是**让首次运行可预测**的正确性前提。
+#
+# 烤进镜像（而非挂 PVC）的额外好处：不引入卷的生命周期，容器重启/换节点都无所谓。
+# 代价是镜像大 ~255MB——相对 JDK 基座本身不算离谱。
+#
+# ⚠️ 预热项目的 `distributionUrl` 必须与测试床服务**逐字相同**，否则 wrapper 的
+# 哈希对不上、缓存命中不了（见 warmup/gradle/wrapper/gradle-wrapper.properties）。
 ENV GRADLE_USER_HOME=/gradle-home
-VOLUME ["/gradle-home"]
+COPY docker/sandbox/warmup /warmup
+RUN cd /warmup && ./gradlew --no-daemon test && cd / && rm -rf /warmup
+
+# ⚠️ **这里刻意不写 `VOLUME ["/gradle-home"]`**：一旦声明成卷，k8s 的 volumeMount
+# （emptyDir / PVC）会**遮蔽**镜像里这一层，烤进去的缓存就白烤了。
+# 同理 deploy/worker-deployment.yaml 里**不能**再给 /gradle-home 挂卷。
 
 # 与基础镜像一致；沙箱**不装 git**——克隆与提交都在 worker（那也是唯一该有 PAT 的地方），
 # 仓库代码因此连做仓库操作的手段都没有。

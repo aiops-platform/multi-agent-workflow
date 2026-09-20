@@ -105,8 +105,18 @@ spec:
           volumeMounts:
             - name: workspace
               mountPath: /workspace
-            - name: gradle-home
-              mountPath: /gradle-home
+          # ⚠️ **不要再给 /gradle-home 挂卷**。
+          #
+          # gradle 发行版与依赖缓存已经**烤进镜像**（见 docker/sandbox/Dockerfile.java21）。
+          # 任何 volumeMount 到 /gradle-home 都会**遮蔽**镜像里那一层——emptyDir 挂上去
+          # 就是空的，烤进去的缓存全废，退回冷启动那 9 分 20 秒。
+          #
+          # 之所以从"挂 emptyDir 预热"改成"烤进镜像"：实测冷启动 560s > 所有超时阀值
+          # （函数 120 / ToolSpec 300 / SBX_MAX_EXEC_SECONDS 300）→ **首次调用必然超时**，
+          # tester 会拿到 `passed: false` 的假失败。烤进镜像后首次也是秒级。
+          #
+          # gradle 运行期仍会往 $GRADLE_USER_HOME 写（daemon 日志等），
+          # 落在容器的可写层里——不需要额外挂卷，重启丢了也无所谓（底子是烤好的）。
           resources:
             requests: { cpu: "500m", memory: "1Gi" }
             limits: { cpu: "2", memory: "4Gi" }
@@ -116,8 +126,4 @@ spec:
         # 布局 {root}/{tenant}/{run}/repos/{service} —— root 由 worker 的
         # AGENTFLOW_WORKSPACE_ROOT 指定，两个容器挂同一份。
         - name: workspace
-          emptyDir: {}
-        # gradle 发行版 + 依赖缓存。**首次构建要联网**（~130MB + Maven Central），
-        # 预热后即可断网跑测试。缓存与 gradle 版本绑定，多服务时按服务分卷。
-        - name: gradle-home
           emptyDir: {}

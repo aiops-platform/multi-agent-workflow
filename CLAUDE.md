@@ -231,10 +231,18 @@ make lint      # ruff 检查
 
    - **镜像分两层**：`docker/sandbox/Dockerfile`（基础）**永远可离线构建**，只跑 exec
      服务、不含工具链/不含 git/不含密钥；按 runtime 叠加变体
-     `Dockerfile.java21`（JDK21 + `GRADLE_USER_HOME` 卷）。**没有 `WITH_JDK` 构建参数了**
-     ——工具链与"零依赖离线可建"是矛盾的，揉在一起会让基础镜像的构建条件看开关。
+     `Dockerfile.java21`（JDK21 + **烤进镜像的 gradle 缓存**）。**没有 `WITH_JDK`
+     构建参数了**——工具链与"零依赖离线可建"是矛盾的，揉在一起会让基础镜像的构建条件看开关。
      Java 服务只装 JDK、不装 gradle：`./gradlew` 自带 wrapper（`java -jar
      gradle-wrapper.jar` 下载，不需要 wget/curl/unzip）。
+   - ⚠️ **gradle 缓存必须"烤进镜像"，不能靠运行时挂卷预热**。实测：冷启动跑一次
+     `./gradlew test` = **560s（9分20秒）**，而所有超时阀值都是 300s
+     → **首次调用必然超时**，tester 拿到 `passed: false` 的**假失败**，然后去"修"一个
+     并不存在的测试问题。烤进镜像后**首次 16.9s**（干净副本实测，含真编译真测试、零网络）。
+     两个连带约束：① 预热项目 `docker/sandbox/warmup/` 的 `distributionUrl` 必须与
+     测试床服务**逐字相同**（wrapper 的缓存路径哈希由 URL 算出，差一字符即白烤）；
+     ② **不能给 `/gradle-home` 挂任何卷**（含 Dockerfile 里的 `VOLUME`）——挂载会
+     **遮蔽**镜像里那一层，缓存全废、退回 560s。
    - **exec 服务默认只绑 loopback**（`SBX_HOST` 是显式逃生阀）。它**没有认证**，
      绑 `0.0.0.0` 会顺着 `hostNetwork` 暴露到节点网络。
    - **worker Pod 加 sidecar + 共享卷**（`deploy/worker-deployment.yaml`），两容器同挂

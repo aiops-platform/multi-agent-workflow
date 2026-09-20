@@ -1,0 +1,56 @@
+// 预热项目：只在 `Dockerfile.java21` 构建期跑一次，产物是 GRADLE_USER_HOME 里的缓存，
+// 这个项目本身烤完就删（见 Dockerfile 里的 `rm -rf /warmup`）。**它不是产品代码。**
+//
+// 为什么需要它：实测冷启动跑一次 `./gradlew test` 要 **9 分 20 秒**（560s），
+// 而 `ws_run_tests` 的超时是 300s —— 首次调用**必然超时**，tester agent 会拿到
+// 一个 `passed: false` 的假失败，然后去"修"一个不存在的测试问题。
+// 预热后同一套测试 **11 秒**完成。
+//
+// ⚠️ 依赖集合是**测试床三个服务的并集**（见下方注释标注来源）。这是刻意的耦合：
+// 沙箱镜像的用途就是跑这三个服务的测试。
+// 某个服务以后新增依赖 → 那一项走运行时下载（**降级，不是失败**），
+// 不会像"没有发行版"那样直接崩。真要同步，回来把这里补上。
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.3.5'
+    id 'io.spring.dependency-management' version '1.1.6'
+}
+
+java {
+    toolchain {
+        // 与三个服务一致；镜像里装的就是 JDK 21
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    set('springCloudVersion', '2023.0.3')
+}
+
+dependencies {
+    // ── 以下为三个服务 build.gradle 的并集 ──
+    implementation 'org.springframework.boot:spring-boot-starter-web'          // order, warranty
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'      // 三个都有
+    implementation 'io.micrometer:micrometer-registry-prometheus'               // 三个都有
+    implementation 'org.springframework.cloud:spring-cloud-starter-openfeign'   // order
+    implementation 'org.springframework.cloud:spring-cloud-starter-gateway'     // gateway
+    implementation 'net.logstash.logback:logstash-logback-encoder:7.4'          // 三个都有
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'      // 三个都有
+}
+
+dependencyManagement {
+    imports {
+        mavenBom "org.springframework.cloud:spring-cloud-dependencies:${springCloudVersion}"
+    }
+}
+
+// 跑 `test` 而不是 `dependencies`：前者会把 compileClasspath / testCompileClasspath /
+// runtimeClasspath / testRuntimeClasspath **四条**都解析并下载。
+// `gradle dependencies` 只报告声明，不保证把 jar 都拉下来——那样烤出来的缓存是残的。
+tasks.named('test') {
+    useJUnitPlatform()
+}
