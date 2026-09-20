@@ -21,7 +21,10 @@ async def load_snapshot_workflow(store: StateStore, snapshot_id: str) -> Workflo
     if snap is None:
         raise ValueError(f"snapshot 不存在: {snapshot_id}")
     raw_yaml = snap["workflow_yaml"]
-    return Workflow.load_yaml(raw_yaml)
+    # strict=False：snapshot 是**冻结的历史数据**，永远不能被重新编辑。
+    # 新加的静态校验用在这里 = 让已跑过的 run 恢复不了（实测踩过：
+    # 11/13 个快照被 on_reject 校验拦下，resume 直接抛异常）。
+    return Workflow.load_yaml(raw_yaml, strict=False)
 
 
 async def resume_executor(

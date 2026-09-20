@@ -130,11 +130,18 @@ class DAG:
     # 构建
     # ------------------------------------------------------------------
     @classmethod
-    def build(cls, raw_nodes: dict, raw_edges: list[dict] | None = None) -> DAG:
+    def build(
+        cls, raw_nodes: dict, raw_edges: list[dict] | None = None, *, strict: bool = True
+    ) -> DAG:
         """从 YAML 解析后的 ``nodes`` / ``edges`` 构建 DAG。
 
         ``raw_edges`` 为 None 时回退到节点内联 ``upstreams`` + ``when``（spike 兼容）。
+
+        ``strict=False``：**加载冻结的历史数据**（run snapshot）时用。
+        新加的静态校验只能拦「还没保存的图」，绝不能让**已经跑过的 run** 因为
+        新规则而读不出来——快照永远不会被重新编辑，拒绝它就是永久损坏。
         """
+
         # 1) 先建节点骨架
         nodes: dict[str, Node] = {}
         for nid, spec in raw_nodes.items():
@@ -208,16 +215,17 @@ class DAG:
                 node.in_edges[0].when = node.when
 
         dag = cls(nodes, edges)
-        dag._validate()
+        dag._validate(strict=strict)
         return dag
 
     # ------------------------------------------------------------------
     # 静态校验（§8.2.3）
     # ------------------------------------------------------------------
-    def _validate(self) -> None:
+    def _validate(self, *, strict: bool = True) -> None:
         self._check_cycle()
         self._check_join_consistency()
-        self._check_on_reject_consistency()
+        if strict:
+            self._check_on_reject_consistency()
 
     def _check_on_reject_consistency(self) -> None:
         """``on_reject: abort`` 的审批节点**不得有驳回出边**（§8.1 / CLAUDE.md 约束 4.1）。

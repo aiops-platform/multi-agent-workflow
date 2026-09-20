@@ -31,7 +31,7 @@ class Workflow:
     # 加载
     # ------------------------------------------------------------------
     @classmethod
-    def load_yaml(cls, source: str | Path | dict) -> Workflow:
+    def load_yaml(cls, source: str | Path | dict, *, strict: bool = True) -> Workflow:
         if isinstance(source, dict):
             raw = source
         elif isinstance(source, Path):
@@ -51,7 +51,7 @@ class Workflow:
         if not isinstance(raw, dict):
             raise ValueError("Workflow YAML 顶层必须是对象")
 
-        dag = DAG.build(raw.get("nodes", {}) or {}, raw.get("edges"))
+        dag = DAG.build(raw.get("nodes", {}) or {}, raw.get("edges"), strict=strict)
         dag.check_params_refs()
 
         return cls(

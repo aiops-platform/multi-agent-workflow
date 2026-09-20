@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import sqlite3
 from contextlib import asynccontextmanager
@@ -49,6 +50,8 @@ from .management_store import build_management_store
 from .mcp_store import MCPStore, build_mcp_store
 from .ticket_store import TICKET_NEW, TICKET_RUNNING, TicketStore, build_ticket_store
 from .workflow_store import WorkflowStore, build_workflow_store
+
+log = logging.getLogger("agentflow.api")
 
 settings: Settings = get_settings()
 # 租户注册表：import 时为 builtin 默认（dev）；init() 从管理库重建（v5.3 §5.2）
@@ -893,7 +896,8 @@ async def list_runs(
         try:
             snap = await store.get_snapshot(run["workflow_snapshot_id"])
             if snap:
-                name = Workflow.load_yaml(snap["workflow_yaml"]).name
+                # strict=False：冻结快照（同上）
+                name = Workflow.load_yaml(snap["workflow_yaml"], strict=False).name
         except (ValueError, yaml.YAMLError, WorkflowDAGError):
             name = None
 
@@ -933,9 +937,14 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
     try:
         snap = await store.get_snapshot(run["workflow_snapshot_id"])
         if snap:
-            wf = Workflow.load_yaml(snap["workflow_yaml"])
+            # strict=False：冻结快照不该被**新加的**静态校验拦住（见 core/dag.build 的说明）
+            wf = Workflow.load_yaml(snap["workflow_yaml"], strict=False)
             graph = _workflow_graph(wf)
     except (ValueError, yaml.YAMLError, WorkflowDAGError):
+        # ⚠️ 别静默：图空白是**用户直接可见**的症状，而这行 `graph = {}` 会让它
+        # 看起来像前端坏了。实测踩过——加了条 DAG 校验后 30/35 个 run 的图变空白，
+        # 查了半天前端，真因在这里被吞掉了。
+        log.warning("[%s] snapshot 重建图失败，本次返回空图", run_id, exc_info=True)
         graph = {}
 
     nodes_raw = await store.get_nodes(run_id)

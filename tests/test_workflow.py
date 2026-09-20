@@ -172,3 +172,39 @@ def test_on_reject_continue_without_reject_edge_still_loads() -> None:
         ],
     }
     assert Workflow.load_yaml(raw).dag.nodes["appr"].on_reject == "continue"
+
+
+def test_abort_with_reject_edge_is_loadable_when_not_strict() -> None:
+    """**冻结的历史数据必须能加载**——`strict=False` 放行。
+
+    背景（实测踩过，2026-09-20）：`_check_on_reject_consistency` 加进 `_validate()`
+    之后，**11/13 个已冻结的 run snapshot 加载失败**（它们正是 `abort` + 驳回边那种图）。
+    后果：
+      - `GET /runs/{id}` 重建图失败 → 被 `except: graph = {}` 吞掉 → **流程图空白**
+      - `executor/resume.py` 从 checkpoint 恢复时**直接抛异常** → 历史 run 恢复不了
+
+    snapshot 是**冻结数据、永远不能被重新编辑**——用新规则拒绝它 = 永久损坏。
+    所以静态校验只拦「还没保存的图」（strict，编写路径），
+    加载冻结数据一律 `strict=False`。
+    """
+    raw = {
+        "nodes": {
+            "a": {"agent": "triage"},
+            "appr": {"kind": "approval", "approvers": ["lead"], "on_reject": "abort"},
+            "recap": {"agent": "postmortem"},
+        },
+        # 用**显式边**（快照里存的就是这种形态）；`upstreams` 只在没有 edges 时生效，
+        # 两者混写会得到空入边表（本文件上一条测试的 docstring 记过这个坑）。
+        "edges": [
+            {"from": "a", "to": "appr"},
+            {"from": "appr", "to": "recap",
+             "when": "$.nodes.appr.output.approved == false"},
+        ],
+    }
+    # 编写路径：拦下
+    with pytest.raises(WorkflowDAGError, match="永远不可达"):
+        Workflow.load_yaml(raw)
+    # 冻结数据路径：放行（同一个图！）
+    wf = Workflow.load_yaml(raw, strict=False)
+    assert wf.dag.nodes["appr"].on_reject == "abort"
+    assert "recap" in [e.target for e in wf.dag.edges if e.source == "appr"]
