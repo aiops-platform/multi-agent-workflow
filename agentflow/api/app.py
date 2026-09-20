@@ -666,6 +666,63 @@ async def create_ticket(
     return created
 
 
+async def _with_latest_run(ctx: TenantContext, ticket: dict) -> dict:
+    """给工单挂上它**最近一次** run 的状态摘要（``latest_run``）。
+
+    ## 为什么必须挂（工单自己的 status 靠不住）
+
+    工单的 ``status`` 只在 ``POST /tickets/{tid}/run`` 里被置成 ``TICKET_RUNNING``，
+    **之后没有任何代码再改它** —— run 结束（成功 / 失败 / 中断）都不会回写。
+    于是列表里那条会**永远是 running**，哪怕 run 早就停在 halt 节点上了。
+    前端要区分「还在跑」与「跑完了但缺信息」，只能自己去读 run。
+
+    ``run_ids`` 是按发起顺序追加的，取**最后一条**即最近一次。
+
+    ## 为什么要 outcome 而不只是 status
+
+    ``status=success`` 只说明"没有节点失败"。中断的 run（``kind: halt`` 被触发、
+    其余 PENDING 全部 SKIPPED）同样是 ``done`` → ``success``。
+    判据同 ``_halted_node``，两处共用一份实现。
+
+    ## 代价
+
+    **N+1**：只对 ``running`` 的工单算 —— 别的状态前端根本不看 run。
+    未发起过 run 的工单直接给 ``None``，不白读一次库。
+    """
+    run_ids = ticket.get("run_ids") or []
+    if not run_ids or ticket.get("status") != TICKET_RUNNING:
+        return {**ticket, "latest_run": None}
+
+    rid = run_ids[-1]
+    try:
+        # 复用 _run_for_tenant —— 租户隔离的判据只该有一份（跨租户 404）
+        run = await _run_for_tenant(rid, ctx)
+        store = await _service().store_for(ctx.tenant_id)
+        nodes_raw = await store.get_nodes(rid)
+        wf = None
+        snap = await store.get_snapshot(run["workflow_snapshot_id"])
+        if snap:
+            # strict=False：冻结快照
+            wf = Workflow.load_yaml(snap["workflow_yaml"], strict=False)
+        halted_node = _halted_node(wf, nodes_raw)
+    except (ValueError, yaml.YAMLError, WorkflowDAGError, KeyError, HTTPException):
+        # run 被清理 / 快照坏掉 / 跨租户：如实给 None（前端退回显示工单自己的 status），
+        # 而不是让整个列表 500。工单列表是入口页，它挂掉什么都做不了。
+        #
+        # `run_ids` 只是关联记录，run 被清理后它就悬空了 —— 那是数据现实，不是错误。
+        return {**ticket, "latest_run": None}
+
+    return {
+        **ticket,
+        "latest_run": {
+            "run_id": rid,
+            "status": _api_run_status(run["status"]),
+            "outcome": "halted" if halted_node else "completed",
+            "halted_at": halted_node,
+        },
+    }
+
+
 @app.get("/tickets")
 async def list_tickets(
     status: str | None = None,
@@ -673,19 +730,20 @@ async def list_tickets(
     offset: int = 0,
     ctx: TenantContext = Depends(get_tenant_context),
 ) -> list[dict]:
-    """列出该租户的工单（新→旧）。"""
-    return await (await _control_stores(ctx)).ticket.list(
+    """列出该租户的工单（新→旧）。每条附 ``latest_run``（见 ``_with_latest_run``）。"""
+    rows = await (await _control_stores(ctx)).ticket.list(
         ctx.tenant_id, status=status, limit=max(1, min(limit, 200)), offset=max(0, offset)
     )
+    return [await _with_latest_run(ctx, t) for t in rows]
 
 
 @app.get("/tickets/{tid}")
 async def get_ticket(tid: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
-    """取单条工单。跨租户一律 404（不泄漏存在性，§9.2）。"""
+    """取单条工单。跨租户一律 404（不泄漏存在性，§9.2）。附 ``latest_run``。"""
     ticket = await (await _control_stores(ctx)).ticket.get(ctx.tenant_id, tid)
     if ticket is None:
         raise HTTPException(status_code=404, detail="ticket 不存在")
-    return ticket
+    return await _with_latest_run(ctx, ticket)
 
 
 @app.post("/tickets/{tid}/run")
