@@ -45,6 +45,19 @@ LogEvidenceSchema = {
                 "required": ["error_message", "why"],
             },
         },
+        #: **窗口内实际出过 ERROR 的服务**（取自 `query_logs` 返回的 `by_service`）。
+        #:
+        #: 为什么要单列：`code-locator` 的目标服务原先**只**来自 trace 的
+        #: `failing_service`，工单没带 `trace_id` 时它为空 → locate 直接报
+        #: `found: false` → run 在 halt 处结束，**整条诊断链白跑**。
+        #: 而日志里其实明明白白写着是哪个服务在报错——这份证据一直存在，
+        #: 只是没有任何字段把它交出去。
+        #:
+        #: ⚠️ 与 trace 的 `failing_service` **不是一回事**，别混用：
+        #: trace 给的是「调用链上判定为故障 span 的那个服务」（窄、准、有运行时证据），
+        #: 这里给的是「这一窗口里日志中出现过错误的所有服务」（宽，**可能含症状服务**）。
+        #: 下游（`code-locator`）必须按**弱证据**用，并在输出里标明来源是日志。
+        "services": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["error_type", "error_message", "summary"],
 }
