@@ -119,9 +119,15 @@ nodes:
       plan: "$.nodes.plan.output"
     approvers: []
     timeout: 86400
-    # ⚠️ on_reject 引擎**只解析、从不消费**（全仓仅 core/dag.py 三处）——拒绝路由靠下面那条
-    #    `when: approved == false` 的边。写在这只是为了说明默认值，别指望它生效。
-    on_reject: abort
+    # `on_reject: continue` —— 驳回**不中止 run**，而是沿下面那条
+    # `approved == false → recap` 的边走，让复盘节点记下"方案被否"。
+    #
+    # ⚠️ 必须显式写 `continue`。引擎里 `on_reject` 的默认值是 `abort`，而 `abort` 下
+    #    **run 直接抛 WorkflowNodeFailed 中止**，那条 `→ recap` 边**永远不可达**——
+    #    图看着有去处，实际是死的，且加载与运行都不报错。
+    #    （此前的注释写「on_reject 只解析、从不消费」是**过时**的：`rejected_abort_node()`
+    #    早在 2026-09-18 01:12 就落地了，见 docs/TODO.md §21 与 CLAUDE.md 约束 4.1。）
+    on_reject: continue
 
   # ── 复盘（仅拒绝/超时分支；批准路径被 skip 级联跳过）─────────────────────────
   recap:
