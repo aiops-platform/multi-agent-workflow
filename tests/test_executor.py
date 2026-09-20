@@ -10,7 +10,7 @@ from agentflow.core.workflow import Workflow
 from agentflow.executor.dag_executor import DAGExecutor, WorkflowNodeFailed
 from agentflow.statestore.memory import InMemoryStateStore
 
-from .conftest import PARALLEL_YAML, SIMPLE_YAML
+from .conftest import PARALLEL_ABORT_YAML, PARALLEL_YAML, SIMPLE_YAML
 
 
 def make_runner(calls: dict | None = None):
@@ -133,7 +133,10 @@ async def test_approval_reject_aborts_run_when_on_reject_abort() -> None:
     全仓没有消费方。图上写 `abort` 的节点实际一直走"沿拒绝边路由"，
     窄的那条静默胜出。
     """
-    yaml_text = PARALLEL_YAML.replace("on_reject: continue", "on_reject: abort")
+    # 用 conftest 里的合法 abort 变体（abort + **无驳回边**）。
+    # 不能再拿 `continue` 那张图只换字段——那会得到 abort + 驳回边的矛盾图，
+    # 加载期就被 _check_on_reject_consistency 拦下。
+    yaml_text = PARALLEL_ABORT_YAML
     assert "on_reject: abort" in yaml_text  # 防止 fixture 改名后本测试静默失效
 
     ex, _, _, _ = build_executor(yaml_text)
@@ -146,7 +149,9 @@ async def test_approval_reject_aborts_run_when_on_reject_abort() -> None:
     assert "驳回" in str(exc.value)
     # 节点状态仍是 REJECTED（保留"谁驳的、理由是什么"），不是 failed
     assert ex.get_status("approve") == REJECTED
-    assert ex.get_status("recap") != DONE
+    # 中止发生在任何下游被调度之前（原断言看 recap，但 abort 变体里没有驳回路由、
+    # 也就没有 recap 节点——改成看"批准侧的下游"同样成立且更贴题）
+    assert ex.get_status("test") != DONE
 
 
 async def test_approval_reject_aborts_on_resume_path_too() -> None:
@@ -161,8 +166,8 @@ async def test_approval_reject_aborts_on_resume_path_too() -> None:
     所以判据必须是**状态**（`rejected_abort_node()`）而不是**动作**。
     本测试刻意**不调 approve()**，直接把节点置成 REJECTED 后 run —— 与 Worker 同构。
     """
-    yaml_text = PARALLEL_YAML.replace("on_reject: continue", "on_reject: abort")
-    wf = Workflow.load_yaml(yaml_text)
+    # 同 test_approval_reject_aborts_run_when_on_reject_abort：必须用无驳回边的变体
+    wf = Workflow.load_yaml(PARALLEL_ABORT_YAML)
     store = InMemoryStateStore()
     runner, _ = make_runner()
     ex = DAGExecutor("run_resume_reject", "t", wf.dag, store, node_runner=runner, inputs={})
@@ -569,7 +574,9 @@ _CASCADE_SKIP_YAML = """
 name: cascade-skip
 nodes:
   a: { agent: triage }
-  appr: { kind: approval, name: "审批" }
+  # on_reject 必须显式写 continue：默认是 abort，而 abort 下下面那条
+  # `approved == false` 边永远不可达（且加载期就会被校验拦下）。
+  appr: { kind: approval, name: "审批", on_reject: continue }
   b: { agent: tester, upstreams: [appr] }
   c: { kind: approval, name: "二级审批", upstreams: [b] }
   d: { agent: committer, upstreams: [c] }

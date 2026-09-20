@@ -15,9 +15,24 @@
 """
 from __future__ import annotations
 
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
+
+#: 边的 ``when`` 是否表达「该审批被驳回」。
+#:
+#: 只在 when 里找 ``<节点>.output.approved`` 与 ``false``/``!= true`` 的组合——
+#: 本仓 ``when`` 一律写成 ``$.nodes.<id>.output.approved == false`` 这一种形态
+#: （见两个 seed workflow 与 scripts/*.workflow.yaml）。刻意不做通用表达式解析：
+#: 判据收窄一点，误报就少一点；漏掉的极端写法最多是"退回今天的行为"（静默）。
+_REJECT_WHEN = re.compile(r"approved\s*(?:==\s*false|!=\s*true)")
+
+
+def _is_reject_when(when: str | None, node_id: str) -> bool:
+    if not when:
+        return False
+    return f"{node_id}.output.approved" in when and bool(_REJECT_WHEN.search(when))
 
 # 节点状态
 PENDING = "pending"
@@ -202,6 +217,37 @@ class DAG:
     def _validate(self) -> None:
         self._check_cycle()
         self._check_join_consistency()
+        self._check_on_reject_consistency()
+
+    def _check_on_reject_consistency(self) -> None:
+        """``on_reject: abort`` 的审批节点**不得有驳回出边**（§8.1 / CLAUDE.md 约束 4.1）。
+
+        这是**矛盾**，不是风格问题：``abort`` 下驳回会直接抛 ``WorkflowNodeFailed``
+        中止整条 run，那条 ``approved == false`` 的出边**永远不可达**——
+        图看着有去处，实际是死的，而加载与运行都不报错。
+
+        实测踩过（2026-09-18）：``scripts/problem-log-diagnose.workflow.yaml`` 同时写了
+        两个，作者基于一句**已失效 14.5 小时的注释**（"on_reject 只解析、从不消费"）
+        以为 ``abort`` 是无害的默认值。是测试红了才发现的，而这类问题本该在**加载期**拦下。
+
+        ⚠️ **反方向不查**：``continue`` 而**没有**驳回边是**合法**的，语义为
+        「驳回后下游全部失活、run 照常收敛（不中止）」——与 ``abort`` 的区别正在于此。
+        （`tests/test_run_api.py` 的 APPROVAL_YAML 就是这个形态，且注释写明了意图。）
+        一开始我把这一向也写成报错，打掉了 4 个既有测试才想明白。
+        """
+        for nid, node in self.nodes.items():
+            if not node.is_approval or node.on_reject != "abort":
+                continue
+            dead = [
+                e.target for e in self.edges
+                if e.source == nid and _is_reject_when(e.when, nid)
+            ]
+            if dead:
+                raise WorkflowDAGError(
+                    f"审批节点 {nid} 声明 on_reject: abort，却存在驳回出边 → {dead}；"
+                    f"abort 下 run 会直接中止，**那条边永远不可达**。"
+                    f"要么改成 on_reject: continue，要么删掉那条边（CLAUDE.md 约束 4.1）"
+                )
 
     def _check_cycle(self) -> None:
         """Kahn 拓扑排序检测环。"""

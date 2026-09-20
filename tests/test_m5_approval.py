@@ -163,6 +163,9 @@ async def test_approval_timeout_resume_converges_sqlite() -> None:
             "approve-changes": {
                 "kind": "approval", "name": "审批修复方案",
                 "approvers": ["lead"], "timeout": -1,  # 负超时 → 创建即过期
+                # 必须显式 continue：默认 abort 下，下面那条拒绝边永远不可达
+                # （本测试要验的正是"超时后沿拒绝路径收敛"）。
+                "on_reject": "continue",
             },
             "recap": {"agent": "postmortem"},
         },

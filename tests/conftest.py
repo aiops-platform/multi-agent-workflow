@@ -97,6 +97,32 @@ edges:
 """
 
 
+def _parallel_abort_variant() -> str:
+    """`PARALLEL_YAML` 的 `on_reject: abort` 变体——**必须同时去掉驳回路由**。
+
+    只把 `on_reject` 换成 `abort` 会得到「abort + 驳回边」的**矛盾图**：abort 下驳回
+    直接抛 WorkflowNodeFailed 中止整条 run，那条 `approved == false` 边**永远不可达**。
+    这种图现在**加载期就报错**（`DAG._check_on_reject_consistency`），所以不能那样构造。
+
+    ⚠️ 这与 `continue` 变体（本 fixture 原样）是一对，仍能证明 `on_reject` **被读取**：
+    同样的驳回动作，只因这个字段取值不同，走向完全相反（沿边路由 vs 中止）。
+    差别只在于 abort 侧没有驳回边可画——因为那种边在 abort 下没有意义。
+    """
+    y = PARALLEL_YAML.replace("on_reject: continue", "on_reject: abort")
+    for frag in (
+        '  recap:\n    agent: postmortem\n'
+        '    when: "$.nodes.approve.output.approved == false"\n',
+        '  - { from: approve, to: recap, when: '
+        '"$.nodes.approve.output.approved == false" }\n',
+    ):
+        assert frag in y, f"PARALLEL_YAML 变了，本变体的裁剪点已失效：{frag!r}"
+        y = y.replace(frag, "")
+    return y
+
+
+PARALLEL_ABORT_YAML = _parallel_abort_variant()
+
+
 @pytest.fixture
 def simple_dag() -> DAG:
     from agentflow.core.workflow import Workflow
