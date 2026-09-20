@@ -50,12 +50,23 @@ class ApprovalSweeper:
 
         tenants_provider 给出租户清单 → 逐租户扫描各自租户库；未提供（单库
         用法/测试）退化为单 store 扫描。
+
+        **逐租户隔离**：单个租户失败只记日志并跳过，**不中断整轮**。
+        此前没有这层保护——一个坏租户（实测：`db_ref_enc` 解不开）会让
+        `_store(tid)` 抛异常、整个 for 中断，**排在它后面的租户全部扫不到**。
+        而且坏租户的位置决定了谁受害：排在前面时"看起来一切正常"，
+        排到最后时才"恰好没人受影响"——纯属运气，没有任何报错指向真正的原因。
         """
         if self._tenants_provider is not None:
             timed_out: list[dict] = []
             for tid in await self._tenants_provider():
-                store = await self._store(tid)
-                timed_out.extend(await self._scan(store))
+                try:
+                    store = await self._store(tid)
+                    timed_out.extend(await self._scan(store))
+                except Exception:  # noqa: BLE001 —— 一个租户坏掉不该饿死其余租户
+                    log.exception(
+                        "sweeper：租户 %s 扫描失败（已跳过，其余租户继续）", tid
+                    )
             return timed_out
         return await self._scan(await self._store(None))
 

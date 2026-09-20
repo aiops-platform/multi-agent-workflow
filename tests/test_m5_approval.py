@@ -283,3 +283,46 @@ async def test_notifier_record() -> None:
                        tenant_id="team-alpha", approvers=["lead"])
     assert r["kind"] == "waiting"
     assert r["approvers"] == ["lead"]
+
+
+# ----------------------------------------------------------------------
+# sweeper 的逐租户隔离
+# ----------------------------------------------------------------------
+async def test_sweeper_one_bad_tenant_does_not_starve_the_rest(monkeypatch) -> None:
+    """一个租户坏掉，**排在它后面的租户仍要被扫到**。
+
+    回归背景（实测踩过）：`run_once` 逐租户 `await self._store(tid)` 且**没有
+    try/except** → 某个租户的 `db_ref_enc` 解不开时抛异常、整个 for 中断，
+    排在它后面的租户全部扫不到。而且**坏租户的位置决定谁受害**——排在最后时
+    "恰好没人受影响"，看起来一切正常。没有任何报错指向真正的原因。
+    """
+    store = InMemoryStateStore()
+    good_a, good_c = SqliteStateStore(":memory:"), SqliteStateStore(":memory:")
+    for s in (good_a, good_c):
+        await s.connect()
+
+    order: list[str] = []
+
+    async def resolve(tid):
+        order.append(tid)
+        if tid == "bad":
+            raise ValueError("db_ref 解密失败（密钥不匹配？）")
+        return {"a": good_a, "c": good_c}[tid]
+
+    class _Router:
+        async def resolve(self, tid):
+            return await resolve(tid)
+
+    sweeper = ApprovalSweeper(
+        _Router(), InMemoryQueue(), interval=1,
+        tenants_provider=lambda: _order(),
+    )
+
+    async def _order():
+        return ["a", "bad", "c"]
+
+    timed = await sweeper.run_once()
+
+    # 三个都被尝试过（坏的那个没让 for 提前退出）
+    assert order == ["a", "bad", "c"], f"坏租户中断了整轮：{order}"
+    assert timed == []
