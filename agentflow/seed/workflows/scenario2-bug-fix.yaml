@@ -129,14 +129,35 @@ nodes:
   halt:
     kind: halt
     description: "中断：证据不足时停在这里，不再往下走（不调 LLM）"
+  # ---- logs → locate：给「定位要改哪个仓库」补一条退路 ----
+  #
+  # 与场景1 同款改动（见 scenario1-quotation-print-fail.yaml 上的完整说明）。
+  #
+  # 场景2 的主路径本来就有 trace（测试床的 warranty-service 真的在报带 traceId 的错），
+  # `target_service` 通常解析得出。但**工单没带 trace_id 时它必为空** ——
+  # 而那正是演示里手建工单的常见形态（Ticket Inbox 的 trace_id 是选填）。
+  # 那时 locate 报 found=false → 触发 `locate → halt` → 整条诊断链白跑，
+  # 而同一窗口的日志里明明写着是哪个服务在报错。
+  #
+  # ⚠️ 证据强度不同：trace 的 failing_service 是运行时判定（强），
+  # logs 的 services 是「窗口内报过错的服务」（弱，**可能是症状服务** ——
+  # 场景2 恰恰是跨服务故障，症状服务与根因服务不是同一个）。
+  # 所以 code-locator 用兜底时**必须**在 `target_source` 里标出来（prompt 已要求）。
+  #
+  # ⚠️ required_edges 必须同步加 logs：join: all 的判据是
+  # `all(_edge_active(e) for e in in_edges if e.source in required)` ——
+  # 只加边不加它等于**不等待** logs，`log_services` 会解析成 None。
   locate:
     agent: code-locator
     description: "代码定位：由服务名定位仓库，列出可疑文件"
     join: all
-    required_edges: [triage, trace]
+    required_edges: [triage, trace, logs]
     params:
       bug: "$.nodes.triage.output.summary"
       target_service: "$.nodes.trace.output.failing_service"
+      # logs 的负证据形如 {found:false, services:[], ...}；为空数组时
+      # code-locator 走"两个都空 → found:false"那条分支，语义正确。
+      log_services: "$.nodes.logs.output.services"
     on_failure: abort
 
   know:
@@ -294,6 +315,8 @@ edges:
   - { from: scope, to: metrics, when: "$.nodes.scope.output.insufficient == false" }
   - { from: scope, to: infra, when: "$.nodes.scope.output.insufficient == false" }
   - { from: trace, to: locate }
+  # logs → locate：trace 给不出 failing_service 时的退路（见 locate 节点上的说明）
+  - { from: logs, to: locate }
   - { from: logs, to: rca }
   - { from: trace, to: rca }
   - { from: metrics, to: rca }
