@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from agentflow.core.dag import DONE, REJECTED, SKIPPED
+from agentflow.core.dag import DONE, FAILED, REJECTED, SKIPPED
 from agentflow.core.workflow import Workflow
 from agentflow.executor.dag_executor import DAGExecutor, WorkflowNodeFailed
 from agentflow.statestore.memory import InMemoryStateStore
@@ -252,32 +252,48 @@ async def test_evidence_gate_reject_routes_to_recap_without_aborting() -> None:
     assert ex.get_status("commit") == SKIPPED
 
 
-async def test_failed_tests_skip_review_and_gate() -> None:
-    """测试不过 → review 与证据门 SKIPPED（条件边不满足），recap 收口。
+async def test_failed_tests_fail_the_node_and_the_run() -> None:
+    """测试不过 → **test 节点判 failed、整条 run 判 failed**（不再"跳过下游、recap 收口"）。
 
-    这条是 `halt` 存在的理由的反面：`test.passed == false` 跳过下游是**设计内行为**，
-    与"中断"是两回事——所以判中断要用 `halt_triggered()`（图上的 kind），不能靠数 SKIPPED。
+    ## 改于 2026-09-21（原设计）
+
+    原先 `test.passed == false` 走条件边跳过 review/证据门，由 recap 收口 ——
+    也就是"跑完了但结论是不通过"在图上**仍是 done（绿）**、run 仍算 `completed`。
+
+    **实测代价**（run_668981c0a7）：tester 输出 `{passed: false, tests_run: 0,
+    failed: ["沙箱未接线，一条测试都没跑", …]}`，而节点全绿、看板显示"已完成" ——
+    实际修复没落盘、一条测试都没跑。图上一片绿是最误导的一种失败。
+
+    现在由 executor 的 `VERDICT_FIELDS` 认这个结论字段（`tester` → `passed`），
+    显式 false 即节点失败。`reviewer` 的 `approved` 同理。
+
+    ⚠️ 这**不是** halt：`halt` 是"证据不足、不往下走"（图上的 `kind`），
+    这里是"结论不通过"（节点失败）。两条判据仍要分开，`halt_triggered()` 应为 False。
     """
     bad = dict(OK_OUTPUTS, test={"passed": False, "tests_run": 3, "failed": ["T1"]})
     ex = build(bad)
     await ex.run()
     await ex.approve("approve-plan", approved=True, by="lead-engineer")
-    assert await ex.run() == "done"
-    assert ex.get_status("review") == SKIPPED
-    assert ex.get_status("approve-commit") == SKIPPED
-    assert ex.get_status("recap") == DONE
+    with pytest.raises(WorkflowNodeFailed):
+        await ex.run()
+    assert ex.get_status("test") == FAILED
     assert ex.halt_triggered() is False
 
 
-async def test_review_reject_routes_to_recap() -> None:
-    """审查不通过 → 证据门 SKIPPED，recap 收口。"""
+async def test_review_reject_fails_the_node_and_the_run() -> None:
+    """审查不通过 → **review 节点判 failed、run 判 failed**（同 test，见上一条的说明）。
+
+    改动原因与 `test_failed_tests_fail_the_node_and_the_run` 同：`approved: false`
+    以前只是"跳过证据门"，节点仍是绿的。
+    """
     bad = dict(OK_OUTPUTS, review={"approved": False, "comments": ["回归风险"], "risk": "high"})
     ex = build(bad)
     await ex.run()
     await ex.approve("approve-plan", approved=True, by="lead-engineer")
-    assert await ex.run() == "done"
-    assert ex.get_status("approve-commit") == SKIPPED
-    assert ex.get_status("recap") == DONE
+    with pytest.raises(WorkflowNodeFailed):
+        await ex.run()
+    assert ex.get_status("review") == FAILED
+    assert ex.halt_triggered() is False
 
 
 # ── 行为：中断（halt）────────────────────────────────────────────────────────

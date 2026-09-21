@@ -415,11 +415,15 @@ edges:
   # 止血被驳回也要有去处，否则 DAG 在那个分支上断掉
   - { from: approve-remediate, to: recap, when: "$.nodes.approve-remediate.output.approved == false" }
   - { from: test, to: review, when: "$.nodes.test.output.passed == true" }
-  - { from: test, to: recap, when: "$.nodes.test.output.passed == false" }
+  # ⚠️ 这里原有两条「测试没过 / 审查没过 → 直接 recap 收口」的边，**已删**。
+  # 2026-09-21 起，`tester.passed == false` 与 `reviewer.approved == false` 由 executor
+  # 的 `VERDICT_FIELDS` 判成**节点失败**（红）、整条 run 判 failed —— 那两条边因此
+  # **永远不可达**（失败节点的出边恒失活），留着就是"看着还有条退路、实际走不到"。
+  # 代价：测试/审查不通过时不再有复盘（run 直接失败）。要保留复盘，得由平台支持
+  # "收敛到 recap 之后再判失败"，那是另一件事。
 
   # 审查 → 提交审批
   - { from: review, to: approve-commit, when: "$.nodes.review.output.approved == true" }
-  - { from: review, to: recap, when: "$.nodes.review.output.approved == false" }
 
   # 审批 → 提交 → 复盘
   - { from: approve-commit, to: commit, when: "$.nodes.approve-commit.output.approved == true" }

@@ -21,6 +21,7 @@ from typing import Any
 from ..core.dag import (
     DAG,
     DONE,
+    FAILED,
     PENDING,
     REJECTED,
     REJECTED_CANCELED,
@@ -51,6 +52,23 @@ NodeRunner = Callable[[Node, dict], Awaitable[Any]]
 # 执行前先查同 run+node+幂等键 的成功记录，命中则复用（§8.4.2），crash 重放不重复。
 SIDE_EFFECT_AGENTS = frozenset({"committer", "infra-remediator"})
 
+#: 「跑完了」≠「通过了」：这几个 agent 的输出里有一个**结论字段**，
+#: 显式为 ``False`` 时节点判 **FAILED**（红），而不是 DONE（绿）。
+#:
+#: ## 为什么放在 executor 层，而不是让 runner 抛
+#:
+#: 放 runner 里抛的话会走 `_run_with_retry` 的 `on_error` → `on_failure: continue`
+#: 会把它转成**负证据**、节点照样标 DONE —— **那正是要避免的"看着成功"**。
+#: 所以判定在 `on_failure` 之外，与上面的 `SIDE_EFFECT_AGENTS` 同类（本模块不 import
+#: `agents/`，避免反向依赖，故这些 agent 名的小表就地维护）。
+#:
+#: ## 实测背景（run_668981c0a7）
+#:
+#: `tester` 输出 `{"passed": false, "tests_run": 0, "failed": ["沙箱未接线，一条测试都没跑", …]}`，
+#: 而节点状态是 **done（绿）**、run 走完算 **completed** —— 图上一片绿，
+#: 实际什么都没验证。审批/审查同一类："跑完了但结论是不通过"。
+VERDICT_FIELDS = {"tester": "passed", "reviewer": "approved"}
+
 
 class WorkflowNodeFailed(Exception):
     """节点失败 → run 判 failed。
@@ -60,10 +78,15 @@ class WorkflowNodeFailed(Exception):
     「执行失败（重试耗尽）: 审批被驳回」这种自相矛盾的行（实测踩过）。
     """
 
-    def __init__(self, node_id: str, cause: Exception, *, message: str | None = None) -> None:
+    def __init__(self, node_id: str, cause: Exception, *, message: str | None = None,
+                 output: Any = None) -> None:
         super().__init__(message or f"节点 {node_id} 执行失败（重试耗尽）: {cause}")
         self.node_id = node_id
         self.cause = cause
+        #: 失败时**保留的输出**（正常失败没有输出，为 None）。
+        #: "结论不通过"这类失败必须带上 —— 用户要看的就是那份证据（测试跑了什么、
+        #: 哪几条没过）。丢掉它，节点详情里只剩一句结论，等于把证据扔了。
+        self.output = output
 
 
 class NodeInputError(Exception):
@@ -556,6 +579,29 @@ class DAGExecutor:
             key = f"{self.run_id}:{node.id}"
         return key
 
+    def _raise_on_negative_verdict(self, nid: str, agent: str, output: Any) -> None:
+        """agent 的**结论字段**显式为 False → 节点判失败（见 `VERDICT_FIELDS`）。
+
+        只认 `is False`：字段缺失 / `None` **不判** —— 判据要单边定义。
+        那些情况本来就该由节点的 `require` 或输出契约去管，用"没填"推断"没通过"
+        会把"agent 没按契约输出"误报成"测试没过"。
+        """
+        field = VERDICT_FIELDS.get(agent)
+        if not field or not isinstance(output, dict):
+            return
+        if output.get(field) is not False:
+            return
+        # 证据：优先取各 agent 契约里"为什么不通过"的那一项
+        reason = output.get("failed") or output.get("issues") or output.get("summary")
+        detail = f"；依据：{str(reason)[:200]}" if reason else ""
+        raise WorkflowNodeFailed(
+            nid,
+            RuntimeError(f"{agent} 结论为不通过（{field}=false）"),
+            message=(f"节点 {nid}（agent {agent}）**跑完了但结论是不通过**："
+                     f"{field}=false{detail}"),
+            output=output,
+        )
+
     async def _run_with_retry(
         self, node: Node, params: dict, external_operation_id: str | None = None
     ) -> Any:
@@ -668,6 +714,7 @@ class DAGExecutor:
                 output = await self._run_with_retry(
                     node, params, external_operation_id=self._external_operation_id(node, ctx)
                 )
+                self._raise_on_negative_verdict(nid, node.agent, output)
             state: dict = {"status": DONE, "output": output, "params": params}
             # 真实 node_runner（AgentNodeRunner）暴露 take_usage → 合并 token/cost 计量
             # （按节点 pop，防并行 agent 波串扰）；mock _default_runner 无该方法 → 保持无计量
@@ -686,7 +733,8 @@ class DAGExecutor:
             await self._flush_node_trace(nid)
             log.info("[%s] done %s", self.run_id, nid)
         except WorkflowNodeFailed as exc:
-            state = {"status": "failed", "output": None, "error": str(exc)}
+            # `exc.output`：结论型失败带证据（见 WorkflowNodeFailed.output）；真跑挂的为 None
+            state = {"status": FAILED, "output": exc.output, "error": str(exc)}
             self._stamp_timing(state, started_at)
             self.node_states[nid] = state
             await self._persist(nid)

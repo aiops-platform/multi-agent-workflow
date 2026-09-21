@@ -270,6 +270,123 @@ edges:
 
 
 # ──────────────────────────────────────────────────────────────────
+# 「跑完了」≠「通过了」：agent 的结论字段为 false → 节点失败（VERDICT_FIELDS）
+# ──────────────────────────────────────────────────────────────────
+
+VERDICT_YAML = """
+name: verdict
+version: "1.0.0"
+inputs: {}
+nodes:
+  t:
+    agent: tester
+    on_failure: continue
+  r: { agent: postmortem }
+edges:
+  - { from: t, to: r }
+"""
+
+
+async def test_negative_verdict_marks_node_failed_not_done() -> None:
+    """tester 输出 `passed: false` → 节点 **failed**（不是 done），run 判 failed。
+
+    实测背景（run_668981c0a7）：tester 输出 `{passed: false, tests_run: 0,
+    failed: ["沙箱未接线，一条测试都没跑", …]}`，节点却是 `done`（绿）、
+    run 走完算 `completed` —— 图上一片绿，实际什么都没验证。
+    """
+    from agentflow.core.workflow import Workflow
+
+    wf = Workflow.load_yaml(VERDICT_YAML)
+
+    async def negative_runner(node, params):
+        return {"passed": False, "tests_run": 0, "failed": ["沙箱未接线，一条测试都没跑"]}
+
+    store = InMemoryStateStore()
+    ex = DAGExecutor("run_v", "t", wf.dag, store, node_runner=negative_runner)
+    with pytest.raises(WorkflowNodeFailed):
+        await ex.run()
+    assert ex.get_status("t") == "failed", "结论不通过的节点必须是 failed，不能是 done"
+
+
+async def test_negative_verdict_ignores_on_failure_continue() -> None:
+    """`on_failure: continue` **不能**把"结论不通过"变回 DONE。
+
+    这是刻意设计：`continue` 的语义是"这条取证路失败就出负证据、下游照走"，
+    用在**诊断侧**（logs/metrics/infra）。而"测试没过"是一个**结论**，
+    不该因为某个节点的 on_failure 配置就被粉饰成"跑完了"。
+    故判定放在 on_failure 之外（executor 层），见 VERDICT_FIELDS 的注释。
+    """
+    from agentflow.core.workflow import Workflow
+
+    wf = Workflow.load_yaml(VERDICT_YAML)   # t 显式声明了 on_failure: continue
+
+    async def negative_runner(node, params):
+        return {"passed": False, "tests_run": 0}
+
+    ex = DAGExecutor("run_v2", "t", wf.dag, InMemoryStateStore(), node_runner=negative_runner)
+    with pytest.raises(WorkflowNodeFailed):
+        await ex.run()
+    assert ex.get_status("t") == "failed"
+
+
+async def test_negative_verdict_keeps_output_as_evidence() -> None:
+    """失败节点要**保留输出** —— 用户要看的就是那份证据。
+
+    正常失败（跑挂）没有输出，`output` 为 None；结论型失败必须带上，
+    否则节点详情里只剩一句"结论不通过"，把"哪几条没过"给扔了。
+    """
+    from agentflow.core.workflow import Workflow
+
+    wf = Workflow.load_yaml(VERDICT_YAML)
+    payload = {"passed": False, "tests_run": 0, "failed": ["用例 A 未通过", "用例 B 未通过"]}
+
+    async def negative_runner(node, params):
+        return dict(payload)
+
+    store = InMemoryStateStore()
+    ex = DAGExecutor("run_v3", "t", wf.dag, store, node_runner=negative_runner)
+    with pytest.raises(WorkflowNodeFailed):
+        await ex.run()
+    assert ex.node_states["t"]["output"] == payload
+
+    # checkpoint 里也要有（前端读的是 GET /runs/{id} → 库里的 nodes 行）
+    rows = await store.get_nodes("run_v3")
+    assert rows["t"]["output"] == payload
+
+
+async def test_passing_verdict_stays_done() -> None:
+    """反向对照：`passed: true` 照常 done —— 判据只有"显式 false"一条。"""
+    from agentflow.core.workflow import Workflow
+
+    wf = Workflow.load_yaml(VERDICT_YAML)
+
+    async def ok_runner(node, params):
+        return {"passed": True, "tests_run": 3}
+
+    ex = DAGExecutor("run_v4", "t", wf.dag, InMemoryStateStore(), node_runner=ok_runner)
+    assert await ex.run() == "done"
+    assert ex.get_status("t") == "done"
+
+
+async def test_verdict_field_absent_does_not_fail() -> None:
+    """字段缺失**不判失败** —— 判据单边定义。
+
+    "agent 没按契约输出" 与 "测试没过" 是两回事；用缺字段推断"没通过"会把
+    前者误报成后者。（后者该由输出契约去管。）
+    """
+    from agentflow.core.workflow import Workflow
+
+    wf = Workflow.load_yaml(VERDICT_YAML)
+
+    async def no_field_runner(node, params):
+        return {"tests_run": 3, "note": "没给 passed"}
+
+    ex = DAGExecutor("run_v5", "t", wf.dag, InMemoryStateStore(), node_runner=no_field_runner)
+    assert await ex.run() == "done"
+    assert ex.get_status("t") == "done"
+
+
+# ──────────────────────────────────────────────────────────────────
 # 入参预检（require）+ 可选墙钟上限（timeout）：输入有问题直接失败，不空转
 # ──────────────────────────────────────────────────────────────────
 
