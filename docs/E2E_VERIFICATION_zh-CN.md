@@ -261,7 +261,15 @@ curl -s -X POST localhost:8000/runs/$rid/approve -H 'Content-Type: application/j
 
 **审批验收**（`on_reject` + 计划审批，2026-09-18 实施）：
 
-两条流程现在都是「诊断 → `plan` → **`approve-plan`** → 修复」，即**计划必须先获批**
+> ⚠️ **本节及下面这张表只针对 `agentflow/seed/workflows/` 的两条 scenario 流程**
+> （本节 E2E 用的就是 `bug-fix-scenario2`，见上方 `POST /workflows`）。
+> **`problem-log-diagnose`（Problem Center「分析new」）已于 2026-09-21 分化**：
+> 它的修复段（`fix → test → review → approve-commit → commit`）**已整体删除**，
+> 人工门只剩一道 `diagnose-output` 且是**终态节点**，`on_reject: continue` 而**没有**驳回边。
+> 拿本条 E2E 去核那条流程会找不到 `approve-commit`。
+> 详见 `docs/design-v5.7.md` §7.2 的「补记（2026-09-21）」。
+
+两条 scenario 流程现在都是「诊断 → `plan` → **`approve-plan`** → 修复」，即**计划必须先获批**
 才动手。逐条核对：
 
 ```bash

@@ -7,7 +7,7 @@ import pytest
 
 from agentflow.core.dag import DONE, PENDING, REJECTED, SKIPPED, WAITING_APPROVAL
 from agentflow.core.workflow import Workflow
-from agentflow.executor.dag_executor import DAGExecutor, WorkflowNodeFailed
+from agentflow.executor.dag_executor import VERDICT_FIELDS, DAGExecutor, WorkflowNodeFailed
 from agentflow.statestore.memory import InMemoryStateStore
 
 from .conftest import PARALLEL_ABORT_YAML, PARALLEL_YAML, SIMPLE_YAML
@@ -453,6 +453,34 @@ async def test_verdict_field_absent_does_not_fail() -> None:
     ex = DAGExecutor("run_v5", "t", wf.dag, InMemoryStateStore(), node_runner=no_field_runner)
     assert await ex.run() == "done"
     assert ex.get_status("t") == "done"
+
+
+@pytest.mark.parametrize(("agent", "field"), sorted(VERDICT_FIELDS.items()))
+async def test_every_verdict_field_is_enforced(agent: str, field: str) -> None:
+    """`VERDICT_FIELDS` 的**每一条**都要真的生效——参数化在那张映射表上。
+
+    为什么这样写（2026-09-21）：上面几条用的都是 `tester` / `passed`，而
+    `reviewer` / `approved` 那半边原先**只有** `tests/test_problem_log_diagnose_workflow.py`
+    里一条 workflow 级用例在测。那条用例随该 workflow 删掉修复段而失去载体
+    （它连 `test` / `review` 节点都不再有了），删的时候差点把最后一份覆盖一起删掉——
+    是"删之前先问这条断言还有没有别的地方在守"才发现的。
+
+    改成对着映射表参数化之后，**以后往 `VERDICT_FIELDS` 里加 agent 会自动要求有覆盖**：
+    加一条映射 = 多一个参数化用例，不必记得回来补测试。
+    """
+    wf = Workflow.load_yaml(
+        "name: verdict-map\ninputs: {}\nnodes:\n"
+        f"  n: {{ agent: {agent} }}\n"
+        "edges: []\n"
+    )
+
+    async def runner(node, params):
+        return {field: False}
+
+    ex = DAGExecutor(f"run_v_{agent}", "t", wf.dag, InMemoryStateStore(), node_runner=runner)
+    with pytest.raises(WorkflowNodeFailed):
+        await ex.run()
+    assert ex.get_status("n") == "failed", f"{agent}.{field}=false 必须判 failed"
 
 
 # ──────────────────────────────────────────────────────────────────
