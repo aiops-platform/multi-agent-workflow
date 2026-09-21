@@ -309,7 +309,7 @@ nodes:
   # 要让「修复没走完」也回传，得把它挪到 recap 之前的分叉点，或另加并行边。
   ticket-done:
     agent: ticket-done
-    description: "回传工单结果到原系统（当前只组装回调载荷，尚未真正投递）"
+    description: "把 run 的处置结果回传原系统，更新工单状态"
     params:
       ticket: "$.inputs.bug_report"
       callback_url: "$.inputs.callback_url"
