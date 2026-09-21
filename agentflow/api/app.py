@@ -31,7 +31,7 @@ from ..agents.tools import tools_for_agent
 from ..approval.notifier import ApprovalNotifier
 from ..approval.sweeper import ApprovalSweeper
 from ..config import Settings, get_settings
-from ..core.dag import DONE, WAITING_APPROVAL, WorkflowDAGError
+from ..core.dag import DONE, REJECTED, REJECTED_CANCELED, WAITING_APPROVAL, WorkflowDAGError
 from ..core.workflow import Workflow
 from ..datasource import build_app_indicators_service
 from ..executor.dag_executor import ApprovalRaceError
@@ -704,7 +704,7 @@ async def _with_latest_run(ctx: TenantContext, ticket: dict) -> dict:
         if snap:
             # strict=False：冻结快照
             wf = Workflow.load_yaml(snap["workflow_yaml"], strict=False)
-        halted_node = _halted_node(wf, nodes_raw)
+        outcome = _run_outcome(wf, nodes_raw)
     except (ValueError, yaml.YAMLError, WorkflowDAGError, KeyError, HTTPException):
         # run 被清理 / 快照坏掉 / 跨租户：如实给 None（前端退回显示工单自己的 status），
         # 而不是让整个列表 500。工单列表是入口页，它挂掉什么都做不了。
@@ -717,8 +717,7 @@ async def _with_latest_run(ctx: TenantContext, ticket: dict) -> dict:
         "latest_run": {
             "run_id": rid,
             "status": _api_run_status(run["status"]),
-            "outcome": "halted" if halted_node else "completed",
-            "halted_at": halted_node,
+            **outcome,
         },
     }
 
@@ -941,6 +940,71 @@ def _halted_node(wf: Workflow | None, nodes_raw: dict) -> str | None:
     return None
 
 
+def _rejected_node(nodes_raw: dict) -> tuple[str, str] | None:
+    """被否决的审批节点 → ``(node_id, reason)``，reason ∈ ``{"timeout", "manual"}``。
+
+    ## 为什么必须有它（这是一个真实的错误显示）
+
+    ``run.status`` 只看"有没有节点失败"。审批**超时**时 sweeper 把节点置成
+    ``REJECTED_CANCELED``、输出 ``{"approved": false, "reason": "timeout"}``，
+    再发 resume 让下游照常收敛 —— 于是整条 run 跑完，``status=success``、
+    ``outcome=completed``，**列表里显示成 resolved**。
+
+    实测（``run_d8f3a5c560``）：``approve-plan`` 是 ``rejected-canceled`` /
+    ``reason=timeout``，而 run 报 success —— **方案审批被超时自动否决了，
+    却显示成"事故已解决"**。
+
+    ## 两种否决态的区别
+
+    - ``rejected-canceled`` —— **超时**自动否决（sweeper 置，``core/dag.py:46``）。
+      语义上"视同 REJECTED"（下游拒绝路径可求值，见 CLAUDE.md 4.1），
+      但**理由是人没来**，不是人否了 —— 展示上必须分开，否则读的人以为有人拍过板。
+    - ``rejected`` —— 人**明确驳回**。
+
+    理由优先读节点输出的 ``reason``（sweeper 写的 ``"timeout"``）；读不到再按状态兜底。
+
+    ## 与 _halted_node 的关系
+
+    两者在当前两条流程里**互斥**：halt 的触发点（scope / rca / locate）全在
+    approve-plan **之前**，一旦 halt，下游审批节点全部 SKIPPED，不可能再被否决。
+    所以调用方的优先级顺序不影响结果；``outcome`` 里仍按 halted → rejected 排，
+    是为了保持既有语义不动。
+
+    ## 为什么放在 API 层现算
+
+    与 ``_halted_node`` 同理：判据来自冻结的 snapshot + checkpoint，不可变、可复现，
+    不动状态机。**三处共用这一份**（GET /runs、GET /runs/{id}、工单的 latest_run）。
+    """
+    for nid, cp in nodes_raw.items():
+        st = cp.get("status")
+        if st not in (REJECTED, REJECTED_CANCELED):
+            continue
+        out = cp.get("output") or {}
+        reason = out.get("reason") if isinstance(out, dict) else None
+        if reason not in ("timeout", "manual"):
+            reason = "timeout" if st == REJECTED_CANCELED else "manual"
+        return nid, reason
+    return None
+
+
+def _run_outcome(wf: Workflow | None, nodes_raw: dict) -> dict:
+    """run 的结论：**按图走完 / 中途中断 / 被否决**。三个字段一起给，调用方直接展开。
+
+    抽出来的理由与 ``_halted_node`` 一样：这三个消费面（列表 / 详情 / 工单的
+    latest_run）必须同源，否则同一条 run 在两个页面说两个故事。
+    """
+    halted = _halted_node(wf, nodes_raw)
+    rejected = _rejected_node(nodes_raw)
+    return {
+        #: ``completed`` / ``halted``（证据不足）/ ``rejected``（审批被否决）
+        "outcome": "halted" if halted else ("rejected" if rejected else "completed"),
+        "halted_at": halted,
+        "rejected_at": rejected[0] if rejected else None,
+        #: ``timeout``（超时自动否决）/ ``manual``（人工驳回）/ None
+        "reject_reason": rejected[1] if rejected else None,
+    }
+
+
 @app.get("/runs")
 async def list_runs(
     status: str | None = None,
@@ -993,17 +1057,15 @@ async def list_runs(
         tokens = sum((cp.get("tokens") or 0) for cp in nodes_raw.values())
         cost = sum((cp.get("cost") or 0.0) for cp in nodes_raw.values())
 
-        halted_node = _halted_node(wf, nodes_raw)
-
         out.append({
             "run_id": rid,
             "workflow": name,
             "status": _api_run_status(run["status"]),
-            #: 与 GET /runs/{id} 同义（见 _halted_node）：``completed`` / ``halted``。
-            #: **列表里也必须给**——Ticket Inbox 要据此把"中断"从"进行中"里分出来，
-            #: 只有 status 的话它只能看到 ``success``，也就是"跑完了、没问题"。
-            "outcome": "halted" if halted_node else "completed",
-            "halted_at": halted_node,
+            #: 与 GET /runs/{id} 同义（见 _run_outcome）：``completed`` / ``halted`` /
+            #: ``rejected`` + ``rejected_at`` + ``reject_reason``。
+            #: **列表里也必须给**——Ticket Inbox 要据此把"中断""被否决"从"进行中"里
+            #: 分出来，只有 status 的话它只能看到 ``success``，也就是"跑完了、没问题"。
+            **_run_outcome(wf, nodes_raw),
             "total_tokens": tokens,
             "total_cost": cost,
             "inputs": run.get("inputs") or {},
@@ -1087,7 +1149,7 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
             "upstream": upstream_out,
         })
 
-    # ---- outcome：**按图走完** 还是 **中途中断** ----（判据与列表共用，见 _halted_node）
+    # ---- outcome：按图走完 / 中途中断 / 被否决 ----（判据与列表共用，见 _run_outcome）
     halted_node = _halted_node(wf, nodes_raw)
 
     return {
@@ -1095,11 +1157,14 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
         "workflow": graph.get("name"),
         "graph": graph,
         "status": _api_run_status(run["status"]),
-        #: ``completed``（按图走完）/ ``halted``（中途判定证据不足，停在 halt 节点）
-        "outcome": "halted" if halted_node else "completed",
-        #: 中断的落点与原因（未中断时为 null）。**给人和程序同一个判据**——
+        #: ``completed``（按图走完）/ ``halted``（证据不足，停在 halt 节点）/
+        #: ``rejected``（审批被否决 —— 人工驳回或超时自动拒绝）。
+        #:
+        #: ⚠️ ``status=success`` **不等于**有结论：审批超时被自动否决后，
+        #: 下游照常收敛，run 一样报 success（实测 run_d8f3a5c560）。
+        **_run_outcome(wf, nodes_raw),
+        #: 中断的落点（未中断时为 null）。**给人和程序同一个判据**——
         #: 不必去数 SKIPPED（那分不清"中断"与"正常跳过"）。
-        "halted_at": halted_node,
         "halt": (nodes.get(halted_node) or {}).get("output") if halted_node else None,
         "total_tokens": total_tokens,
         "total_cost": total_cost,
