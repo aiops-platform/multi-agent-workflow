@@ -50,7 +50,13 @@ NodeRunner = Callable[[Node, dict], Awaitable[Any]]
 # §8.4.3 副作用节点清单（外部世界可感知、重复执行会造成重复副作用）：
 # committer（建 PR）、infra-remediator（scale/restart）。这两类 agent 的节点
 # 执行前先查同 run+node+幂等键 的成功记录，命中则复用（§8.4.2），crash 重放不重复。
-SIDE_EFFECT_AGENTS = frozenset({"committer", "infra-remediator"})
+#:
+#: `ticket-done` 是 2026-09-21 加进来的：在 `returnApmTicketStatus` 落地之前它
+#: 只组装载荷、不产生副作用，**不在**这个清单里是对的；接上 MCP 写工具之后它会
+#: 真的 POST 到原系统改工单状态，于是同 ``committer`` 一样需要幂等键 ——
+#: resume / crash 重放时 `run_id:node_id` 命中已有成功记录即复用，不重复投递。
+#: **判据：这个 agent 一旦重跑，外部世界会不会多一次可见的变化。**
+SIDE_EFFECT_AGENTS = frozenset({"committer", "infra-remediator", "ticket-done"})
 
 #: 「跑完了」≠「通过了」：这几个 agent 的输出里有一个**结论字段**，
 #: 显式为 ``False`` 时节点判 **FAILED**（红），而不是 DONE（绿）。

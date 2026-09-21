@@ -139,3 +139,28 @@ async def test_non_side_effect_node_has_no_idempotency_key() -> None:
     ex = DAGExecutor("run_z", "t", dag, store, node_runner=runner)
     assert await ex.run() == "done"
     assert await store.get_succeeded_attempt("run_z", "logs", "run_z:logs") is None
+
+
+async def test_ticket_done_is_a_side_effect_agent() -> None:
+    """`ticket-done` 接上 MCP 写工具后**必须**进副作用清单。
+
+    它此前只组装载荷、不产生副作用，不在清单里是对的；现在它会真的 POST 到原系统
+    改工单状态 —— resume / crash 重放若不复用已有成功记录，就是**重复投递**
+    （原系统收到两次同样的工单更新）。
+
+    判据：**这个 agent 一旦重跑，外部世界会不会多一次可见的变化。**
+    """
+    from agentflow.executor.dag_executor import SIDE_EFFECT_AGENTS
+
+    assert "ticket-done" in SIDE_EFFECT_AGENTS
+
+    store = InMemoryStateStore()
+    dag = DAG.build({"td": {"agent": "ticket-done"}}, [])
+
+    async def runner(node, params):
+        return {"delivered": True}
+
+    ex = DAGExecutor("run_td", "t", dag, store, node_runner=runner)
+    assert await ex.run() == "done"
+    att = await store.get_succeeded_attempt("run_td", "td", "run_td:td")
+    assert att is not None, "副作用节点应落确定性幂等键 run_id:node_id"
