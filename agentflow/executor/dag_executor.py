@@ -67,7 +67,20 @@ SIDE_EFFECT_AGENTS = frozenset({"committer", "infra-remediator"})
 #: `tester` 输出 `{"passed": false, "tests_run": 0, "failed": ["沙箱未接线，一条测试都没跑", …]}`，
 #: 而节点状态是 **done（绿）**、run 走完算 **completed** —— 图上一片绿，
 #: 实际什么都没验证。审批/审查同一类："跑完了但结论是不通过"。
-VERDICT_FIELDS = {"tester": "passed", "reviewer": "approved"}
+#:
+#: ## `ticket-done` 为什么也在这里（2026-09-21 加）
+#:
+#: 它不是"测试/审批不通过"，而是**最后一公里没走完**：`delivered: false` 意味着
+#: 工单状态在原系统里**根本没被更新**。可 run 照样显示 `success` —— 实测
+#: `run_843dd83d86`：`commit` 产出 `pr_url: ""` / `pr_number: 0`（没有任何交付物），
+#: `ticket-done` 如实报 `{"delivered": false, "payload": {"status": "failed", …}}`，
+#: 而整条 run 一片绿。
+#:
+#: **对下游读的人来说，"没交付"和"交付失败"没有区别** —— 反正是没更新。
+#: 绿着一条没交付的 run 比红着更危险：看板会把这条算成已闭环。
+#: （曾考虑做成 `halt` 那种"能力未就绪"标识，但那要等出站能力真接上、两种情形
+#: 真能分开时再说；在那之前一律按"没交付"如实呈现。）
+VERDICT_FIELDS = {"tester": "passed", "reviewer": "approved", "ticket-done": "delivered"}
 
 
 class WorkflowNodeFailed(Exception):
@@ -591,8 +604,14 @@ class DAGExecutor:
             return
         if output.get(field) is not False:
             return
-        # 证据：优先取各 agent 契约里"为什么不通过"的那一项
-        reason = output.get("failed") or output.get("issues") or output.get("summary")
+        # 证据：优先取各 agent 契约里"为什么不通过"的那一项。
+        # `note` 在链尾 —— `ticket-done` 的"为什么不交付"写在那里（它没有
+        # failed/issues/summary）。不带上它，节点详情里就只剩一句"结论为不通过"，
+        # 把那份最有价值的原因说明（"平台尚未提供出站 HTTP 能力"之类）丢掉了。
+        reason = (
+            output.get("failed") or output.get("issues")
+            or output.get("summary") or output.get("note")
+        )
         detail = f"；依据：{str(reason)[:200]}" if reason else ""
         raise WorkflowNodeFailed(
             nid,

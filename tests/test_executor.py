@@ -354,6 +354,75 @@ async def test_negative_verdict_keeps_output_as_evidence() -> None:
     assert rows["t"]["output"] == payload
 
 
+# ── ticket-done：最后一公里（2026-09-21 加）──────────────────────────
+#
+# 与 tester/reviewer 同构，但性质不同：那两者是"结论不通过"，它是**没交付**。
+# 对下游读的人来说两者没有区别 —— 反正是没更新。
+
+TICKET_DONE_YAML = """
+name: ticket-verdict
+version: "1.0.0"
+inputs: {}
+nodes:
+  td: { agent: ticket-done }
+edges: []
+"""
+
+
+async def test_undelivered_ticket_marks_node_failed() -> None:
+    """`ticket-done` 报 `delivered: false` → 节点 **failed**，不是 done。
+
+    实测背景（run_843dd83d86）：`commit` 产出 `pr_url: ""` / `pr_number: 0`
+    （没有任何交付物），`ticket-done` 如实报
+    `{"delivered": false, "payload": {"status": "failed", …}}` ——
+    而整条 run 显示 `success`。**绿着一条没交付的 run 比红着更危险**：
+    看板会把它算成已闭环。
+    """
+    from agentflow.core.workflow import Workflow
+
+    wf = Workflow.load_yaml(TICKET_DONE_YAML)
+    note = "未投递：本节点目前不具备任何投递能力"
+
+    async def undelivered_runner(node, params):
+        return {
+            "payload": {"ticket_id": "INC95528", "status": "failed", "description": "根因：…"},
+            "delivered": False,
+            "note": note,
+        }
+
+    store = InMemoryStateStore()
+    ex = DAGExecutor("run_td", "t", wf.dag, store, node_runner=undelivered_runner)
+    with pytest.raises(WorkflowNodeFailed) as excinfo:
+        await ex.run()
+    assert ex.get_status("td") == "failed", "没交付的节点必须是 failed，不能是 done"
+    # 失败理由要带上那句诚实说明（理由链尾的 `note`），不能只剩"结论为不通过"
+    assert note in str(excinfo.value)
+
+
+async def test_delivered_ticket_stays_done() -> None:
+    """负向对照：投递成功（`delivered: true`）**不能**被误判成失败。
+
+    只有 `is False` 才判 —— 这是 `VERDICT_FIELDS` 的单边定义（见其注释）。
+    没有这条，"加一个结论字段"就变成了"凡是这个 agent 都红"。
+    """
+    from agentflow.core.workflow import Workflow
+
+    wf = Workflow.load_yaml(TICKET_DONE_YAML)
+    payload = {
+        "payload": {"ticket_id": "INC95528", "status": "resolved"},
+        "delivered": True,
+        "note": "已 POST 回原系统，HTTP 200",
+    }
+
+    async def delivered_runner(node, params):
+        return dict(payload)
+
+    store = InMemoryStateStore()
+    ex = DAGExecutor("run_td2", "t", wf.dag, store, node_runner=delivered_runner)
+    assert await ex.run() == "done"
+    assert ex.get_status("td") == "done"
+
+
 async def test_passing_verdict_stays_done() -> None:
     """反向对照：`passed: true` 照常 done —— 判据只有"显式 false"一条。"""
     from agentflow.core.workflow import Workflow
