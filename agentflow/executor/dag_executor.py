@@ -471,7 +471,10 @@ class DAGExecutor:
         )
 
     async def _flush_node_trace(self, nid: str) -> None:
-        """把该节点成功后取到的明细行落 ``node_traces``，并派生审计（§9.5）。
+        """把该节点的明细行落 ``node_traces``，并派生审计（§9.5）。
+
+        **成功与失败两条路径都会调用**（失败路径见 ``_exec_node_inner`` 的 except 分支）：
+        runner 在失败时同样记了明细，而"输出不可解析"这类失败恰恰是最需要原文的场景。
 
         - 仅真实 ``AgentNodeRunner`` 有明细（``take_trace``）；mock runner 直接返回。
         - 明细行 = node 汇总 + llm_call + tool_call + denied；DB/审计失败只记日志不翻车。
@@ -760,9 +763,26 @@ class DAGExecutor:
         except WorkflowNodeFailed as exc:
             # `exc.output`：结论型失败带证据（见 WorkflowNodeFailed.output）；真跑挂的为 None
             state = {"status": FAILED, "output": exc.output, "error": str(exc)}
+            # 失败路径**同样**记用量与明细 —— 与成功路径同源，不是可选的装饰。
+            #
+            # `runner._capture` 在失败时也记录了 llm_call / tool_call，它自己的 docstring
+            # 写着「**失败路径尤其需要 trace**：轮次耗尽 / 输出不可解析正是最该观测的场景」。
+            # 但此前只有成功路径调 `_flush_node_trace` / `take_usage`，于是那份记录被
+            # pop 出来又丢掉 —— 实测 run_9932d76f6d 的 plan 节点（AgentOutputError：
+            # "未输出合法 JSON"）：9 个成功节点都有 trace，唯独最需要看原文的 plan 是 0 条，
+            # 事后只剩错误消息里嵌的前 200 字符，**判不出是输出被截断还是模型写飞了**。
+            usage = (
+                self.node_runner.take_usage(node)
+                if hasattr(self.node_runner, "take_usage")
+                else None
+            )
+            if usage:
+                state["tokens"] = usage.get("tokens", 0)
+                state["cost"] = usage.get("cost", 0.0)
             self._stamp_timing(state, started_at)
             self.node_states[nid] = state
             await self._persist(nid)
+            await self._flush_node_trace(nid)
             self.failed.append(nid)
             raise
         await self._process_approvals()

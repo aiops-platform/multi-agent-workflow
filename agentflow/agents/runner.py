@@ -139,7 +139,8 @@ class AgentNodeRunner:
         return self._reasoning_model
 
     def take_trace(self, node: Node) -> list[dict] | None:
-        """pop 取走该节点的明细行（无 → None）。executor 在节点成功后调用。"""
+        """pop 取走该节点的明细行（无 → None）。executor 在节点**成功与失败时都**调用
+        —— 失败时那份明细是判"输出为什么不可解析"的唯一现场（见 `_capture`）。"""
         return self._trace_by_node.pop(id(node), None)
 
     def take_usage(self, node: Node) -> dict | None:

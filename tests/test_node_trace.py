@@ -31,6 +31,7 @@ from agentflow.api.app import app
 from agentflow.api.workflow_store import WorkflowStore
 from agentflow.core.dag import Node
 from agentflow.core.workflow import Workflow
+from agentflow.executor.dag_executor import WorkflowNodeFailed
 from agentflow.service import RunService
 from agentflow.statestore.memory import InMemoryStateStore
 from agentflow.statestore.sqlite import SqliteStateStore
@@ -337,6 +338,55 @@ async def test_executor_flush_node_trace_derives_audit() -> None:
     assert decision.get("mcp__git-srv__commit_working") == "DENY"
     assert all(l["actor"] == "triage" for l in logs)
     assert all(l["input_masked"] is not None for l in logs)  # 输入脱敏后落审计
+
+
+# ======================================================================
+# 失败路径：明细与用量同样要落库
+# ======================================================================
+class _FailingTraceRunner(_TraceFakeRunner):
+    """同上，但节点抛 ``WorkflowNodeFailed`` —— 失败路径也必须留下 trace。"""
+
+    async def __call__(self, node: Node, params: dict) -> dict:
+        raise WorkflowNodeFailed(node.id, RuntimeError("agent 未输出合法 JSON"))
+
+    def take_usage(self, node: Node) -> dict:
+        return {"tokens": 2424, "cost": 0.000511}
+
+
+async def test_executor_flushes_trace_and_usage_on_failure() -> None:
+    """**失败的节点也要落 trace 与用量** —— 「输出不可解析」这类失败，原文是唯一现场。
+
+    实测背景（`run_9932d76f6d` 的 `plan` 节点）：`fix-planner` 抛 `AgentOutputError`
+    （未输出合法 JSON），而 `runner._capture` 在失败时**同样**记了 llm_call —— 它自己的
+    docstring 写着「失败路径尤其需要 trace：轮次耗尽 / 输出不可解析正是最该观测的场景」。
+    但 executor 只在成功路径 flush，那份记录被 pop 出来又丢掉：
+
+        9 个成功节点都有 trace（infra 9 条 / rca 16 条…），唯独最需要看原文的 plan 是 0 条
+
+    后果是**判不出**「输出被 token 上限截断」还是「模型自己写飞了」—— 只剩错误消息里
+    嵌的前 200 字符。同一处 `take_usage` 也没调，失败节点的 tokens/cost 一并丢失。
+
+    ⚠️ 这条判据**不改变 run 的成败**（那是 `VERDICT_FIELDS` 管的），只保证**事后能查**，
+    所以断言的是「库里有行」，不是「状态是什么」。
+    """
+    store = InMemoryStateStore()
+    wf = Workflow.load_yaml("name: t\nnodes:\n  n1: { agent: triage }\n")
+    svc = RunService(store, node_runner=_FailingTraceRunner())
+    # inline 模式：节点失败会把异常抛到 create_run 外 —— 断言在**抛出之后**做，
+    # 这正是要证明的：失败已经发生，明细依然落了库。run_id 从库里取。
+    with pytest.raises(WorkflowNodeFailed):
+        await svc.create_run("local", wf, inputs={})
+    run_id = (await store.list_runs("local"))[0]["run_id"]
+
+    nodes = await store.get_nodes(run_id)
+    assert nodes["n1"]["status"] == "failed"      # 失败语义不变
+    assert nodes["n1"]["tokens"] == 2424          # 用量不再丢
+    assert nodes["n1"]["cost"] == 0.000511
+
+    traces = await store.get_node_traces(run_id)
+    assert [r["kind"] for r in traces] == [K_NODE, K_TOOL_CALL, K_DENIED], (
+        "失败节点的明细必须落库 —— 丢了就判不出「输出为什么不可解析」"
+    )
 
 
 # ======================================================================
