@@ -81,6 +81,28 @@ make lint      # ruff 检查
      跳过 review/commit 是设计内行为）。run.status 仍为 `done`，
      `GET /runs/{id}` 另给 `outcome: completed|halted` + `halted_at` + `halt`（**现算不落库**）。
    - halt 节点**不经 runner**（不调 LLM、不重试、不做幂等）。
+
+3.2 **「跑完了」≠「通过了」：结论字段判失败**（`VERDICT_FIELDS`，`executor/dag_executor.py`）
+
+   ```python
+   VERDICT_FIELDS = {"tester": "passed", "reviewer": "approved", "ticket-done": "delivered"}
+   ```
+
+   - **只认 `is False`**。字段缺失 / `None` **不判** —— 判据必须单边定义，
+     否则"agent 没按契约输出"会被误报成"结论不通过"。
+   - **判定必须在 `on_failure` 之外**（executor 层）。放 runner 里抛会走 `on_error`，
+     而 `on_failure: continue` 会把它转成**负证据**、节点照样标 DONE —— 那正是要避免的。
+   - **失败要保留输出**（`WorkflowNodeFailed.output`）。理由链
+     `failed → issues → summary → note`，链尾 `note` 是给 `ticket-done` 的
+     "为什么不交付"留的。
+   - **加一个 agent 就是加一条映射**，别在别处写特判。
+   - 这条链的终点是**投不出去必须是红的**（绿着一条没交付的 run 比红着更危险：
+     看板会算成已闭环）。完整链路（跨三仓）见 `docs/design-v5.8.md` §13。
+
+   > **副作用节点清单也要同步**：`SIDE_EFFECT_AGENTS` 判据是
+   > 「**这个 agent 一旦重跑，外部世界会不会多一次可见的变化**」。
+   > `ticket-done` 接上 MCP 写工具后即属此类（否则 resume/重放会**重复投递**）。
+
 4. **审批 CAS + 终态不可逆 + 时间原子判定**（`statestore/base.py:cas_update_approval`）。
    严禁绕过 CAS 改终态。CAS 除状态谓词外还带 `approval_time_guard` 时间谓词（§8.3.2）：
    approve/reject 仅未超时可批、TIMED_OUT 仅超时后可置。改 SQL 必须保留。
@@ -147,7 +169,7 @@ make lint      # ruff 检查
    - **要改 workflow**：`PUT /workflows/{wid}`（或 `POST /workflows` 新建），改完立即生效
      （已发起的 run 不受影响——它们用 snapshot 冻结）。
    - 原设计的 DAG 形态（节点类型 / when / join / 审批门禁）见 `design-v5.2.md` §8.1（**仓库上一级目录**，不在 `backend/docs/`——v5.6 §8 是「残余风险」不是这个）；
-     当前两条流程的节点结构见 `docs/design-v5.7.md` §7.2。
+     当前两条流程的节点结构见 `docs/design-v5.8.md` §4。
    - **新租户的默认数据 = `agentflow/seed/`（种子，2026-09-18 起）**：租户库建好时，
      `TenantStoresRouter._build()` 会往**三张表**写默认数据，让新租户开箱可用——
      `workflows` + `mcp_servers` + `agent_configs`（agent↔server 绑定）。
@@ -203,7 +225,7 @@ make lint      # ruff 检查
      `aiops-datasource-mcp-server` 提供（`POST /mcp-servers` 注册 →
      `PUT /agent-configs/{name}` 的 `mcp_server_ids` 绑定），**进程内直连实现已删除**
      （原 `agents/datasources.py`）。本地只读工具仅剩 `locate_code`（CMDB 映射）
-     与 `search_knowledge`（占位）。详见 `docs/design-v5.6.md` §3。
+     与 `search_knowledge`（占位）。详见 `docs/design-v5.8.md` §3。
    - ⚠️ **例外：`datasource/` 直连 Prometheus**（唯一一处，2026-09 引入）。遗留前端
      Smart Inspection 页面（`service-intelligence-platform-ui/js/app.js`）要的是**瞬时值
      + UI 形状的信封**，而 MCP 侧 `backends/prometheus.py` 是面向 LLM 证据的
@@ -359,7 +381,7 @@ exec_context.py、docs/DEPLOYMENT_zh-CN.md）
 core/        Workflow 模型 + DAG 语义 + 版本冻结（M0）
 statestore/  State Model（memory/sqlite/postgres）+ router.py（租户库路由）
 executor/    并发 DAGExecutor + 幂等 + Retry + Resume（M2）
-agents/      15-agent 编队 + AgentScope 适配 + 工具治理（M1 骨架）
+agents/      16-agent 编队（9 诊断 + 7 修复）+ AgentScope 适配 + 工具治理（M1 骨架）
              └ scopes.py       build_permission_context（§9.5 DONT_ASK+allow）
                              （原 datasources.py 已在 v5.5 批3 删除，取数全部走 MCP）
 datasource/  ⚠️ 架构例外：Prometheus 直连（仅服务遗留前端 Smart Inspection）
@@ -410,6 +432,8 @@ M3 ✅ → M4 ✅（组件级；API 认证/egress 未落地）→ M5 ✅（CAS �
 M6 🟡（适配器可用，真实 broker/DB 专项待生产）→ M7 🟡（诊断真实，解决侧部分 mock）。
 多租户 v5.3 批 A/B/C ✅（管理库+Router+配置表入租户库 / 接单 CAS+topic 租户化+
 tenantctl+namespace 派生 / 共享数据源下线+repo 封堵+per-tenant MCP/配置路由，300+ tests）。
+工单回传闭环 ✅（2026-09-21）：结论字段判失败 + MCP 写工具 + APM 接收端点，三仓链路
+端到端实测（设计见 `docs/design-v5.8.md` §13；缺口见 `docs/TODO.md` §28–§31）。
 待办：MCP 凭证加密+回显脱敏、Mock CMDB 租户维度、Orchestrator 租户 namespace 接线、
 Kafka topic 自动建、**JWT JWKS**（算法 RS256 已可用，缺自动取钥/轮换）、
 Langfuse/OTel、沙箱 API 认证、真实 Kafka/PG 故障恢复专项（§14）。

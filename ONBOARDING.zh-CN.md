@@ -38,7 +38,7 @@ Agent 运行在 AgentScope（锁定 2.0.3，模型 DeepSeek deepseek-v4-flash）
 
 ## 建议阅读顺序
 - `README.md` — 里程碑总览（M0-M7）、快速开始（make install/test/api）、目录结构，以及沙箱与 testbed 联调脚本。先读它建立全局认识。
-- `docs/design-v5.6.md` §8.1 + `docs/design-v5.7.md` §7.2 — 标准工作流的 DAG 形态：节点类型、when 条件、join、审批门禁。（原 `workflows/bug-fix-pipeline.yaml` 已删，见上）
+- `design-v5.2.md` §8.1（仓库上一级目录）+ `docs/design-v5.8.md` §4 — 标准工作流的 DAG 形态：节点类型、when 条件、join、审批门禁；诊断链的现状见 v5.8 §4。（原 `workflows/bug-fix-pipeline.yaml` 已删，见上）
 - `agentflow/core/dag.py` — DAG 语义：带 `when` 的边、join any|all、全 INACTIVE → SKIPPED 级联、审批节点参与 skip。这是语义上最重要的文件。
 - `agentflow/statestore/base.py` — 状态模型 + 审批 CAS + 终态不可变。动任何状态转移前必读——绕过 CAS 是被禁止的。
 - `agentflow/executor/dag_executor.py` — 执行引擎：并发跑节点、param 解析、幂等、重试，以及审批挂起时仅当 ready 集为空才释放 worker。

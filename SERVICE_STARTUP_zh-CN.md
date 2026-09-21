@@ -112,7 +112,7 @@ API 端点一览（`/docs` 有 Swagger）：
 | GET | `/health` | 健康检查 |
 
 > 注：审批端点需要 workflow 里有 `kind: approval` 节点才会触发 `WAITING_APPROVAL`
-> （DAG 形态见 `docs/design-v5.6.md` §8.1 的 `approve-changes`）。M0-M2 形态是**进程内直接执行**，
+> （DAG 形态见 `design-v5.2.md` §8.1 的 `approve-changes`，仓库上一级目录）。M0-M2 形态是**进程内直接执行**，
 > 审批返回后同进程继续跑。
 
 ## 七、（可选）真实诊断场景：接 testbed

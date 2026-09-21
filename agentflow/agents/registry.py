@@ -1,4 +1,4 @@
-"""15-agent 编队注册表（design §7）。
+"""16-agent 编队注册表（design §7）。
 
 映射 agent 名 → 职责 / 工具可见性 / 输出 Schema。executor 的 node_runner
 通过 ``AGENT_REGISTRY`` 把节点调度到对应职能智能体。

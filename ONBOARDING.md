@@ -21,7 +21,7 @@ Think of it as a deterministic workflow orchestrator wrapped around AI agents. A
 
 ## Reading order
 - `README.md` - Milestone overview (M0-M7), quick start (make install/test/api), directory map, and the sandbox + testbed integration recipes. Read first for the big picture.
-- `docs/design-v5.6.md` §8.1 + `docs/design-v5.7.md` §7.2 - The canonical workflow's DAG shape: node types, when-conditions, joins, and the approval gate. (The former `workflows/bug-fix-pipeline.yaml` was deleted on 2026-09-16 — workflows live in the database, see `CLAUDE.md` §6.0.)
+- `design-v5.2.md` §8.1 (one level above the repo) + `docs/design-v5.8.md` §4 - The canonical workflow's DAG shape: node types, when-conditions, joins, and the approval gate. (The former `workflows/bug-fix-pipeline.yaml` was deleted on 2026-09-16 — workflows live in the database, see `CLAUDE.md` §6.0.)
 - `agentflow/core/dag.py` - DAG semantics: edges with `when`, join any|all, all-INACTIVE to SKIPPED cascade, and approval nodes participating in skip. The single most important semantic file.
 - `agentflow/statestore/base.py` - State model + approval CAS + terminal-state immutability. Read before touching any state transitions — bypassing CAS is forbidden.
 - `agentflow/executor/dag_executor.py` - The execution engine: concurrent node running, param resolution, idempotency, retry, and how approval suspension releases only when the ready set is empty.

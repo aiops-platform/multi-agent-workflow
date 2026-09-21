@@ -1,6 +1,6 @@
 # CMDB 业务域 + 术语表 草稿（待人工审校）
 
-> **状态**：草稿，**未写入任何 CMDB 文件**。用途是给 `design-v5.7.md` §2.4 / §3.4 的
+> **状态**：草稿，**未写入任何 CMDB 文件**。用途是给 `design-v5.8.md` §3.4.4 / §4.5 的
 > 业务语义层提供一份可审校的初稿。
 > 审校通过后，内容应落到 `aiops-mcp-servers/.../data/cmdb-entities.json`。
 
@@ -109,7 +109,7 @@ gateway ──┬─→ order ──┬─→ pricing          (定价)
 
 ## 四、需要新建的边
 
-按 `design-v5.7.md` §2.2 的模型，本表对应以下边（**当前尚不存在**）：
+按 `design-v5.8.md` §3.4.2 的模型，本表对应以下边（**当前尚不存在**）：
 
 ```
 enterprise:retail-ecommerce  ──enterprise_journey──→  journey:purchase-to-delivery
@@ -148,7 +148,7 @@ portfolio:order-transaction  ──portfolio_link──→ app:order-service, ap
 
 ## 六、状态与这份草稿没做什么
 
-**已完成**（2026-09-15）：`design-v5.7.md` §7.1 的**本体部分已实施**——删 `cross_journey_hub` /
+**已完成**（2026-09-15）：`design-v5.8.md` §3.4.7 的**本体部分已实施**——删 `cross_journey_hub` /
 `cross_journey_link`、加 `domain` / `domain_link`、加 `enterprise_journey` / `app_codebase`、
 全部边加 `layer`、`app.attributes` 加 `kind`、`refs`→`app_codebase` 边、**删掉 6 个派生 Portfolio**。
 `description` / `keywords` 字段已加到信封层，20 个节点（10 app + 10 codebase）已填充**派生值**。

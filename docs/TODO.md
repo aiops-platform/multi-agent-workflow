@@ -209,9 +209,9 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 `agentflow/statestore/router.py`（`_resolve_ref`）、`agentflow/api/auth.py`、
 `agentflow/config.py`
 
-## 6. ⭐⭐ 动态编排（编排层）—— **未实施**，设计见 `docs/design-v5.6.md` §4
+## 6. ⭐⭐ 动态编排（编排层）—— **未实施**，设计见 `docs/design-v5.8.md` §5
 
-> 2026-09-11 记录。来源：`design-v5.4.md`（已并入 `docs/design-v5.6.md`）。
+> 2026-09-11 记录。来源：`design-v5.4.md`（已并入 `docs/design-v5.8.md` §5）。
 > **不是缺陷，是有意未开工**：设计稿为 design-only，批次须**人工评审批准后**才实施。
 > 记在此处是为了让"没做完的部分"有个可查的落点，别让 v5.6 §4 读起来像已完成。
 
@@ -258,7 +258,7 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 | B4 | 审批节点 id **稳定语义命名**约束（`approve-change`/`approve-pr`），否则 default-deny 403 | compiler |
 | B5 | 规划预算（planner ≤3 迭代 / compiler ≤3 重排 / ≤30 节点 ≤10 层）超限 escalate | compiler + dispatch |
 
-> **前置**：`docs/design-v5.6.md` §5.2 的 **4 项接缝开放问题**（capability 粒度 /
+> **前置**：`docs/design-v5.8.md` §6.2 的 **4 项接缝开放问题**（capability 粒度 /
 > planner 是否需预知本租户工具可用性 / 生成图窗口来源 / CMDB 工具能否规划期调用）
 > 原两稿均未定，**批 B 前需评审**。
 > 验收：E2E 走「未见故障 → miss → planner → compiler 落库 → 计划审批 → 执行」；
@@ -1410,7 +1410,7 @@ POST /runs/{id}/resume  →  {"ok": true, "status": "resumed"}      ← 接口�
 Worker 日志             →  [run_xxx] run 已终态，忽略 resume      ← 实际什么都没做
 ```
 
-`worker.py` 拿 `TERMINAL` 拦下（`design-v5.7.md` §3.6 补记里有完整复现）。
+`worker.py` 拿 `TERMINAL` 拦下（`design-v5.8.md` §4.7 补记里有完整复现）。
 **接口回成功而实际没做**是最坏的一类返回：调用方据此以为恢复了，继续等一个永不到来的状态。
 修法二选一：回 `409` + 说明，或回 `{"ok": true, "status": "noop"}` 并让前端显式提示。
 
@@ -1664,3 +1664,87 @@ assert node.is_approval, ...    # ← 下面两条 assert 才会被映射成 400
 判据是**"节点不存在"该算 404 还是 400**：`approve` 的入参是节点 id，打错 id 更接近
 "资源不存在"。定了这条再改映射（或在 `DAGExecutor.approve` 里把 `KeyError` 换成
 带节点 id 的 `ValueError`，那样端点现有的映射不用动——**后者更省**）。
+
+---
+
+## 28. `running` 状态的**僵尸 run** 没有自愈路径（Worker 崩溃/被杀后永久卡住）
+
+> 2026-09-21 发现（重启 Worker 前查"有没有正在跑的 run"时撞到）。**未修**。
+
+### 现象
+
+```bash
+$ curl -s localhost:8000/runs/run_dfa3801aee -H 'X-Tenant-ID: otr' | jq '{status,created_at,updated_at}'
+{ "status": "running",
+  "created_at": "2026-09-17T06:33:16",   # 4 天前
+  "updated_at": "2026-09-17T06:33:17" }  # 创建后 1 秒，此后再没动过
+```
+
+13 个节点里 12 个 done，`review` 卡在 `running`。**它不是"正在跑"，是死了。**
+
+### 根因
+
+Worker 认领 run 走 `cas_update_run_status(queued → running)`，认领后**没有 lease /
+没有 heartbeat**。进程一死，那行就永远停在 `running`：
+
+- **不能被 trigger 重新认领** —— CAS 只从 `queued` 转；
+- **不能被 resume** —— `worker._cmd_resume` 的 CAS 只接受 `paused` / `waiting_approval`；
+- 重启 Worker 也没用（它对 `running` 的 run 视而不见）。
+
+### 为什么这次没修
+
+- 修它要引入 **lease + heartbeat**（或一条"启动时扫描超期的 running run 并回收"的自愈路径），
+  那是状态机层面的改动，牵扯 Worker 生命周期与多副本语义，该单独设计与评审。
+- 眼下有一个**手工逃生阀**（2026-09-21 救 `run_843dd83d86` 时用过）：
+  直接改库把状态挪回一个可认领的值——
+  `UPDATE runs SET status='paused' WHERE run_id='…'` 然后 `POST /runs/{id}/resume`。
+  ⚠️ **它绕过了状态机**，只应在明确知道那条 run 确实没有活着的 Worker 时使用。
+
+### 判据
+
+**"这条 run 还有没有活着的执行者"** 必须有地方可查（lease 表 / heartbeat 列），
+否则运维分不清"在跑"和"死了 4 天"。
+
+## 29. `approvals` 表**没有决策时间列** —— 审批历史给不出"什么时候批的"
+
+> 2026-09-21 发现（做 Run 详情「审批」页签时）。**未修**。
+
+表里有 `timeout_at`（超时闸门的落点），但**没有 `approved_at` / `decided_at`**。
+于是 `GET /runs/{id}` 的 `approvals[]` 能给"谁批的、批没批、为什么驳回"，给不出时间。
+
+要补得**加列 + 迁移**（`statestore/sqlite.py` 与 `postgres.py` 两处建表 + 迁移脚本），
+并在 `cas_update_approval` 写入时落值。不是难事，但属于 schema 变更，该单独一轮。
+
+> 已写在 `statestore/base.py::get_approvals_for_run` 的 docstring 里，
+> 免得下一个人以为是自己漏读了字段。
+
+## 30. 锁竞争超时对外是 **HTTP 500 空响应体**
+
+> 2026-09-21 发现（验证 `AGENTFLOW_LOCK=redis` 是否生效时撞到）。**未修**。
+
+`RunService._acquire_tenant_lock` 抢不到锁时抛 `TimeoutError`，而 `api/app.py` 的
+`run_ticket` 只捕获 `TenantQuotaExceeded` 与 `InputsValidationError` → 漏到顶层 → 500。
+
+```
+HTTP 500  耗时 10.02s     ← 正是那个 10.0s 轮询超时
+"Internal Server Error"   ← 响应体里没有任何原因
+```
+
+**但抢不到锁是运行态问题**（redis 抖了 / 有人占着），不是服务端 bug：
+500 空响应让运维无从下手（是 redis 挂了？是租户超额？还是代码坏了？）。
+
+### 判据
+
+**"依赖不可用"与"服务端出错"要能从状态码上分开**（503/409 带原因 vs 500）。
+定了再改 `run_ticket` 的异常映射。
+
+## 31. `returnApmTicketStatus` 是**单地址**配置 —— 多原系统尚未设计
+
+> 2026-09-21 记。**未修**（当前只有一个原系统，够用）。
+
+回调地址走 `DATASOURCE_APM_TICKET_URL` 这一个部署级配置。若将来不同租户要接各自的
+工单平台，需要按租户解析地址——那时"地址是部署属性"这条前提就不成立了，
+要么回到调用方传（并解决 13.4 里那两条问题：让模型决定地址、每单重传），
+要么让 MCP server 侧持有租户→地址的映射。
+
+**现在不做**，但要把这个前提记下来：它会决定那张配置表长什么样。

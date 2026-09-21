@@ -45,7 +45,7 @@ python -m agentflow.tenantctl provision team-a \
   （**指向共享基础库的旧 db_ref 一律拒绝删除**，防连坐管理库）。
 - **隔离是物理的、不是靠列过滤**：`workflows` / `mcp_servers` / `agent_configs` /
   `tickets` 四张控制面表**没有 tenant_id 列**，它们的隔离完全依赖"每租户一个库"。
-  这正是早期 postgres 共享 DSN 会造成跨租户可见的原因（见 `design-v5.6.md` §3）。
+  这正是早期 postgres 共享 DSN 会造成跨租户可见的原因（见 `design-v5.8.md` §3）。
 
 ### 2.2 每租户 Worker Deployment
 

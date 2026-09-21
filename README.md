@@ -116,7 +116,7 @@ agentflow/
 workflows/               # ⚠️ 2026-09-16 已删除——**workflow 的真源是数据库，不是仓库文件**
                          #    存：POST /workflows → workflows 表(id,name,yaml,created_at)
                          #    用：run 时从库读（api/app.py:697 → :704 → :398）
-                         #    DAG 形态见 docs/design-v5.6.md §8.1、docs/design-v5.7.md §7.2
+                         #    DAG 形态见 design-v5.2.md §8.1（仓库上一级目录）、现状见 docs/design-v5.8.md §4
 scripts/
 ├── watch_run.py            # run 逐阶段观测（节点状态/输出/token/审批/工具明细）
 ├── mock_mcp_server.py      # MCP 配置页测试用 mock server（mcp v1 FastMCP）
@@ -194,7 +194,7 @@ agent 不知道"当前时间"，不能让它在运行期猜（猜错会得到错
 **故障 span 判定**住在 MCP server 侧：ES 按 traceId 重建调用链，优先「业务根因」而非
 「feign 下游调用症状」。该启发式是**测试床特定经验**，非通用算法。
 
-详见 `docs/design-v5.6.md`。
+详见 `docs/design-v5.8.md`。
 
 ## 控制面 API（36 端点）
 

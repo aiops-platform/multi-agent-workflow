@@ -267,7 +267,7 @@ curl -s -X POST localhost:8000/runs/$rid/approve -H 'Content-Type: application/j
 > 它的修复段（`fix → test → review → approve-commit → commit`）**已整体删除**，
 > 人工门只剩一道 `diagnose-output` 且是**终态节点**，`on_reject: continue` 而**没有**驳回边。
 > 拿本条 E2E 去核那条流程会找不到 `approve-commit`。
-> 详见 `docs/design-v5.7.md` §7.2 的「补记（2026-09-21）」。
+> 详见 `docs/design-v5.8.md` §4.14 的「补记（2026-09-21）」。
 
 两条 scenario 流程现在都是「诊断 → `plan` → **`approve-plan`** → 修复」，即**计划必须先获批**
 才动手。逐条核对：
