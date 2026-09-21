@@ -49,8 +49,22 @@ class InputsValidationError(ValueError):
     """run 入参不合法（v5.3 §7.3：加固姿态下 inputs.repos 直传被封堵）→ API 映射 400。"""
 
 
-# 需要代码工作区的 agent（修复侧，§8.7.2）——workflow 含其一即准备 run 工作区
-WORKSPACE_AGENTS = frozenset({"fix-implementer", "tester", "reviewer", "committer"})
+# 会**碰代码工作区**的 agent——workflow 含其一即准备 run 工作区。
+#
+# ⚠️ 判据是「这个 agent 用不用工作区」，**不是**「它写不写代码」。原先只列了修复侧四个
+# （§8.7.2），加了 `code-locator` 是因为踩了坑：它用 `ws_read_file` / `ws_list_files`
+# 读仓库（CLAUDE.md §9.6：那两个工具刻意不经沙箱，但**仍要求工作区先 prepare**），
+# 而 `problem-log-diagnose` 删掉修复段后图里就只剩它一个——于是
+# `_prepare_workspace` 提前 return，工作区不存在，`ws_*` 全部 fail-closed 报错，
+# `locate` 只能退到 MCP 上瞎试（实测烧掉 16 万 token、耗尽迭代预算、输出非 JSON），
+# 最后 `found == false` → **整条诊断链在 halt 处中断**。
+# 症状是"诊断分析不出问题"，而根因在一个跟诊断毫无关系的名单里——**静默回归**。
+WORKSPACE_AGENTS = frozenset(
+    {
+        "code-locator",  # 诊断侧：只读（ws_read_file / ws_list_files）
+        "fix-implementer", "tester", "reviewer", "committer",  # 修复侧（§8.7.2）
+    }
+)
 
 
 class RunService:
@@ -179,9 +193,13 @@ class RunService:
         finally:
             if lock_key is not None:
                 await self.lock.release(lock_key)
-        # §8.7.2 工作区准备：必须早于 trigger 发布——修复侧 agent 的工作区工具按
-        # current_run 定位工作区，Worker 接单时工作区须已就绪。仅当 workflow 含
-        # 修复侧节点时准备（纯诊断 workflow 不付克隆代价）。
+        # §8.7.2 工作区准备：必须早于 trigger 发布——工作区工具按 current_run 定位工作区，
+        # Worker 接单时工作区须已就绪。
+        #
+        # ⚠️ 判据是「workflow 里有没有**会碰工作区**的 agent」（见 `WORKSPACE_AGENTS`），
+        # **不是**「有没有修复侧节点」。这里原先写的就是后者，于是删掉修复段后
+        # `code-locator`（只读工作区，用 ws_read_file/ws_list_files）被漏掉，
+        # 整条诊断链在 locate 处断——**注释里的措辞直接变成了实现里的假设**，踩过一次。
         await self._prepare_workspace(run_id, tenant_id, workflow, inputs)
         if self.queue is not None:
             # 先置 queued 再发布：Worker 接单后才置 running，状态机不回跳

@@ -897,8 +897,20 @@ locate → halt (found == false)
    `done` → API `success` → viewmodel `completed`。人否了诊断，run 仍报成功，
    痕迹只在门节点的 `rejected` 与审批记录里。这是 `TERMINAL` 含 `REJECTED` 的固有属性，
    换 `abort` 就会把"人否决"变成"执行失败"，取舍见 `CLAUDE.md` §4.1。
-3. **删掉修复段后这条流程不含任何 `WORKSPACE_AGENTS`**，`service.py` 的 `_prepare_workspace`
-   会提前 return——**run 不再准备 git 工作区**（更省更快，也不再是副作用面）。这是期望行为。
+3. ~~**删掉修复段后这条流程不含任何 `WORKSPACE_AGENTS`**，`service.py` 的 `_prepare_workspace`
+   会提前 return——run 不再准备 git 工作区（更省更快）。~~
+   ⚠️ **这条是错的，当天就被证伪并修掉**，留在这里当反面教材：
+   `code-locator` **也碰工作区**（用 `ws_read_file` / `ws_list_files` 读仓库，CLAUDE.md §9.6
+   说那两个工具刻意不经沙箱，但**仍要求工作区先 prepare**），而修复段删除后图里就只剩它一个。
+   于是：工作区不准备 → `ws_*` 全部 fail-closed 报「在本次 run 未 prepare」→ `code-locator`
+   退到 MCP 上逐个猜项目名 → **实测烧掉 16 万 token、耗尽迭代预算、输出非 JSON** →
+   `locate.found == false` → **整条诊断链在 halt 处中断**。
+   症状是「诊断分析不出问题」，离根因（一个跟诊断无关的名单）非常远。
+   修法：`WORKSPACE_AGENTS` 加 `code-locator`——**判据是"这个 agent 用不用工作区"，
+   不是"它写不写代码"**；并加回归测试钉住（`test_workspace_gets_prepared_for_the_diagnosis_chain`）。
+   代价是那条"更省更快"没了：工作区照旧准备。**正确性优先。**
+   > 这条值得留的教训：把"某个早退分支不再触发"当成**收益**写进提交信息之前，
+   > 得先确认**那个分支是唯一让某件事发生的地方**——这次不是，而我没有回头核。
 
 `docs/TODO.md` §25（`ws_git` 允许 `push`）的前提随之变动，见该节的「前提变动」注。
 

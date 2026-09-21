@@ -1,11 +1,13 @@
 """Problem Center「分析new」workflow（scripts/problem-log-diagnose.workflow.yaml）。
 
-锁四件事：
+锁五件事：
 1. **能加载**——即已过 `core/dag.py` 的静态校验（无环 / join 一致性 / params 引用只指上游）；
 2. **拓扑合理**——日志证据先于根因、门等齐 rca + plan、两条中断边存在；
 3. **门是终态节点**——图上**没有出边**，`on_reject: continue`；通过/驳回都是 run 的自然收敛
    （run 仍判 `done`，人工决策不是执行失败）；
-4. **halt 的裁决权在 executor**——触发后其余 PENDING 节点全部 SKIPPED，不靠逐条 gate 边。
+4. **halt 的裁决权在 executor**——触发后其余 PENDING 节点全部 SKIPPED，不靠逐条 gate 边；
+5. **会触发 run 工作区准备**——否则 `code-locator` 的 `ws_*` 全 fail-closed，诊断链直接断
+   （见 `test_workspace_gets_prepared_for_the_diagnosis_chain`，那是实际踩过的静默回归）。
 
 ⚠️ 历史（2026-09-21，修复段整体删除）：
 本流程原本是 `plan → approve-plan → fix → test → review → approve-commit → commit → recap`，
@@ -323,3 +325,25 @@ async def test_upstream_service_missing_fails_fast() -> None:
     with pytest.raises(WorkflowNodeFailed) as ei:
         await ex.run()
     assert "service" in str(ei.value)
+
+
+def test_workspace_gets_prepared_for_the_diagnosis_chain() -> None:
+    """本流程必须触发 run 工作区准备——否则 `code-locator` 的 `ws_*` 全部 fail-closed。
+
+    ⚠️ 这是**实际踩过的静默回归**（2026-09-21）：删掉修复段后，图里会碰工作区的 agent
+    就只剩 `code-locator` 一个，而它当时不在 `WORKSPACE_AGENTS` 里 →
+    `RunService._prepare_workspace` 提前 return → 工作区不存在 →
+    `ws_read_file` / `ws_list_files` 报「在本次 run 未 prepare」→ `code-locator` 退到
+    MCP 上逐个猜项目名（实测烧掉 16 万 token、耗尽了迭代预算、输出非 JSON）→
+    `locate.found == false` → **整条诊断链在 halt 处中断**。
+
+    症状是「诊断分析不出问题」，离根因（一个跟诊断无关的名单）很远，故在这里锁住：
+    **判据是"这个 agent 用不用工作区"，不是"它写不写代码"。**
+    """
+    from agentflow.service import WORKSPACE_AGENTS
+
+    agents = {n.agent for n in load().dag.nodes.values()}
+    assert agents & WORKSPACE_AGENTS, (
+        f"本流程的 agent {sorted(a for a in agents if a)} 没有任何一个会触发工作区准备；"
+        f"`code-locator` 的 ws_read_file/ws_list_files 会全部 fail-closed（WORKSPACE_AGENTS={sorted(WORKSPACE_AGENTS)}）"
+    )
