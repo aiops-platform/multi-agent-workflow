@@ -1618,3 +1618,49 @@ problem 的 `state`**：
 **要修的话，判据是先定语义**：`resolved`（已修复）与 `escalated`（已派单）都是终态，
 `/ignore` 该不该能改写 `resolved`？定了这条，三个端点的守卫才有统一写法——
 **别只给 `/resolve` 加守卫**，那会制造 API/UI 语义分叉。
+
+---
+
+## 27. `POST /runs/{id}/approve|reject` 打**不存在的节点 id** → HTTP 500（不是 4xx）
+
+> 2026-09-21 发现（做「升级 = 生成工单」时实跑真环境撞到）。**未修**。
+
+### 现象
+
+```bash
+curl -s -X POST localhost:8000/runs/$rid/approve -H 'Content-Type: application/json' \
+  -H 'X-Tenant-ID: otr' -d '{"node_id":"diagnose-output","by":"probe"}'
+# → Internal Server Error   HTTP 500
+```
+
+节点 id 不存在时 500；节点**存在但不在等待审批**时才是干净的 400
+（`approve` 里那句 `assert ... == WAITING_APPROVAL`，`AssertionError` 已被端点映射成 400）。
+
+### 根因
+
+`executor/dag_executor.py` 的 `DAGExecutor.approve` **第一行**：
+
+```python
+node = self.dag.nodes[nid]      # ← 节点不存在 → KeyError
+assert node.is_approval, ...    # ← 下面两条 assert 才会被映射成 400
+```
+
+`KeyError` **不在** `api/app.py` 审批端点的异常映射里（那里只映射
+`ValueError/AssertionError → 400`、`ApprovalRaceError → 409`、`ApproverNotAllowed → 403`）
+→ 冒到顶层 → 500。
+
+### 为什么要登记而不是当场修
+
+- **UI 走不到**：run 查看器的审批按钮 `data-node` 取自 `pending_approvals[].node_id`
+  （`js/app.js` 的 `renderRunApprovals`），永远是图里真实存在的节点。
+- 修它会改**对外状态码**（500 → 404/400），而前端各处对审批失败的提示是按既有映射写的，
+  属于契约变更，该单独评审。
+- 触发它的那条路径（APM 侧猜一个门节点 id）**已在本次一并根治**：`_agentflow_gate_node`
+  在没有 `pending_approvals` 时返回 `None`，调用方**跳过那次出站**而不是猜一个 id
+  （见 `aiops-apm-anomaly-detector` 的 `_decide_agentflow`）。
+
+### 要修的话
+
+判据是**"节点不存在"该算 404 还是 400**：`approve` 的入参是节点 id，打错 id 更接近
+"资源不存在"。定了这条再改映射（或在 `DAGExecutor.approve` 里把 `KeyError` 换成
+带节点 id 的 `ValueError`，那样端点现有的映射不用动——**后者更省**）。
