@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agentflow.api.management_store import build_management_store, decrypt_db_ref  # noqa: E402
 from agentflow.config import get_settings  # noqa: E402
-from agentflow.tenants import db_name_of  # noqa: E402
+from agentflow.tenants import db_name_of, parse_db_ref  # noqa: E402
 
 #: 任何情况下都不许删的库
 PROTECTED = {"postgres", "template0", "template1"}
@@ -121,11 +121,19 @@ async def main(argv: list[str]) -> int:
         print(f"\n2) db_ref 解密")
         claimed_db = None
         try:
-            ref = decrypt_db_ref(row["db_ref_enc"], settings)
+            # ⚠️ 两步，少一步都是错的：
+            #   ① `decrypt_db_ref` 返回的是**解出来的原文字符串**（里面是 JSON 文本）
+            #   ② 要再 `parse_db_ref` 才拿到 `{"backend", "dsn"}`
+            #       —— 与 `statestore/router.py:129` 同一个组合。
+            # 早期这里只做了 ① 就按 `ref["dsn"]` 取 → AttributeError 被下面这个 except
+            # 吞掉，于是**每一个租户**（包括刚用当前密钥建的、完全健康的）都被报成
+            # 「db_ref 解不开：AttributeError」，还把排查方向指向"密钥换过"。
+            # 教训：把"真的解不开"和"我自己解析错了"分开报，否则前者永远查不出来。
+            ref = parse_db_ref(decrypt_db_ref(row["db_ref_enc"], settings))
             claimed_db = db_name_of(ref["dsn"]) if ref.get("backend") == "postgres" else None
             print(f"     ✓ 可解密  backend={ref.get('backend')}  库名={claimed_db}")
         except Exception as exc:  # noqa: BLE001
-            print(f"     ✗ 解不开：{type(exc).__name__}")
+            print(f"     ✗ 解不开：{type(exc).__name__}: {exc}")
             print(f"       典型原因：AGENTFLOW_SECRET_KEY 与加密时不同（换过 key，或当初从 jwt_secret 派生）")
             print(f"       ⚠️ `tenantctl deprovision --confirm-delete` 会**崩在这一步**")
             print(f"       ⚠️ 此时**不要相信 db_ref 声称的位置**，以第 4 步「数据实际在哪」为准")
