@@ -1,4 +1,4 @@
-.PHONY: install test lint api
+.PHONY: install test lint api doctor
 
 install:
 	python3 -m venv venv
@@ -17,3 +17,9 @@ api:
 # 注：原先的 `make demo`（agentflow/demo.py）已删除。它读的是仓库里的
 # `workflows/bug-fix-pipeline.yaml`——而那**不是运行时的真源**（workflow 存数据库，
 # 见 CLAUDE.md「工作流的真源」）。留着一个读文件的 demo 会让人以为改 YAML 就生效。
+
+# 环境体检（换机器时先跑这个）。INSTALL=1 时把能自动装的装上（gh CLI）。
+#   make doctor
+#   make doctor INSTALL=1
+doctor:
+	$(PY) scripts/doctor.py $(if $(INSTALL),--install,)

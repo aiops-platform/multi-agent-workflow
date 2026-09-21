@@ -6,11 +6,18 @@
 
 ```bash
 make install   # 创建 venv + 安装依赖
+make doctor    # ⭐ 环境体检（换机器时先跑这个）；INSTALL=1 时把能装的装上
 make test      # 跑 pytest（M0/M2 语义 + 幂等 + Resume）
 make demo      # （已移除，见下方「工作流的真源」）
 make api       # 控制面 FastAPI（:8000/docs）
 make lint      # ruff 检查
 ```
+
+> **换一台机器、或者别人第一次接手：先 `make doctor`。** 本系统依赖一批**机器相关**的
+> 外部件（postgres / kafka / 沙箱 / **gh CLI**），它们的共同点是**缺了不报错** ——
+> 只在某条 run 跑到某一步时表现为"结果不对"。`doctor` 把这些问题摆在装环境的时候，
+> 并给出可直接粘贴的修复命令（`--install` 能自动装 gh）。
+> 判据只有一份：它复用 `tenantctl._env_preflight`，与 provision 时看到的是同一套。
 
 ## 每个 task 的收尾（硬性流程）
 
@@ -315,6 +322,27 @@ make lint      # ruff 检查
      **租户 deny 规则从未生效**。别照着这行写代码，见 `docs/TODO.md` §23.3。
    - SandboxClient 本地联调仍可经 `kubectl port-forward`（打进 Pod loopback，绑
      127.0.0.1 不受影响）。
+
+9.7 **PR 后端（gh CLI）—— 与沙箱同一类：机器相关、缺了静默断链**
+
+   `committer` 的 `ws_open_pr`（`agents/workspace_tools.py`）推分支 + 开 PR，
+   它产生 `commit.pr_url` —— **`ticket-done` 判「有没有交付」就靠这个字段**。
+
+   - **凭证不进我们的代码**：`gh` 自己从 keychain 取 token。我们不读、不转发、
+     不落任何 GitHub 令牌，所以 worker 进程里**不存在**一个会被日志/异常/`repr`
+     带出去的 PAT 变量（§24）。**这也是它留在 worker 而不进沙箱的原因** ——
+     持有密钥的一方不执行不可信代码，而沙箱里那份代码不可信。
+   - **容器/CI 形态**：`gh` 认 `GH_TOKEN` / `GITHUB_TOKEN` 环境变量，不必交互登录；
+     但要把**远端与凭证一起**挂进 worker（`deploy/worker-deployment.yaml`）。
+   - ⚠️ **缺了它的症状最阴**：`ws_open_pr` 起不来 → `commit` 节点失败 →
+     `on_failure: abort` 把整条 run 中止 → **它下游的 `ticket-done` 根本不执行**，
+     原系统那边**什么都收不到**。不是"报了个失败"，是**闭环彻底没有回音**。
+   - 所以换机器先 `make doctor`（`--install` 能装 gh）；凭证那步装不了，
+     脚本会打出两条路：`gh auth login`（交互）或 `GH_TOKEN=<PAT>`（无人值守）。
+   - 三条边界写在 `ws_open_pr` 的 docstring 里：**base 取仓库默认分支**（不让 LLM 挑）、
+     **head 取 git 当前分支**（不接受传参，否则能推别的分支上去）、
+     **标题/正文走 `--title=` 单参形式**（模型给的值以 `-` 开头时不会被当旗标解析）。
+
 10. **真实数据源 = MCP server**（v5.5）：查询逻辑在
     `aiops-mcp-servers/servers/aiops-datasource-mcp-server`（独立仓库）。要点：
     - **查询必须带时间区间与目标**：`start_time`/`end_time` 必填（ISO8601），窗口由

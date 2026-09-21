@@ -203,7 +203,54 @@ def _env_preflight(settings) -> list[str]:
                     f"沙箱的可写白名单 {allow} 不含工作区根 {ws}"
                     "（compose 的 sandbox.SBX_WRITABLE 要带上它）"
                 )
+
+    # ④ PR 后端（gh）：**和沙箱同一类** —— 机器相关、缺了不报错、只是闭环静默断掉
+    #
+    # 缺它的症状：`committer` 的 `ws_open_pr` 起不来 → `commit` 节点失败 →
+    # `on_failure: abort` 让整条 run 中止 → 它**下游的 `ticket-done` 根本不执行**，
+    # 于是原系统那边**什么都收不到**。比"报 failed"更糟：是彻底没有回音。
+    problems.extend(gh_preflight())
     return problems
+
+
+def gh_preflight() -> list[str]:
+    """检查「建 PR」的能力（gh CLI + 凭证）是否就绪；空列表 = 就绪。
+
+    抽成独立函数是因为它有**两个消费方**：`_env_preflight`（provision 时提示）
+    与 `scripts/doctor.py`（可安装的那个入口）。两份实现必然漂移。
+
+    为什么值得体检：换一台机器就得重来一遍，而缺了它的表现不是报错，
+    是**闭环静默断掉**（详见 `_env_preflight` 的 ④）。
+    """
+    import os
+    import shutil
+    import subprocess
+
+    exe = shutil.which("gh")
+    if exe is None:
+        return [
+            (
+                "未安装 gh CLI → 建 PR 会失败，整条 run 会在 commit 节点中止、**工单不回传**。"
+                "装：`make doctor INSTALL=1`（或 brew install gh，见 https://cli.github.com）"
+            )
+        ]
+    # gh 自己认 GH_TOKEN / GITHUB_TOKEN —— 容器与 CI 里不必跑交互式登录
+    if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
+        return []
+    try:
+        r = subprocess.run(
+            [exe, "auth", "status"], capture_output=True, text=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [f"gh auth status 跑不起来（{type(exc).__name__}: {exc}）"]
+    if r.returncode != 0:
+        return [
+            (
+                "gh 未登录 → 建 PR 会失败（症状同上）。二选一："
+                "① 交互：`gh auth login`；② 无人值守/容器：设 `GH_TOKEN=<PAT>`（需 repo scope）"
+            )
+        ]
+    return []
 
 
 async def provision(args) -> int:

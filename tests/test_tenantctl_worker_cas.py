@@ -421,3 +421,56 @@ class _FakeResp:
 
     def __exit__(self, *a) -> None:
         return None
+
+
+# ======================================================================
+# PR 后端体检（gh CLI + 凭证）
+# ======================================================================
+def test_gh_preflight_reports_missing_cli(monkeypatch) -> None:
+    """没装 gh → 报出来，并指向 `make doctor`。
+
+    这项值得体检是因为**缺了不报错**：`ws_open_pr` 起不来 → `commit` 失败 →
+    `on_failure: abort` 中止整条 run → 下游的 `ticket-done` **根本不执行**，
+    原系统什么都收不到（不是"报了失败"，是闭环没有回音）。
+    """
+    from agentflow import tenantctl
+
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    problems = tenantctl.gh_preflight()
+    assert any("gh CLI" in p and "make doctor" in p for p in problems), problems
+
+
+def test_gh_preflight_accepts_token_env(monkeypatch) -> None:
+    """有 `GH_TOKEN` 就算就绪 —— 容器/CI 里不必交互登录。
+
+    判据必须**先看环境变量再看 `auth status`**：无人值守环境本来就没有 keychain，
+    拿 `gh auth status` 的失败去报"未登录"会给出一个在那台机器上根本不成立的建议。
+    """
+    from agentflow import tenantctl
+
+    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/gh")
+    # 即便 auth status 会失败，也不该被调用
+    def _boom(*a, **k):  # pragma: no cover
+        raise AssertionError("有 GH_TOKEN 时不该再去问 auth status")
+
+    monkeypatch.setattr("subprocess.run", _boom)
+    assert tenantctl.gh_preflight() == []
+
+
+def test_gh_preflight_reports_not_logged_in(monkeypatch) -> None:
+    """装了但没登录 → 两条路都给出来（交互 / 环境变量）。"""
+    from agentflow import tenantctl
+
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/gh")
+
+    class _R:
+        returncode = 1
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
+    problems = tenantctl.gh_preflight()
+    assert any("未登录" in p and "gh auth login" in p and "GH_TOKEN" in p for p in problems), problems
