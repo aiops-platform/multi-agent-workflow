@@ -13,7 +13,8 @@
 | 文件 | 播到哪张表 | 触发条件 |
 |---|---|---|
 | `workflows/_manifest.yaml` + `*.yaml` | 租户库 `workflows` | 该表为空 |
-| `dataplane.yaml` | 租户库 `mcp_servers` + `agent_configs` | 各自表为空 |
+| `dataplane.yaml` | 租户库 `mcp_servers` + `agent_configs`（**内置 agent 的绑定**） | 各自表为空 |
+| `agents/*.yaml` | 租户库 `agent_configs`（**自定义 agent 的完整定义**） | 同上（与绑定同一张表、同一道空表守卫） |
 
 播种发生在 `TenantStoresRouter._build()`——即**任何导致某个租户库被打开**的路径
 （`tenantctl provision` / `migrate`、API 启动、Worker 装配…），所以覆盖是全的。
@@ -26,6 +27,15 @@
   `created_at DESC`；播种时按 manifest 顺序给 `created_at` 递增，顺序因此是确定的。
 - **workflow 的 YAML 正文逐字节保留，不要加头注释**——那段文本会原样进 `workflows.yaml`
   列，并在 UI 的 YAML 编辑框里显示给终端用户。
+- **`agents/` 与 `dataplane.yaml` 的 `bindings` 是两个来源，别混**：
+  - `bindings` = 「**内置** agent 绑哪些 MCP server」。role/stage/prompt/schema 全在代码里
+    （`agents/registry.py` / `prompts.py`），种子里只写绑定 —— 多写一份就是**双真源**。
+  - `agents/*.yaml` = 「**自定义** agent 长什么样」。代码里**没有副本**，不写在这儿就没地方写，
+    所以它可以把 prompt / schema 一起带上，不存在双真源问题。
+  - 选择哪条：名字在内置 16 个里 → `bindings`；不在 → `agents/`。
+    写错地方的表现：走 `bindings` 会被 `_agent_row` 静默跳过（"不是内置 agent"），
+    结果是**新租户少一个 agent 且只有一条 warning 日志**。
+
 - **`dataplane.yaml` 里不写 URL**：URL 是环境相关的（本地 `127.0.0.1` / k8s 里是
   service DNS），由 `url_setting` 指向的配置项注入（见 `.env.example`）。
 - **不写 `tools` / `enable_tools` / `disable_tools`**：那几列是 MCP server 被 load 时

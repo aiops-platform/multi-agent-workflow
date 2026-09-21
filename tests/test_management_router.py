@@ -200,7 +200,11 @@ async def test_router_seeds_new_tenant_and_is_idempotent(tmp_path, monkeypatch) 
     （`router.get` 缓存未命中时无并发保护），空表守卫必须在**进程/连接之外**也成立。
     """
     from agentflow.config import get_settings
-    from agentflow.seed import load_dataplane_seed, load_workflow_seeds
+    from agentflow.seed import (
+        load_custom_agent_seeds,
+        load_dataplane_seed,
+        load_workflow_seeds,
+    )
 
     s = get_settings()
     monkeypatch.setattr(s, "seed_defaults", True)
@@ -211,7 +215,10 @@ async def test_router_seeds_new_tenant_and_is_idempotent(tmp_path, monkeypatch) 
         bundle = await router.get("fresh-a")
         assert len(await bundle.workflow.list()) == len(load_workflow_seeds())
         assert len(await bundle.mcp.list()) == len(load_dataplane_seed()["servers"])
-        assert len(await bundle.agent_config.list()) == len(load_dataplane_seed()["bindings"])
+        # agents 表有两个来源：内置 agent 的绑定 + 自定义 agent 的完整定义
+        assert len(await bundle.agent_config.list()) == (
+            len(load_dataplane_seed()["bindings"]) + len(load_custom_agent_seeds())
+        )
     finally:
         await router.aclose()
 
@@ -220,7 +227,9 @@ async def test_router_seeds_new_tenant_and_is_idempotent(tmp_path, monkeypatch) 
     try:
         bundle2 = await router2.get("fresh-a")
         assert len(await bundle2.workflow.list()) == len(load_workflow_seeds())
-        assert len(await bundle2.agent_config.list()) == len(load_dataplane_seed()["bindings"])
+        assert len(await bundle2.agent_config.list()) == (
+            len(load_dataplane_seed()["bindings"]) + len(load_custom_agent_seeds())
+        )
     finally:
         await router2.aclose()
 

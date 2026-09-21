@@ -53,6 +53,9 @@ _PKG = "agentflow.seed"
 _WORKFLOW_DIR = "workflows"
 _WORKFLOW_MANIFEST = "_manifest.yaml"
 _DATAPLANE = "dataplane.yaml"
+#: 自定义 agent 的完整定义（每个文件一个 agent）。**与 dataplane.yaml 的 bindings 不是一回事**：
+#: 那边是「内置 agent 绑哪些 MCP server」，这边是「代码里没有副本的 agent 长什么样」。
+_AGENT_DIR = "agents"
 
 
 def _read(relative: str) -> str | None:
@@ -109,6 +112,65 @@ def load_workflow_seeds() -> list[dict[str, str]]:
             log.warning("[seed] %s 缺 name 字段（跳过）", fname)
             continue
         out.append({"id": wid, "name": str(name), "yaml": text})
+    return out
+
+
+def load_custom_agent_seeds() -> list[dict[str, Any]]:
+    """→ 自定义 agent 的完整定义列表（每个 ``agents/*.yaml`` 一个）。失败 → ``[]``。
+
+    与 workflow 种子不同，这里**不用 manifest**：agent 之间没有顺序语义
+    （没有"最后一条是默认"那种约定），目录扫一遍即可。
+
+    ## 为什么单独一条通路，不塞进 dataplane.yaml 的 bindings
+
+    两者回答的是不同问题：``bindings`` 是「**内置** agent 绑哪些 server」——
+    role/stage/prompt/schema 全在代码里，种子里只写绑定，多写一份就是双真源。
+    而自定义 agent **代码里没有副本**：不写在这儿就没地方写。硬塞进 bindings 也不行——
+    那条路径对 server_ids 为空、以及名字非内置的都会跳过（见 `_agent_row`），
+    而 ticket-done 恰恰还没有可绑的 server。
+
+    按鸭子类型返回，只做**结构校验**（必填键在不在、role 合不合法），
+    语义校验交给写入后的 `AgentConfigResolver`。
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        entries = sorted(files(_PKG).joinpath(_AGENT_DIR).iterdir(), key=lambda p: p.name)
+    except (FileNotFoundError, ModuleNotFoundError, OSError, NotADirectoryError) as exc:
+        log.warning("[seed] 读不到 %s/ 目录（跳过自定义 agent）：%s", _AGENT_DIR, exc)
+        return out
+
+    for entry in entries:
+        if not entry.name.endswith((".yaml", ".yml")):
+            continue
+        try:
+            raw = entry.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            log.warning("[seed] 读取 %s 失败（跳过）：%s", entry.name, exc)
+            continue
+        try:
+            doc = yaml.safe_load(raw) or {}
+        except yaml.YAMLError as exc:
+            log.warning("[seed] %s 解析失败（跳过）：%s", entry.name, exc)
+            continue
+        name = doc.get("name")
+        prompt = doc.get("system_prompt")
+        if not name or not prompt:
+            log.warning("[seed] %s 缺 name / system_prompt（跳过）", entry.name)
+            continue
+        if doc.get("role") not in ("diagnose", "fix"):
+            # 与 POST /agent-configs 同一条白名单；种子里写错要在这里就拦下
+            log.warning("[seed] %s 的 role=%r 不合法（只支持 diagnose/fix），跳过",
+                        entry.name, doc.get("role"))
+            continue
+        out.append({
+            "name": str(name),
+            "role": doc["role"],
+            "stage": doc.get("stage") or "other",
+            "description": doc.get("description"),
+            "system_prompt": str(prompt),
+            "schema": doc.get("output_schema"),
+            "server_names": list(doc.get("mcp_server_ids") or []),
+        })
     return out
 
 
@@ -241,7 +303,67 @@ async def seed_defaults(
                     continue
                 if await agent_store.insert_if_absent(row):
                     counts["agents"] += 1
+
+            # 自定义 agent：代码里没有副本，定义全在 seed/agents/*.yaml。
+            # **在同一个"空表才播"分支里** —— 两张来源写同一张表，各自判空会打架
+            # （先写的那批让表非空，后一批就永远不播了）。
+            for spec in load_custom_agent_seeds():
+                ids = [server_ids[n] for n in spec["server_names"] if n in server_ids]
+                missing = [n for n in spec["server_names"] if n not in server_ids]
+                if missing:
+                    # 不是致命错：agent 照样播（只是没有工具），但必须出声——
+                    # 静默少绑一个 server 的表现是"节点跑得通、但空转"
+                    log.warning("[seed] 自定义 agent %s 声明的 server %s 不存在（按未绑定处理）",
+                                spec["name"], missing)
+                if await agent_store.insert_if_absent({
+                    "name": spec["name"],
+                    "origin": "custom",
+                    "role": spec["role"],
+                    "stage": spec["stage"],
+                    "description": spec["description"],
+                    "system_prompt": spec["system_prompt"],
+                    "schema": spec["schema"],
+                    "mcp_server_ids": ids or None,
+                    "enabled": True,
+                }):
+                    counts["agents"] += 1
     except Exception:
         log.exception("[seed] 播种 agent 绑定失败（跳过）")
 
+    # ── ④ 交叉核对：workflow 引用的 agent 必须存在 ──────────────────
+    #
+    # 种子是"开箱可用"的承诺，而 workflow 里的 `agent:` 指到一个不存在的名字时，
+    # **加载不报错**（`Workflow.load_yaml` 不查 agent 是否存在），要到第一次 run
+    # 跑到那个节点才炸——那时已经看不出是种子的问题了。
+    # 只 warn 不外抛：fail-soft 是本模块的硬约束（它在请求路径上）。
+    try:
+        await _check_workflow_agents(agent_store)
+    except Exception:
+        log.exception("[seed] 交叉核对 workflow 引用的 agent 失败（跳过）")
+
     return counts
+
+
+async def _check_workflow_agents(agent_store: Any) -> None:
+    """workflow 种子里引用的 agent 名，必须在内置名单或已播种的 agent 行里。
+
+    只查**种子 workflow 引用了哪些名字**，不查库里全部 workflow——已存在的租户
+    可能故意引用自定义 agent，那不是种子的责任范围。
+    """
+    from ..agents.registry import DIAGNOSE_AGENTS, FIX_AGENTS
+    from ..core.workflow import Workflow
+
+    rows = {r["name"] for r in await agent_store.list()}
+    known = set(DIAGNOSE_AGENTS) | set(FIX_AGENTS) | rows
+    for item in load_workflow_seeds():
+        try:
+            wf = Workflow.load_yaml(item["yaml"])
+        except Exception:  # noqa: BLE001 - 坏种子在 load_workflow_seeds 已被跳过，这里兜底
+            continue
+        used = {n.agent for n in wf.nodes.values() if n.agent}
+        unknown = sorted(used - known)
+        if unknown:
+            log.warning(
+                "[seed] workflow %s 引用了未知 agent %s —— 跑到该节点会失败",
+                item["id"], unknown,
+            )

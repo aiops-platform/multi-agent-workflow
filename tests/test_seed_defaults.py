@@ -8,6 +8,7 @@ agent↔server 绑定的话，run 能跑完但**每个 agent 零工具**（"看�
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 import pytest
 
@@ -18,7 +19,23 @@ from agentflow.api.agent_store import AgentConfigStore
 from agentflow.api.mcp_store import MCPStore
 from agentflow.api.workflow_store import WorkflowStore
 from agentflow.core.workflow import Workflow
-from agentflow.seed import load_dataplane_seed, load_workflow_seeds, seed_defaults
+from agentflow.seed import (
+    load_custom_agent_seeds,
+    load_dataplane_seed,
+    load_workflow_seeds,
+    seed_defaults,
+)
+
+
+@lru_cache(maxsize=1)
+def _seed_agent_schemas() -> dict[str, dict]:
+    """自定义 agent 的 name → 输出 schema（从种子里读，**不是**代码里的静态表）。
+
+    `AGENT_SCHEMAS` 只覆盖内置 agent；自定义 agent（如 ticket-done）的 schema
+    只存在于 seed/agents/*.yaml —— 而 `AgentConfigResolver` 会把它带进运行时，
+    所以「引用它的输出字段是否真实存在」这条校验对它同样适用。
+    """
+    return {c["name"]: (c["schema"] or {}) for c in load_custom_agent_seeds()}
 
 
 class _Settings:
@@ -68,6 +85,30 @@ def test_seed_corpus_is_valid_and_nonempty() -> None:
     for agent, names in plane["bindings"].items():
         assert set(names) <= server_names, f"{agent} 绑了未声明的 server: {names}"
 
+    # 自定义 agent 种子（seed/agents/*.yaml）：代码里没有副本，这里就是它的真源
+    customs = load_custom_agent_seeds()
+    assert customs, "自定义 agent 种子为空——检查 agentflow/seed/agents/ 是否被打进包里"
+    names = [c["name"] for c in customs]
+    assert len(names) == len(set(names)), f"自定义 agent 重名: {names}"
+    for c in customs:
+        assert c["role"] in ("diagnose", "fix"), f"{c['name']} 的 role 不在白名单"
+        assert c["system_prompt"].strip(), f"{c['name']} 没有 system_prompt"
+        assert c["schema"], f"{c['name']} 没有 output_schema"
+        assert set(c["server_names"]) <= server_names, (
+            f"{c['name']} 绑了未声明的 server: {c['server_names']}"
+        )
+        # 与内置 agent 撞名会让 POST /agent-configs 400（"是内置 agent"），
+        # 而种子走的是 insert_if_absent、不校验——只能在这里拦
+        assert c["name"] not in builtin, f"自定义 agent {c['name']} 与内置重名"
+
+    # workflow 引用的 agent 必须在内置 ∪ 自定义里：`Workflow.load_yaml` **不查**
+    # agent 是否存在，引到不存在的名字要到第一次 run 才炸
+    known = builtin | set(names)
+    for w in ws:
+        used = {n.agent for n in Workflow.load_yaml(w["yaml"]).nodes.values() if n.agent}
+        unknown = sorted(used - known)
+        assert not unknown, f"{w['id']} 引用了未知 agent: {unknown}"
+
 
 def test_seed_params_reference_real_schema_fields() -> None:
     """种子里每个 ``$.nodes.<id>.output.<field>`` 都必须指向**真实存在**的字段。
@@ -110,7 +151,10 @@ def test_seed_params_reference_real_schema_fields() -> None:
                 if not head:
                     continue
                 agent = dag.nodes[src].agent
-                schema = AGENT_SCHEMAS.get(agent)
+                # **两种来源**：内置 agent 的 schema 在代码里（AGENT_SCHEMAS），
+                # 自定义 agent（如 ticket-done）的只在种子里 —— 不纳入的话，
+                # 任何引用自定义 agent 输出的 params 都会在这里误报"没有输出 schema"。
+                schema = AGENT_SCHEMAS.get(agent) or _seed_agent_schemas().get(agent)
                 assert schema is not None, (
                     f"{w['id']} {nid}.{pname}：{src} 的 agent={agent!r} 没有输出 schema，"
                     "无法核对字段是否存在"
@@ -142,13 +186,38 @@ async def test_seed_empty_tables_write_all() -> None:
     assert counts == {
         "workflows": len(load_workflow_seeds()),
         "servers": len(load_dataplane_seed()["servers"]),
-        "agents": len(load_dataplane_seed()["bindings"]),
+        # agents 表现在有**两个来源**：内置 agent 的绑定 + 自定义 agent 的完整定义
+        "agents": len(load_dataplane_seed()["bindings"]) + len(load_custom_agent_seeds()),
     }
     assert {r["id"] for r in await w.list()} == {x["id"] for x in load_workflow_seeds()}
     assert {s["name"] for s in await m.list()} == {
         s["name"] for s in load_dataplane_seed()["servers"]
     }
-    assert {r["name"] for r in await a.list()} == set(load_dataplane_seed()["bindings"])
+    assert {r["name"] for r in await a.list()} == (
+        set(load_dataplane_seed()["bindings"]) | {c["name"] for c in load_custom_agent_seeds()}
+    )
+
+
+async def test_custom_agent_is_seeded_with_its_own_prompt_and_schema() -> None:
+    """自定义 agent（seed/agents/*.yaml）要**连 prompt 与 schema 一起**播进库。
+
+    与内置 agent 的绑定行不同：内置行的 prompt/schema 留空（走代码里的静态回退，
+    避免双真源），而自定义 agent 代码里没有副本 —— 留空 = 真·没有提示词，
+    节点会退化成 `scopes.build_agent` 里那句兜底「你是 AI 运维平台智能体。」
+    然后产出不可解析的输出。
+    """
+    _w, _m, a, _ = await _seed()
+    rows = {r["name"]: r for r in await a.list()}
+    for spec in load_custom_agent_seeds():
+        row = rows[spec["name"]]
+        assert row["origin"] == "custom", f"{spec['name']} 的 origin 应为 custom"
+        assert row["role"] == spec["role"] and row["stage"] == spec["stage"]
+        # 比 **strip 过**的值：store 写入时 `_opt_str` 会去首尾空白（YAML 的 `|`
+        # 块标量自带尾换行，故意保留它没有意义），差异仅此而已
+        assert row["system_prompt"] == spec["system_prompt"].strip(), "prompt 没播进去"
+        assert row["schema"] == spec["schema"], "schema 没原样播进去"
+    # 而内置绑定的行仍**不带** prompt（走静态回退）——这条是反向对照
+    assert rows["log-analyst"]["system_prompt"] is None
 
 
 async def test_seed_is_idempotent() -> None:
@@ -217,12 +286,16 @@ async def test_binding_points_at_the_real_server_id() -> None:
 
     await seed_defaults(w, m, a, settings=_Settings())
 
-    rows = await a.list()
-    assert rows, "agent 绑定没播上"
-    for r in rows:
-        assert r["mcp_server_ids"] == [existing], (
-            f"{r['name']} 绑到了 {r['mcp_server_ids']}，应为库里真实的 {existing!r}"
+    rows = {r["name"]: r for r in await a.list()}
+    bound = load_dataplane_seed()["bindings"]
+    assert bound, "dataplane 种子里没有绑定"
+    for agent in bound:
+        assert agent in rows, f"{agent} 的绑定行没播上"
+        assert rows[agent]["mcp_server_ids"] == [existing], (
+            f"{agent} 绑到了 {rows[agent]['mcp_server_ids']}，应为库里真实的 {existing!r}"
         )
+    # 自定义 agent **故意不在**这条断言里：它们目前不绑任何 server（没有出站工具可绑），
+    # 播出来的 `mcp_server_ids` 是 None —— 那不等于"播漏了"，见 seed/agents/*.yaml
 
 
 async def test_binding_makes_agents_usable_and_triage_stays_toolless() -> None:

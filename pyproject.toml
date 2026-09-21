@@ -59,7 +59,7 @@ include = ["agentflow*"]
 # 非 editable 安装（`pip install .` / wheel）会**静默丢掉**这些 YAML，症状是新租户
 # 零 workflow、零 agent 绑定。而 Dockerfile.worker 用的是 `pip install -e .`，源码树在，
 # 会侥幸不丢 —— 于是本地怎么测都测不出来。
-"agentflow.seed" = ["README.md", "*.yaml", "workflows/*.yaml"]
+"agentflow.seed" = ["README.md", "*.yaml", "workflows/*.yaml", "agents/*.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

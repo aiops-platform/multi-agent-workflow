@@ -244,7 +244,11 @@ async def test_provision_seeds_defaults_and_replay_is_idempotent(ctl_env, monkey
     from agentflow.api.agent_store import AgentConfigStore
     from agentflow.api.mcp_store import MCPStore
     from agentflow.api.workflow_store import WorkflowStore
-    from agentflow.seed import load_dataplane_seed, load_workflow_seeds
+    from agentflow.seed import (
+        load_custom_agent_seeds,
+        load_dataplane_seed,
+        load_workflow_seeds,
+    )
 
     s, tmp_path = ctl_env
     monkeypatch.setattr(s, "seed_defaults", True)  # conftest 默认关（既有测试靠它保持语义）
@@ -252,7 +256,8 @@ async def test_provision_seeds_defaults_and_replay_is_idempotent(ctl_env, monkey
     assert await tenantctl(["provision", "seed-x"]) == 0
     n_wf = len(load_workflow_seeds())
     n_srv = len(load_dataplane_seed()["servers"])
-    n_agt = len(load_dataplane_seed()["bindings"])
+    # agents 表有两个来源（见 agentflow/seed/agents/）：内置绑定 + 自定义 agent
+    n_agt = len(load_dataplane_seed()["bindings"]) + len(load_custom_agent_seeds())
     assert f"workflows={n_wf} servers={n_srv} agents={n_agt}" in capsys.readouterr().out
 
     db = tmp_path / "data" / "tenants" / "seed-x.db"
