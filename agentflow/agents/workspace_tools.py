@@ -378,6 +378,22 @@ async def ws_open_pr(service: str, title: str, body: str = "") -> dict:
     if not branch or branch == "HEAD":
         raise WorkspaceToolError("当前是游离 HEAD，无法作为 PR 的 head 分支")
 
+    # ⚠️ **先确认 origin 是指向 GitHub 的远端，再推。**
+    #
+    # 本地联调形态（`.env` 里 `AGENTFLOW_REPO_ROOT` 指向本机 testbed 副本）下，
+    # 工作区是从**本机路径**克隆的，origin 于是是 `file:///Users/...` —— 推是推得动的，
+    # 但推到的是**本机那份副本**，而 `gh` 面对它只会说一句
+    # 「none of the git remotes ... point to a known GitHub host」（写进 stderr）。
+    # 不先拦的话，症状是 `json.loads` 报 `Expecting value: line 1 column 1` ——
+    # 既看不出是远端的问题，还会先在**不相干的地方**留下一个分支（实测踩过）。
+    origin = (await _run(repo, ["git", "remote", "get-url", "origin"], check=False)).strip()
+    if not origin or origin.startswith(("/", "file://", ".")):
+        raise WorkspaceToolError(
+            f"工作区的 origin 不是 GitHub 远端（{origin or '未配置'}），无法开 PR。"
+            "本地联调时 AGENTFLOW_REPO_ROOT 指向本机副本会有这个现象；"
+            "要建 PR 需让工作区从真实远端克隆（不设该变量，走 CMDB 的 repo_url）"
+        )
+
     # 推分支。同样禁用仓库自带的 hook —— `git push` 会执行 `pre-push`，
     # 而 `.git/hooks/` 在可写的工作区里（信任边界见 ws_git 的说明）。
     await _run(repo, ["git", "-c", "core.hooksPath=/dev/null",
@@ -413,19 +429,27 @@ async def ws_open_pr(service: str, title: str, body: str = "") -> dict:
 
 
 async def _run(repo: Path, argv: list[str], *, check: bool = True) -> str:
-    """在仓库里跑一条命令并返回 stdout。
+    """在仓库里跑一条命令并返回 **stdout**。
 
     **不经 shell**（``create_subprocess_exec`` 逐个参数传）：模型给的标题/正文里
     出现 `; rm -rf` 也只是字符串，不会被解释。
+
+    ⚠️ **stderr 单独收、不并进 stdout**。早期这里写的是 ``stderr=STDOUT``（跟
+    ``ws_git`` 一样），但 ``ws_git`` 的返回是给人看的、而这里有一半调用要**当 JSON 解析**
+    （``gh pr list --json``）。`gh` 会往 stderr 写提示（「这幅仓库没有指向已知 GitHub host
+    的远端」就是一条），一并进来就成了"JSON 开头多了一段英文"——
+    ``json.loads`` 报 ``Expecting value: line 1 column 1``，**现场完全看不出是 stderr 混进来了**。
+    实测：run_d595720e5b 的 commit 节点连试三次都是这个错。
     """
     proc = await asyncio.create_subprocess_exec(
         *argv, cwd=str(repo),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
-    out, _ = await proc.communicate()
+    out, err = await proc.communicate()
     text = out.decode("utf-8", "replace")
+    detail = err.decode("utf-8", "replace")
     if check and proc.returncode != 0:
-        raise WorkspaceToolError(f"{' '.join(argv[:2])} 失败: {text[:300]}")
+        raise WorkspaceToolError(f"{' '.join(argv[:2])} 失败: {(detail or text)[:300]}")
     return text
 
 

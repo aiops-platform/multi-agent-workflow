@@ -489,22 +489,34 @@ async def test_unreachable_sandbox_does_not_fall_back(tmp_path, monkeypatch) -> 
 # ws_open_pr：推分支 + 开 PR（治「pr_url 系统性为空」）
 # ----------------------------------------------------------------------
 class _FakeProc:
-    """gh 调用替身：只为 `_run` 提供 communicate()/returncode。"""
+    """gh 调用替身：只为 `_run` 提供 communicate()/returncode。
 
-    def __init__(self, out: str, rc: int = 0) -> None:
+    **必须能返回 stderr** —— `_run` 现在是 `out, err = communicate()`。
+    早期这里返回 `(out, None)`，于是 `_run` 拆包就炸；而更值得注意的是
+    下面 `_stub_gh` 默认**往 stderr 塞一句话**：真实 `gh` 就会这么干，
+    而早期实现把 stderr 并进了 stdout，JSON 解析于是崩在一句英文上
+    （实测 run_d595720e5b 的 commit 节点连试三次都是这个）。
+    """
+
+    def __init__(self, out: str, rc: int = 0, err: str = "") -> None:
         self._out = out.encode()
+        self._err = err.encode()
         self.returncode = rc
 
     async def communicate(self):
-        return self._out, None
+        return self._out, self._err
 
 
 def _stub_gh(monkeypatch, *, existing: str = "", base: str = "main",
-             create_url: str = "https://github.com/o/r/pull/12"):
+             create_url: str = "https://github.com/o/r/pull/12",
+    gh_stderr: str = "warning: some gh notice on stderr\n"):
     """拦下 `gh` 调用并记录 argv；**其余（git push 等）走真的**。
 
     只桩 gh 是有意的：push 是真的在跑，所以"分支到底推出去没有"由裸仓库自己作证，
     而不是由我们的桩点头。
+
+    ``gh_stderr`` **默认非空** —— 真实 `gh` 会往 stderr 写提示。把它默认留空的话，
+    测试就复现不了「stderr 混进 stdout 导致 JSON 解析崩」那个 bug（已实测踩过）。
     """
     import asyncio as _a
 
@@ -518,12 +530,12 @@ def _stub_gh(monkeypatch, *, existing: str = "", base: str = "main",
         if a and a[0] == "gh":
             calls.append(a)
             if a[1:2] == ["pr"] and "list" in a:
-                return _FakeProc(existing)
+                return _FakeProc(existing, err=gh_stderr)
             if a[1:3] == ["repo", "view"]:
-                return _FakeProc(base + "\n")
+                return _FakeProc(base + "\n", err=gh_stderr)
             if a[1:2] == ["pr"] and "create" in a:
-                return _FakeProc(create_url + "\n")
-            return _FakeProc("", 1)
+                return _FakeProc(create_url + "\n", err=gh_stderr)
+            return _FakeProc("", 1, err=gh_stderr)
         return await real(*argv, **kw)
 
     monkeypatch.setattr(_a, "create_subprocess_exec", fake)
@@ -531,10 +543,19 @@ def _stub_gh(monkeypatch, *, existing: str = "", base: str = "main",
 
 
 def _with_origin(repo: Path, tmp_path: Path) -> Path:
-    """给工作区仓库挂一个**裸仓库**当 origin —— push 是真的。"""
+    """挂一个 origin：**fetch URL 长得像 GitHub，push 真的落在本地裸仓库**。
+
+    两个 URL 分工不是花招，是必须的：
+    - `get-url origin`（我的检查读它）必须是 `https://github.com/...`，
+      否则过不了"origin 得是 GitHub 远端"那道闸；
+    - push 打真实 GitHub 是不可能的（无网/无凭证），所以 `--push` 指向裸仓库 ——
+      这样"分支到底推出去没有"仍由裸仓库自己作证，而不是由桩点头。
+    """
     origin = tmp_path / "origin.git"
     git("init", "-q", "--bare", str(origin))
-    git("remote", "add", "origin", str(origin), cwd=repo)
+    git("remote", "add", "origin",
+        "https://github.com/xqfgbc/aiops-test-order-service.git", cwd=repo)
+    git("remote", "set-url", "--push", "origin", str(origin), cwd=repo)
     return origin
 
 
@@ -603,3 +624,48 @@ async def test_ws_open_pr_refuses_empty_title(tmp_path, monkeypatch) -> None:
             await ws_open_pr(service=service, title="   ")
     finally:
         _reset(toks)
+
+
+async def test_ws_open_pr_refuses_non_github_origin(tmp_path, monkeypatch) -> None:
+    """origin 不是 GitHub 远端 → **明确报错**，不要推完再让 gh 说一句看不懂的。
+
+    本地联调形态（`AGENTFLOW_REPO_ROOT` 指向本机 testbed 副本）就是这样：
+    工作区从本机路径克隆，origin 是 `file:///Users/...`。此时：
+      ① push 推得动，但推到的是**本机那份副本** —— 在一个不相干的地方留下分支；
+      ② `gh` 只会往 stderr 说「none of the git remotes ... point to a known GitHub host」，
+         而那句英文混进 stdout 后表现为 `json.loads: Expecting value` ——
+         **现场完全看不出是远端的问题**（实测 run_d595720e5b）。
+    """
+    from agentflow.agents.workspace_tools import WorkspaceToolError, ws_open_pr
+
+    # 刻意**不挂 origin**：`_prepared_workspace` 造出来的工作区没有远端，
+    # 正是"origin 不是 GitHub 远端"这一档
+    service, _repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(WorkspaceToolError) as ei:
+            await ws_open_pr(service=service, title="x")
+    finally:
+        _reset(toks)
+    assert "不是 GitHub 远端" in str(ei.value)
+    assert "AGENTFLOW_REPO_ROOT" in str(ei.value), "错误里要给出可操作的下一步"
+
+
+async def test_ws_open_pr_ignores_gh_stderr(tmp_path, monkeypatch) -> None:
+    """`gh` 往 stderr 写东西**不影响** stdout 的 JSON 解析。
+
+    真实 `gh` 会输出提示（认证提醒、远端识别提示……）。早期 `_run` 用
+    `stderr=STDOUT` 把两者并起来，于是 `json.loads` 撞在一句英文上 ——
+    错误是 `Expecting value: line 1 column 1`，**指不到真正的原因**。
+    """
+    from agentflow.agents.workspace_tools import ws_open_pr
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)
+    calls = _stub_gh(monkeypatch, existing='{"url":"https://github.com/o/r/pull/9","number":9}',
+                     gh_stderr="warning: 认证快要过期了\n又一行噪音\n")
+    try:
+        out = await ws_open_pr(service=service, title="x")
+    finally:
+        _reset(toks)
+    assert out["pr_number"] == 9, "stderr 不该污染 stdout 的 JSON"
+    assert any("list" in c for c in calls)
