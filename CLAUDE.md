@@ -311,6 +311,15 @@ make lint      # ruff 检查
    - **`AGENTFLOW_TEST_CMDS`（JSON）决定每服务能跑什么命令**，`ws_run_tests` **不接受
      调用方传参**。旧实现让 LLM 传自由命令再拿前缀白名单去猜，而白名单里含 `bash `，
      等于没有白名单。
+     ⚠️ **配漏的后果是整条 run 挂掉，而且症状指向别处**：`ws_run_tests` 一调就
+     fail-closed 报错，tester 只能改用 `sandbox_run_shell` 自己拼命令去试 ——
+     拼对了就过，拼不对就**烧完 16 个 ReAct 轮次** → `AgentOutputError` →
+     `test` 节点失败 → `on_failure: abort` 中止整条 run、**工单不回传**。
+     实测（run_250bd89c03）：两条路径两次耗尽轮次，token 是正常值的 2.4 倍，
+     而错误信息只说"未输出合法 JSON"，看不出是配置问题。
+     命令里**不用写 `GRADLE_USER_HOME`** —— `Dockerfile.java21` 已 `ENV` 设成
+     `/gradle-home`（缓存烤进镜像，挂卷反而遮蔽它）。实测 `./gradlew test --no-daemon -q`
+     在工作区里 17 秒跑完、rc=0。
    - **`ws_git` 一律带 `-c core.hooksPath=/dev/null`**：`git commit` 会执行仓库自带的
      `pre-commit`，而 `.git/hooks/` 也在可写的工作区里——不堵就是"不可信仓库在持有
      全部密钥的 worker 里执行任意代码"。
@@ -339,6 +348,11 @@ make lint      # ruff 检查
      原系统那边**什么都收不到**。不是"报了个失败"，是**闭环彻底没有回音**。
    - 所以换机器先 `make doctor`（`--install` 能装 gh）；凭证那步装不了，
      脚本会打出两条路：`gh auth login`（交互）或 `GH_TOKEN=<PAT>`（无人值守）。
+   - ⚠️ **`AGENTFLOW_REPO_ROOT` 要用 `https://github.com/<org>` 形式**，不要用本机副本路径。
+     工作区是从它克隆的，origin 因此就是工作区的远端：本机路径形态下 origin 是
+     `file:///...`，`ws_open_pr` 推得动但**推错地方**（往本机那份副本推），
+     而 `gh` 只会说「没有任何 git remote 指向已知 GitHub host」—— **建不出 PR**。
+     `ws_open_pr` 现在**先检查 origin 再推**，是 `/`、`file://`、相对路径就直接拒。
    - 三条边界写在 `ws_open_pr` 的 docstring 里：**base 取仓库默认分支**（不让 LLM 挑）、
      **head 取 git 当前分支**（不接受传参，否则能推别的分支上去）、
      **标题/正文走 `--title=` 单参形式**（模型给的值以 `-` 开头时不会被当旗标解析）。
