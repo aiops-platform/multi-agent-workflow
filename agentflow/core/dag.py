@@ -89,7 +89,7 @@ class Node:
     #: （后者分不清"中断"与"正常跳过"——如 ``test.passed == false`` 跳过 review/commit）。
     #:
     #: 它是**确定性**的：不调 LLM，只把入参里的"为什么停、缺什么"如实带出去。
-    kind: str = "agent"  # agent | approval | halt
+    kind: str = "agent"  # agent | approval | halt | ticket
     agent: str | None = None  # agent 节点对应的职能智能体
     in_edges: list[Edge] = field(default_factory=list)
     when: str | None = None  # 便捷写法：单上游时的边条件
@@ -122,6 +122,16 @@ class Node:
     def is_halt(self) -> bool:
         """中断节点。执行它 = 本条 run 判定为「证据不足、不再往下走」。"""
         return self.kind == "halt"
+
+    @property
+    def is_ticket(self) -> bool:
+        """建单节点。执行它 = **在租户库里建一张工单**（真副作用，不进 runner、不调 LLM）。
+
+        与 `halt` 的关键差别：halt 明说"不重试、不做幂等"，而建单**恰恰最需要幂等**
+        ——所以它在 executor 里走 `_run_with_retry` 的 `invoke()` 分支（拿全套预检/retry/
+        on_failure），而不是像 halt 那样在调度处前置短路。见 `executor/dag_executor.py`。
+        """
+        return self.kind == "ticket"
 
     @property
     def upstreams(self) -> list[str]:
@@ -247,6 +257,42 @@ class DAG:
         self._check_join_consistency()
         if strict:
             self._check_on_reject_consistency()
+            self._check_node_kinds()
+
+    def _check_node_kinds(self) -> None:
+        """节点 ``kind`` 的**白名单** + 建单节点的两条约束（§8.1）。
+
+        值得单独守，是因为**未知 kind 此前会静默降级成普通 agent 节点**：
+        `DAG.build` 只 `pop("kind")` 不做校验，而 `is_approval`/`is_halt` 都是 False
+        → 落到 else 分支去调 runner。于是把 `kind: tikcet` 打错一个字母，
+        结果是一个"没有 agent 的 agent 节点"——**加载不报错、运行也不报错**，
+        只在日志里看着像空转。
+
+        ⚠️ **只在 `strict=True` 时跑**：`strict=False` 是 resume 加载**冻结快照**的路径
+        （`executor/resume.py` 有血泪注释）。拿新规则判已跑过的 run = 让历史 run
+        永久读不出来——这正是 `_check_on_reject_consistency` 那次踩过的坑。
+        """
+        allowed = {"agent", "approval", "halt", "ticket"}
+        for nid, node in self.nodes.items():
+            if node.kind not in allowed:
+                raise WorkflowDAGError(
+                    f"节点 {nid} 的 kind={node.kind!r} 不是合法取值（可用：{sorted(allowed)}）"
+                )
+            if not node.is_ticket:
+                continue
+            # ① `on_failure: continue` 会把失败变成 negative_evidence 并**把节点标 DONE**
+            #    （executor `_run_with_retry` 的 on_error）——建单失败会"看着成功"，
+            #    而下游（APM 回读）拿到的是没有 ticket_id 的负证据。
+            if node.on_failure == "continue":
+                raise WorkflowDAGError(
+                    f"建单节点 {nid} 声明了 on_failure: continue —— 建单失败会被标成 done，"
+                    f"看起来像成功。建单是真副作用，必须 abort（失败就失败）"
+                )
+            # ② 建单节点不走 runner，写 `agent:` 只会被静默忽略。
+            if node.agent:
+                raise WorkflowDAGError(
+                    f"建单节点 {nid} 不该声明 agent（它不调 LLM）：当前 agent={node.agent!r}"
+                )
 
     def _check_on_reject_consistency(self) -> None:
         """``on_reject: abort`` 的审批节点**不得有驳回出边**（§8.1 / CLAUDE.md 约束 4.1）。

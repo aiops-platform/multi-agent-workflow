@@ -27,7 +27,7 @@ import uuid
 from .config import get_settings
 from .core.dag import FAILED, TERMINAL
 from .core.workflow import Workflow
-from .executor.dag_executor import DAGExecutor, NodeRunner, WorkflowNodeFailed
+from .executor.dag_executor import DAGExecutor, NodeRunner, TicketCreator, WorkflowNodeFailed
 from .executor.resume import resume_executor
 from .queue.base import Queue, topic_command, topic_trigger
 from .statestore.base import StateStore
@@ -73,6 +73,7 @@ class RunService:
         store: StateStore | Any,
         node_runner: NodeRunner | None = None,
         *,
+        ticket_creator: TicketCreator | None = None,
         queue: Queue | None = None,
         tenant_registry: TenantRegistry | None = None,
         lock=None,
@@ -81,6 +82,8 @@ class RunService:
         # 兼容既有用法/测试的单库访问（Router 模式为 None，请用 store_for(tenant_id)）
         self.store = store if hasattr(store, "get_run") else None
         self.node_runner = node_runner
+        #: `kind: ticket` 节点的建单实现（组合根注入；None = 该节点 fail-closed）
+        self.ticket_creator = ticket_creator
         # queue 非空 = queue 模式（发布 trigger/command，不进程内执行）
         self.queue = queue
         self.tenant_registry = tenant_registry
@@ -147,6 +150,7 @@ class RunService:
         ex = DAGExecutor(
             run_id, tenant_id, workflow.dag, store,
             node_runner=self.node_runner, inputs=inputs or {},
+            ticket_creator=self.ticket_creator,
         )
         self._executors[run_id] = ex
         outcome = await ex.run()
@@ -165,6 +169,7 @@ class RunService:
         ex = DAGExecutor(
             run_id, tenant_id, workflow.dag, store,
             node_runner=self.node_runner, inputs=inputs or {},
+            ticket_creator=self.ticket_creator,
         )
         self._executors[run_id] = ex
         self._tasks[run_id] = asyncio.create_task(self._run_background(run_id, ex, store))
@@ -293,7 +298,10 @@ class RunService:
                 },
             )
             return self._summary(run_id)
-        ex = await resume_executor(run_id, tenant, store, node_runner=self.node_runner)
+        ex = await resume_executor(
+            run_id, tenant, store,
+            node_runner=self.node_runner, ticket_creator=self.ticket_creator,
+        )
         self._executors[run_id] = ex
         outcome = await ex.run()
         await store.update_run(run_id, status=outcome)
@@ -368,7 +376,10 @@ class RunService:
         if ex is None:
             store, run, tenant = await self._run_context(run_id, tenant_id)
             self._check_approver(tenant, node_id, by)
-            ex = await resume_executor(run_id, tenant, store, node_runner=self.node_runner)
+            ex = await resume_executor(
+                run_id, tenant, store,
+                node_runner=self.node_runner, ticket_creator=self.ticket_creator,
+            )
             if self.queue is None:
                 self._executors[run_id] = ex
         else:

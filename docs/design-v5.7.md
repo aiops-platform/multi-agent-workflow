@@ -880,26 +880,34 @@ scenario2（纯代码修复）      : plan → approve-plan → fix
 `problem-log-diagnose`（Problem Center「分析new」）改成了：
 
 ```
-triage → logs, locate → rca → plan → diagnose-output   ← kind: approval，**终态节点，无出边**
+triage → logs, locate → rca → plan → diagnose-output → create-ticket
+                                      ↑ kind: approval      ↑ kind: ticket
 rca    → halt (insufficient == true)
 locate → halt (found == false)
 ```
 
 **为什么**：Problem Center 里人要拍板的是「这条问题单要不要处理、派给谁做」，不是让平台
-在沙箱里替人改代码。三种裁定（拒绝重跑 / 忽略关单 / 升级开单）收在同一道门上，**升级的下游
-动作（建工单、绑号、置终态）住在 APM 侧**——工单号要绑到 APM 的 `problem_record.evidence`，
-而 agentflow 没有也不该有 APM 的客户端（今天是 APM → agentflow 单向）。
+在沙箱里替人改代码。三种裁定（拒绝重跑 / 忽略关单 / 升级开单）收在同一道门上。
+
+> ⚠️ **建单后来又搬了一次家（同日晚些）**：升级的建单原在 **APM 侧**（放行门之后自己调
+> `POST /tickets`），现改为 **run 内的 `create-ticket` 节点**（`kind: ticket`）——这样它在流程图
+> 里有落点，且与放行门是一次决策。代价是 APM 要**回读** run 的节点输出拿号
+> （`inline` 同步拿得到，`queue` 要有界轮询），且**两边只能有一边建单**（否则两张单）。
+> 详见本节末尾的「建单节点」。
 
 **三点值得留的**：
 
 1. **`continue` + 没有驳回出边 = 引擎允许的第三种形态**（前两种是 `abort`+无边、
    `continue`+有边）。`_check_on_reject_consistency` 只拦反方向那个矛盾组合，**加载期不查
    这一形态**，所以只能靠测试守（`tests/test_problem_log_diagnose_workflow.py`
-   的 `test_gate_is_terminal_with_no_out_edges` / `test_gate_is_continue_so_reject_does_not_abort`）。
-2. **语义代价（不是 bug）**：门是终态后，通过与否**只看节点状态**——两条路的 run 都是
+   的 `test_gate_has_exactly_one_out_edge_and_no_reject_edge` /
+   `test_gate_is_continue_so_reject_does_not_abort`）。通过侧那条边通往 `create-ticket`，
+   **驳回侧仍然没有边**。
+2. **语义代价（不是 bug）**：通过与否**只看节点状态**——两条路的 run 都是
    `done` → API `success` → viewmodel `completed`。人否了诊断，run 仍报成功，
-   痕迹只在门节点的 `rejected` 与审批记录里。这是 `TERMINAL` 含 `REJECTED` 的固有属性，
-   换 `abort` 就会把"人否决"变成"执行失败"，取舍见 `CLAUDE.md` §4.1。
+   痕迹只在门节点的 `rejected` 与审批记录里（驳回后 `create-ticket` 是 SKIPPED）。
+   这是 `TERMINAL` 含 `REJECTED` 的固有属性，换 `abort` 就会把"人否决"变成"执行失败"，
+   取舍见 `CLAUDE.md` §4.1。
 3. ~~**删掉修复段后这条流程不含任何 `WORKSPACE_AGENTS`**，`service.py` 的 `_prepare_workspace`
    会提前 return——run 不再准备 git 工作区（更省更快）。~~
    ⚠️ **这条是错的，当天就被证伪并修掉**，留在这里当反面教材：
@@ -916,6 +924,29 @@ locate → halt (found == false)
    > 得先确认**那个分支是唯一让某件事发生的地方**——这次不是，而我没有回头核。
 
 `docs/TODO.md` §25（`ws_git` 允许 `push`）的前提随之变动，见该节的「前提变动」注。
+
+#### 建单节点（`kind: ticket`，2026-09-21 晚）
+
+升级的建单**从 APM 搬进 run**：门通过后走 `create-ticket` 节点，在**租户库**建一张工单。
+
+- **不走 runner、不调 LLM**，但**走 `_run_with_retry`**（executor 的 `invoke()` 里按
+  `is_ticket` 分派）——于是 require 预检 / retry / timeout / `on_failure` 全套都在。
+  刻意**不学 `halt`** 在调度处短路：halt 的语义是"不重试、不做幂等"，而建单是真副作用。
+- **幂等放在接口层**（`TicketStore.create_once` 按 `source_ref` 查重，已建过就返回那张已存在的），
+  不靠引擎的 `external_operation_id`——后者只活在 attempt 账本里，管得住"同 run 重放"，
+  管不住"同一条数据被两个 run 各建一张"。不变量是**一条数据永远只有一张工单**；
+  `source_ref` = 问题单号，并发由 `UNIQUE(tenant_id, source_ref)` 兜底。
+  取号也放在查重之后——幂等命中时不该白烧一个号。
+- **取号在 agentflow 侧**（`INC-YYYYMMDD-NNNN`，`ticket_seq` 表）——工单住在这儿，号也该这儿出。
+- ⚠️ **`on_failure` 必须是 `abort`**（加载期拦 `continue`）：`continue` 会把失败变成
+  negative_evidence 并**把节点标 DONE**，建单失败会"看着成功"。
+- ⚠️ **`kind` 白名单也是这次加的**（`agent|approval|halt|ticket`，只在 `strict=True`）：
+  此前未知 kind 会**静默降级成普通 agent 节点**去调 runner，打错一个字母也不报错。
+- ⚠️ **已有租户库要补列**：`CREATE TABLE IF NOT EXISTS` 对已存在的表什么也不做，所以
+  `source_ref` 靠连接时的一次受保护 `ALTER TABLE` 补上（SQLite 问 PRAGMA，PG 用
+  `ADD COLUMN IF NOT EXISTS`）——**且必须早于建唯一索引**，否则旧库直接报 "no such column"。
+- **已知边界**：门能从别处放行（run 查看器里也能点通过）——那条路径会在 run 内建出工单，
+  而 **APM 不会知道**（记录不转 `escalated`）。搬进 run 之后，建单副作用不再只有 APM 一个入口。
 
 ### 7.3 验收判据
 

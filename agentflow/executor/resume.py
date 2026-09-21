@@ -10,7 +10,7 @@ import logging
 
 from ..core.workflow import Workflow
 from ..statestore.base import StateStore
-from .dag_executor import DAGExecutor, NodeRunner
+from .dag_executor import DAGExecutor, NodeRunner, TicketCreator
 
 log = logging.getLogger("agentflow.executor.resume")
 
@@ -32,6 +32,7 @@ async def resume_executor(
     tenant_id: str,
     store: StateStore,
     node_runner: NodeRunner | None = None,
+    ticket_creator: TicketCreator | None = None,
 ) -> DAGExecutor:
     """从 checkpoint 重建 executor（§4.4 断点续跑的核心入口）。"""
     run = await store.get_run(run_id)
@@ -45,4 +46,5 @@ async def resume_executor(
         store,
         node_runner=node_runner,
         inputs=run.get("inputs"),
+        ticket_creator=ticket_creator,
     )

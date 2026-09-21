@@ -1105,3 +1105,109 @@ edges: []
     )
     assert await ex2.run() == "done"
     assert calls["n"] == 2, "失败节点必须被重跑，不是被沿用"
+
+
+# ──────────────────────────────────────────────────────────────────
+# kind: ticket —— 建单节点（executor 原生，不调 LLM）
+# ──────────────────────────────────────────────────────────────────
+TICKET_YAML = """
+name: ticket-flow
+inputs: {}
+nodes:
+  t:
+    kind: ticket
+    on_failure: abort
+    require: [source_ref]
+    params:
+      source_ref: "$.inputs.ref"
+edges: []
+"""
+
+
+async def test_ticket_node_calls_the_creator_and_publishes_its_output() -> None:
+    """建单节点**不走 runner**，调注入的 `ticket_creator`，输出进 checkpoint。
+
+    APM 就是靠回读这个输出拿工单号的（`GET /runs/{id}` → nodes[create-ticket].output）。
+    """
+    seen: list[tuple[str, dict]] = []
+
+    async def creator(tenant_id: str, params: dict) -> dict:
+        seen.append((tenant_id, params))
+        return {"ticket_id": "tkt1", "ticket_number": "INC-20260921-0001"}
+
+    wf = Workflow.load_yaml(TICKET_YAML)
+    store = InMemoryStateStore()
+    runner, calls = make_runner()
+    ex = DAGExecutor(
+        "run_tk", "otr", wf.dag, store,
+        node_runner=runner, inputs={"ref": "PR-0001"}, ticket_creator=creator,
+    )
+    assert await ex.run() == "done"
+    assert ex.get_status("t") == "done"
+    assert ex.node_states["t"]["output"]["ticket_number"] == "INC-20260921-0001"
+    # tenant 与已解析的 params 一起给过去（creator 不自己解析 `$.`）
+    assert seen == [("otr", {"source_ref": "PR-0001"})]
+    # runner 一次都没被调到 —— 这是"不调 LLM"的判据
+    assert calls == {}
+
+
+async def test_ticket_node_fails_closed_when_creator_not_wired() -> None:
+    """没接线 `ticket_creator` → **节点失败**，不是"跳过建单然后报成功"。
+
+    单库模式的测试里 `RunService(store)` 单参调用约 25 处，所以这个参数必须是可选的；
+    可选参数的真代价就是"忘了注入"这条路存在——它必须响亮地失败。
+    """
+    wf = Workflow.load_yaml(TICKET_YAML)
+    ex = DAGExecutor("run_tk2", "otr", wf.dag, InMemoryStateStore(), inputs={"ref": "PR-1"})
+    with pytest.raises(WorkflowNodeFailed) as ei:
+        await ex.run()
+    assert "ticket_creator" in str(ei.value)
+
+
+async def test_ticket_node_require_preflight_fails_fast() -> None:
+    """入参预检照常生效：`source_ref` 缺失 → 直接失败，**不调 creator**（不空转）。"""
+    called = False
+
+    async def creator(tenant_id: str, params: dict) -> dict:
+        nonlocal called
+        called = True
+        return {}
+
+    wf = Workflow.load_yaml(TICKET_YAML)
+    ex = DAGExecutor(
+        "run_tk3", "otr", wf.dag, InMemoryStateStore(),
+        inputs={}, ticket_creator=creator,
+    )
+    with pytest.raises(WorkflowNodeFailed):
+        await ex.run()
+    assert called is False
+    assert ex.get_status("t") == "failed"
+
+
+@pytest.mark.parametrize(
+    ("yaml_text", "needle"),
+    [
+        # on_failure: continue → 建单失败会被标成 DONE（negative_evidence），"看着成功"
+        (TICKET_YAML.replace("on_failure: abort", "on_failure: continue"), "on_failure"),
+        # 未知 kind 此前会静默降级成普通 agent 节点（去调 runner）
+        (TICKET_YAML.replace("kind: ticket", "kind: tikcet"), "kind"),
+        # 建单节点不调 LLM，写 agent 只会被静默忽略
+        (
+            TICKET_YAML.replace("    kind: ticket", "    kind: ticket\n    agent: tester"),
+            "agent",
+        ),
+    ],
+)
+def test_bad_ticket_node_is_rejected_at_load(yaml_text: str, needle: str) -> None:
+    """这三条都**只在编写路径**（`strict=True`）拦。
+
+    ⚠️ 绝不能影响 `strict=False`：那是 resume 加载**冻结快照**的路径，拿新规则判已跑过的
+    run = 让历史 run 永久读不出来（`executor/resume.py` 有血泪注释）。
+    """
+    from agentflow.core.dag import WorkflowDAGError
+
+    with pytest.raises(WorkflowDAGError) as ei:
+        Workflow.load_yaml(yaml_text)
+    assert needle in str(ei.value)
+    # 冻结快照路径照常能加载（同一份 YAML，strict=False）
+    assert Workflow.load_yaml(yaml_text, strict=False).dag is not None

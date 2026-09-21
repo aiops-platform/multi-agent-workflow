@@ -13,10 +13,11 @@
 #    而不是让平台在沙箱里替人改代码。三种裁定的落点是：
 #      拒绝·重新分析 → APM 驳门 + 起一轮新的 run（真源在 APM 侧，不在本图）
 #      忽略          → APM 驳门 + 关单
-#      升级          → APM **放行本门** + 调 `POST /tickets` 建一张修复工单，
-#                      工单号绑回问题单、问题单转 `escalated` 终态
-#    「升级」不在图里建单，是刻意的：工单号要绑到 APM 的 `problem_record.evidence`，
-#    而 agentflow 没有也不该有 APM 的客户端（今天是 APM → agentflow 单向）。
+#      升级          → APM 放行本门 → **run 内建单**（`create-ticket` 节点）→ APM 回读
+#                      该节点的工单号、绑回问题单、问题单转 `escalated` 终态
+#    ⚠️ 建单**在图里**（2026-09-21 从 APM 侧搬进来的）：这样它在流程图里有落点，且与放行门
+#    是一次决策。代价是 APM 要**回读** run 的节点输出拿号——`inline` 下同步拿得到，
+#    `queue` 下要轮询（见 APM 侧 `_decide_agentflow`）。
 name: problem-log-diagnose
 version: "2.0.0"
 description: "Problem Center 分析new：日志分析 → 根因 → 修复方案 → 诊断输出门（拒绝重跑 / 忽略 / 升级开单）"
@@ -131,12 +132,11 @@ nodes:
   #    判据看**状态**不看**动作**：`rejected_abort_node()` 按节点状态判定，因为 queue 模式下
   #    Worker 经 `from_checkpoint` 重建后直接 `run()`，**不经过 `approve()`**。见 docs/TODO.md §21。
   #
-  # ⚠️ **本门是终态节点：图上没有任何出边**，这是刻意的，不是漏写。
-  #    `continue` + **没有**驳回出边是引擎明确允许的形状（core/dag.py 的
+  # ⚠️ **驳回侧没有出边**，这是刻意的，不是漏写；通过侧有一条（→ create-ticket）。
+  #    `continue` + 没有驳回边是引擎明确允许的形状（core/dag.py 的
   #    `_check_on_reject_consistency` 只拦反方向「abort + 有驳回边」那个矛盾组合；
-  #    先例 tests/test_run_api.py 的 APPROVAL_YAML 就是同形状）。通过/驳回都是 run 的
-  #    自然收敛：通过 → 门 DONE、run done；驳回 → 门 REJECTED、run 仍 done。
-  #    实测（内存里跑 DAGExecutor，四条路径）见提交信息与测试。
+  #    先例 tests/test_run_api.py 的 APPROVAL_YAML 就是同形状）。语义是"驳回后下游全部失活、
+  #    run 照常收敛（不中止）"——run 仍判 done，留痕在门节点的 `rejected` 状态里。
   #    **不要**为了"看起来完整"补一条 `approved == false → halt` 之类的边：驳回不是中断，
   #    halt 一旦执行会把其余 PENDING 节点全部 SKIPPED，语义完全不同（CLAUDE.md §3.1）。
   #
@@ -153,6 +153,38 @@ nodes:
     approvers: []
     timeout: 86400
     on_reject: continue
+
+  # ── 建单：升级的落点 ─────────────────────────────────────────────────────────
+  # 「升级」= 认可诊断 → **在租户库里建一张修复工单**。这一步住在 run 内部（而不是 APM
+  # 调一次 `POST /tickets`），是为了让它在流程图里有落点、也让它和放行门是一次原子决策。
+  #
+  # ⚠️ 本节点**不走 runner、不调 LLM**（executor 的 `invoke()` 里按 `is_ticket` 分支），
+  #    但**走 `_run_with_retry`** —— 于是 require 预检 / retry / timeout / on_failure 全套都在。
+  #    刻意不学 `halt` 在调度处短路：halt 的语义是"不重试、不做幂等"，而建单是真副作用，
+  #    恰恰最需要这些。
+  #
+  # 幂等：**建单前按 `source_ref` 查重，已建过就返回那张已存在的（成功）**，
+  #    见 `TicketStore.create_once`。不变量比引擎的 `external_operation_id` 更强——
+  #    后者只活在 attempt 账本里，管得住"同 run 重放"，管不住"同一条数据被两个 run 各建一张"。
+  #
+  # `on_failure` **必须 abort**（加载期会拦 `continue`）：`continue` 会把失败变成
+  #    negative_evidence 并**把节点标 DONE** —— 建单失败会"看着成功"，而 APM 回读到的是
+  #    一份没有 ticket_id 的负证据。
+  create-ticket:
+    kind: ticket
+    on_failure: abort
+    require: [source_ref, bug_report]
+    params:
+      # 幂等判据 = **这条数据**（问题单号），不是 run —— 见上面那段。
+      # 它在 require 里，所以工单没号时会 fail-fast，而不是建一张无法去重的单。
+      source_ref: "$.inputs.bug_report.number"
+      bug_report: "$.inputs.bug_report"
+      window_start: "$.inputs.window_start"
+      window_end: "$.inputs.window_end"
+      severity: "$.inputs.bug_report.severity"
+      # 诊断结论随工单走：拿到工单的人不必回平台翻诊断。
+      rca: "$.nodes.rca.output"
+      plan: "$.nodes.plan.output"
 
   # ── 中断终点 ─────────────────────────────────────────────────────────────────
   # **不写 params**：halt 的 reason/missing 由 executor 从**触发它的那条入边**的上游输出
@@ -176,8 +208,10 @@ edges:
   - { from: rca,  to: diagnose-output }
   - { from: plan, to: diagnose-output }
 
-  # ── 门之后：没有边 ───────────────────────────────────────────────────────────
-  # 「升级」的下游动作（建工单、绑号、置终态）住在 APM 侧，见文件头。**不要**在这里加节点。
+  # ── 门之后：通过 → 建单；驳回 → 无边（见门节点上的说明）───────────────────────
+  # 「升级」就是走这条边：放行门 → 建单。工单号由本节点产出，APM **回读**这个节点的
+  # 输出拿号（它不再自己建单——两边都建会出两张单）。
+  - { from: diagnose-output, to: create-ticket, when: "$.nodes.diagnose-output.output.approved == true" }
 
   # ── 中断点（halt）────────────────────────────────────────────────────────────
   # 判据必须是**图上的 kind**（halt_triggered()），且**只需加一条 when 边**——

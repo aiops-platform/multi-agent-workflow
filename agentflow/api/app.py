@@ -332,6 +332,8 @@ async def init() -> RunService:
             sandbox_client=build_sandbox_client(settings),
         )
         print("[agentflow] node_runner=agent（DeepSeek）：Bug Solve 页将真实调用 agent")
+    # 建单能力与 LLM key 无关：没配 key 时也要能建（`kind: ticket` 节点不调 LLM）
+    kwargs["ticket_creator"] = _build_ticket_creator()
     queue_mode = settings.run_mode == "queue"
     service = RunService(
         stores_router,
@@ -353,6 +355,7 @@ async def init() -> RunService:
             # 单进程形态：Worker 以后台任务运行（与独立进程行为一致）
             worker = WorkerPool(
                 stores_router, queue, node_runner=service.node_runner,
+                ticket_creator=service.ticket_creator,
                 tenants_provider=_active_tenant_ids,
             )
             _worker_task = asyncio.create_task(worker.run_forever())
@@ -390,6 +393,31 @@ async def _control_stores(ctx: TenantContext | None):
             self.ticket = ticket_store
 
     return _GlobalStores()
+
+
+def _build_ticket_creator():
+    """造 `kind: ticket` 节点的建单回调，交给 `RunService` / `WorkerPool`。
+
+    组合根职责：`executor/` **不 import `api/`**（那条反向依赖会把整个 web 栈拖进 Worker
+    进程），所以执行引擎只收一个裸回调——与 `node_runner` 同一手法。业务规则
+    （params → 工单字段、按 source_ref 查重）住在 `ticket_store.create_from_node_params`，
+    这里只负责"从哪儿拿 store"。
+
+    两种形态：
+    - **Router**（多租户）：按租户解析，复用 `worker.build_ticket_creator`。
+    - **单库 / 测试**：用模块全局 `ticket_store`，且必须**运行时读取**——
+      测试 monkeypatch 的正是 `app_mod.ticket_store`，构造时捕获会拿到旧的那只。
+    """
+    from ..worker import build_ticket_creator
+    from .ticket_store import create_from_node_params
+
+    if stores_router is not None:
+        return build_ticket_creator(stores_router)
+
+    async def create(tenant_id: str, params: dict) -> dict:
+        return await create_from_node_params(ticket_store, tenant_id, params)
+
+    return create
 
 
 @app.post("/run")
