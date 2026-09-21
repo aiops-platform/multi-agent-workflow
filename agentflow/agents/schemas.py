@@ -221,6 +221,15 @@ CodeLocationSchema = {
         "suspicious_files": {"type": "array", "items": {"type": "string"}},
         #: `found: false` 时写清**缺什么**才能定位（与 scope/rca 的 `missing` 同形）。
         "missing": {"type": "array", "items": {"type": "string"}},
+        #: 目标服务**从哪来**（本节点现在有两个来源，强度不同，必须可分辨）。
+        #:
+        #: 为什么要单列成一个字段、而不是写进 summary 的散文：一是**机器可判**
+        #: （下游/前端能直接看"这次是靠弱证据走的"），二是**短**。
+        #: 实测踩过：先写成"必须在 summary 里说明来源"的散文要求，locate 的输出
+        #: 立刻变长，紧接着一次 run 就因回复被截断而 JSON 解析失败 →
+        #: `on_failure: abort` → **整条 run failed**（run_98ac293c60）。
+        #: 与 scope 的 `evidence_source`（CANDIDATE_EVIDENCE_SOURCES）同款做法。
+        "target_source": {"enum": ["trace", "logs", ""]},
         "summary": {"type": "string"},
     },
     # 放宽 required：`found: false` 时 `service`/`repo_url` 本就不该有。
