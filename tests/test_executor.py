@@ -5,7 +5,7 @@ import asyncio
 
 import pytest
 
-from agentflow.core.dag import DONE, REJECTED, SKIPPED, WAITING_APPROVAL
+from agentflow.core.dag import DONE, PENDING, REJECTED, SKIPPED, WAITING_APPROVAL
 from agentflow.core.workflow import Workflow
 from agentflow.executor.dag_executor import DAGExecutor, WorkflowNodeFailed
 from agentflow.statestore.memory import InMemoryStateStore
@@ -951,3 +951,60 @@ async def test_halt_skips_everything_remaining_even_with_unconditional_edges() -
     assert ex.get_status("side") == SKIPPED
     assert ex.get_status("tail") == SKIPPED
     assert outcome == "done"
+
+
+async def test_resume_reruns_failed_node_instead_of_preserving_it() -> None:
+    """**失败节点必须能被 resume 重跑** —— 它不在 TERMINAL 里是**有意的**。
+
+    回归背景（2026-09-21，我自己引入又撤掉的）：曾把 `FAILED` 加进 `core.dag.TERMINAL`，
+    看着"失败当然是终态"很合理，但 `from_checkpoint` 正是靠**不在 TERMINAL** 把失败
+    节点重置为 `pending`：
+
+        if st.get("status") not in TERMINAL and st.get("status") != WAITING_APPROVAL:
+            st = {"status": PENDING, "output": None}
+
+    加进去之后实测：失败节点被原样保留 → 它的出边失活 → resume **直接收敛成 `done`**
+    —— **一条失败的 run 续跑之后变成了"成功"**。这条测试钉住那个后果。
+
+    注：验证时必须用 **queue 模式**建 run。inline 模式下 `start_run` 会自己起后台执行，
+    两个 executor 写同一行 nodes，探针会被污染（第一版就因此得出过相反的结论）。
+    """
+    from agentflow.core.workflow import Workflow
+    from agentflow.executor.resume import resume_executor
+    from agentflow.queue.memory import InMemoryQueue
+    from agentflow.service import RunService
+
+    yaml_text = """
+name: t
+version: "1.0.0"
+inputs: {}
+nodes:
+  t: { agent: tester }
+edges: []
+"""
+    store = InMemoryStateStore()
+    svc = RunService(store, queue=InMemoryQueue())    # ← queue 模式：只发布，不执行
+    wf = Workflow.load_yaml(yaml_text)
+    rid = (await svc.start_run("t1", wf, {}))["run_id"]
+
+    calls = {"n": 0}
+
+    async def bad(node, params):
+        calls["n"] += 1
+        return {"passed": False}
+
+    ex = DAGExecutor(rid, "t1", wf.dag, store, node_runner=bad)
+    with pytest.raises(WorkflowNodeFailed):
+        await ex.run()
+    assert (await store.get_nodes(rid))["t"]["status"] == "failed"
+
+    async def good(node, params):
+        calls["n"] += 1
+        return {"passed": True}
+
+    ex2 = await resume_executor(rid, "t1", store, node_runner=good)
+    assert ex2.node_states["t"]["status"] == PENDING, (
+        "失败节点在 resume 时应重置为 pending（靠的就是 FAILED 不在 TERMINAL）"
+    )
+    assert await ex2.run() == "done"
+    assert calls["n"] == 2, "失败节点必须被重跑，不是被沿用"

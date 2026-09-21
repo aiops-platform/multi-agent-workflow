@@ -99,7 +99,9 @@ class Worker:
         if run is None:
             log.warning("[%s] trigger 对应 run 不存在", run_id)
             return
-        if run.get("status") in TERMINAL or run.get("status") == "cancelled":
+        # `failed` 不在 TERMINAL（见 core/dag.py 的说明）—— 但**失败的 run 同样不该被
+        # 重新 trigger/resume**，所以这里显式带上，和 cancelled 一样。
+        if run.get("status") in TERMINAL or run.get("status") in ("cancelled", "failed"):
             log.info("[%s] run 已终态（%s），忽略 trigger", run_id, run.get("status"))
             return
         tenant = run["tenant_id"]
@@ -168,7 +170,9 @@ class Worker:
         if run is None:
             log.warning("[%s] resume 对应 run 不存在", run_id)
             return
-        if run.get("status") in TERMINAL or run.get("status") == "cancelled":
+        # `failed` 不在 TERMINAL（见 core/dag.py 的说明）—— 但**失败的 run 同样不该被
+        # 重新 trigger/resume**，所以这里显式带上，和 cancelled 一样。
+        if run.get("status") in TERMINAL or run.get("status") in ("cancelled", "failed"):
             log.info("[%s] run 已终态，忽略 resume", run_id)
             return
         tenant = run["tenant_id"]

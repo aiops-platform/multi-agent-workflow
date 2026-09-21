@@ -25,7 +25,7 @@ import logging
 import uuid
 
 from .config import get_settings
-from .core.dag import TERMINAL
+from .core.dag import FAILED, TERMINAL
 from .core.workflow import Workflow
 from .executor.dag_executor import DAGExecutor, NodeRunner, WorkflowNodeFailed
 from .executor.resume import resume_executor
@@ -236,7 +236,9 @@ class RunService:
         stop 语义：当前节点跑完即停；待审批节点一并作废，图上显示 cancelled。
         """
         for nid, st in ex.node_states.items():
-            if st.get("status") in TERMINAL:
+            # `failed` 不在 TERMINAL（见 core/dag.py 的说明），但停跑时**也不该把它
+            # 改写成 cancelled** —— 那会把失败原因擦掉，图上只剩一句"已取消"。
+            if st.get("status") in TERMINAL or st.get("status") == FAILED:
                 continue
             ex.node_states[nid] = {"status": "cancelled", "output": None}
             await store.put_node(run_id, ex.tenant_id, nid, ex.node_states[nid])

@@ -45,14 +45,22 @@ REJECTED = "rejected"
 # 下游拒绝路径边可求值），但与人工 REJECTED 区分，供前端单独渲染。
 REJECTED_CANCELED = "rejected-canceled"
 #: 节点执行失败（异常 / 重试耗尽 / **结论不通过**，后者见 executor 的 VERDICT_FIELDS）。
-#: 它此前是散在 executor 里的字面量 `"failed"`，且**没进 TERMINAL** —— 那带来三个错：
-#:   · 失败节点的下游停在 `pending`（永远跑不了，却显示成"还没跑"）
-#:   · `stop` 时会把失败节点改写成 `cancelled`，**失败原因被擦掉**
-#:   · Worker 对 `failed` 的 run 不认终态（TERMINAL 里只有 `done` 命中 run 状态）
-#: 失败当然是终态：它不会再运行，也不需要任何人再等它。
+#: 此前是散在 executor 里的字面量 `"failed"`，提出成常量只为可读。
 FAILED = "failed"
 
-TERMINAL = {DONE, SKIPPED, REJECTED, REJECTED_CANCELED, FAILED}
+#: 节点终态。
+#:
+#: ⚠️ **`FAILED` 刻意不在其中** —— 这不是遗漏。`executor/resume.py` 的 `from_checkpoint`
+#: 靠的就是"**不在** TERMINAL"把失败节点重置为 `pending`，从而让 resume 能**重跑**它：
+#:
+#:     if st.get("status") not in TERMINAL and st.get("status") != WAITING_APPROVAL:
+#:         st = {"status": PENDING, "output": None}
+#:
+#: 一度把 `FAILED` 加进来过，实测后果很坏：失败节点被原样保留 → 它的出边失活 →
+#: resume 直接收敛成 `done` —— **一条失败的 run 续跑之后变成了"成功"**。
+#: 需要"停跑时别覆盖失败节点"「Worker 别重启失败的 run」这类判断，就到各自的调用点
+#: 显式写 `== FAILED`，不要动这个集合。
+TERMINAL = {DONE, SKIPPED, REJECTED, REJECTED_CANCELED}
 
 # 边状态
 EDGE_ACTIVE = "active"
