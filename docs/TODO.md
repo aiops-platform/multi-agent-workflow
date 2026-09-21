@@ -1524,6 +1524,13 @@ DSN 含明文口令，打进终端回滚 / CI 日志 / 截图就收不回来；`
 
 ## 25. `ws_git` 白名单**允许 `push`**：「建 commit」与「推远端」之间没有权限边界，只有提示词
 
+> ⚠️ **2026-09-21 前提变动**：本节是因 `problem-log-diagnose` 的 `commit` 节点才写的，
+> 而那条流程的修复段**已整体删除**（它现在只到「诊断输出门」为止，不写代码）。
+> **但本节仍然有效、优先级不变**——`ws_git` 是平台内置工具，白名单与提示词都没变，
+> 而**另外两条流程**（`agentflow/seed/workflows/` 的 scenario1/scenario2）**仍然有**
+> `fix → test → review → approve-commit → commit` 段，`committer` 仍然会被调到。
+> 也就是说：**在这里删掉的本节内容，保护不了那两条流程**。
+
 > 2026-09-20 发现。路径：给 `problem-log-diagnose` 补修复段（`fix → test → review →
 > approve-commit → commit`）时，要写清 `commit` 节点到底做了什么，于是去核
 > `committer` 的提示词与 `ws_git` 的白名单——**两处对不上**。
@@ -1578,5 +1585,36 @@ _GIT_ALLOWED = {"status", "diff", "add", "commit", "push", "rev-parse", "branch"
 3. **显式声明为设计边界**：在 `committer` 提示词里写清"可以 push、推到 `origin`，
    即配置的远端"——**消除"白名单即边界"这个错误推理**，风险交由部署方评估。
 
-在定下来之前，`problem-log-diagnose` 的 YAML 里已写明这条**不是**权限约束
-（`scripts/problem-log-diagnose.workflow.yaml` 的 `commit` 节点注释）。
+在定下来之前，原 `problem-log-diagnose` 的 YAML 里曾在 `commit` 节点注释里写明这条
+**不是**权限约束——**那段注释已随修复段一起删除**（该流程不再有 `commit` 节点）。
+现存的三处说明改由本节的「前提变动」承担：`approve-commit` 的
+`scenario1-quotation-print-fail.yaml:242` / `scenario2-bug-fix.yaml:253` 附近仍有对应注释。
+
+---
+
+## 26. APM 侧三个端点没有终态守卫：`escalated`（以及 `resolved`）会被无条件改写
+
+> 2026-09-21 发现（做「升级 = 生成工单」时）。**已知边界，本轮不修**。
+
+`aiops-apm-anomaly-detector` 的 `src/aiops_apm/router/problems.py` 里，**三个端点不检查
+problem 的 `state`**：
+
+| 端点 | 行 | 行为 |
+|---|---|---|
+| `POST /{record_id}/resolve` | `:161` | 无条件 `records.resolve()` → `state=resolved` |
+| `POST /{record_id}/ignore` | `:189` | 无条件 `records.close()` → `state=closed` |
+| `POST /{record_id}/run-decision` | `:498` | 只追加 evidence，不改 state（危害小） |
+
+存储层的守卫只挡**目标状态**：PG 的 `resolve` 是 `WHERE ... AND state <> 'resolved'`、
+`close` 是 `AND state <> 'closed'`（`storage/records.py:363` / `:371`）；memory 版**完全无条件**。
+⇒ 一条 `escalated`（已升级、已建工单）的问题单，调 `/resolve` 会被改成 `resolved`。
+
+**为什么本轮不修**：这不是升级引入的新洞——`resolved` 同样能被 `/ignore` 改成 `closed`，
+两者是对称的既有形状。而 `decide_problem_diagnosis` 那三处终态守卫
+（`problems.py:398` 的 analyze、`:639` 的 diagnose、`:1036` 的 decision）**本轮已加 `escalated`**，
+且前端行内的 Ignore 按钮对非 `pending|in_progress` 不渲染（`js/app.js:4301`），
+**UI 上走不到**；是 API 层面敞着。
+
+**要修的话，判据是先定语义**：`resolved`（已修复）与 `escalated`（已派单）都是终态，
+`/ignore` 该不该能改写 `resolved`？定了这条，三个端点的守卫才有统一写法——
+**别只给 `/resolve` 加守卫**，那会制造 API/UI 语义分叉。

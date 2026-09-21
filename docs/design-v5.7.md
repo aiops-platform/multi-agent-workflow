@@ -868,6 +868,40 @@ scenario2（纯代码修复）      : plan → approve-plan → fix
 约定全文见 `CLAUDE.md` 约束 4.1，缺陷与实测见 `docs/TODO.md` §21。
 **超时不走这条**（`REJECTED_CANCELED` 是 `on_timeout` 的语义，尚未实现）。
 
+#### 补记（2026-09-21）：`problem-log-diagnose` 收敛为「诊断输出」单门，修复段整体删除
+
+**只动了这一条流程**，上面的形状描述对 `agentflow/seed/workflows/` 的两条
+（scenario1 / scenario2）**仍然成立**——它们照旧是
+`plan → approve-plan(abort) → fix → test → review → approve-commit(continue) → commit`。
+
+`problem-log-diagnose`（Problem Center「分析new」）改成了：
+
+```
+triage → logs, locate → rca → plan → diagnose-output   ← kind: approval，**终态节点，无出边**
+rca    → halt (insufficient == true)
+locate → halt (found == false)
+```
+
+**为什么**：Problem Center 里人要拍板的是「这条问题单要不要处理、派给谁做」，不是让平台
+在沙箱里替人改代码。三种裁定（拒绝重跑 / 忽略关单 / 升级开单）收在同一道门上，**升级的下游
+动作（建工单、绑号、置终态）住在 APM 侧**——工单号要绑到 APM 的 `problem_record.evidence`，
+而 agentflow 没有也不该有 APM 的客户端（今天是 APM → agentflow 单向）。
+
+**三点值得留的**：
+
+1. **`continue` + 没有驳回出边 = 引擎允许的第三种形态**（前两种是 `abort`+无边、
+   `continue`+有边）。`_check_on_reject_consistency` 只拦反方向那个矛盾组合，**加载期不查
+   这一形态**，所以只能靠测试守（`tests/test_problem_log_diagnose_workflow.py`
+   的 `test_gate_is_terminal_with_no_out_edges` / `test_gate_is_continue_so_reject_does_not_abort`）。
+2. **语义代价（不是 bug）**：门是终态后，通过与否**只看节点状态**——两条路的 run 都是
+   `done` → API `success` → viewmodel `completed`。人否了诊断，run 仍报成功，
+   痕迹只在门节点的 `rejected` 与审批记录里。这是 `TERMINAL` 含 `REJECTED` 的固有属性，
+   换 `abort` 就会把"人否决"变成"执行失败"，取舍见 `CLAUDE.md` §4.1。
+3. **删掉修复段后这条流程不含任何 `WORKSPACE_AGENTS`**，`service.py` 的 `_prepare_workspace`
+   会提前 return——**run 不再准备 git 工作区**（更省更快，也不再是副作用面）。这是期望行为。
+
+`docs/TODO.md` §25（`ws_git` 允许 `push`）的前提随之变动，见该节的「前提变动」注。
+
 ### 7.3 验收判据
 
 - CMDB：`business` 层 app—app 连边被拒（反例测试）；`calls` 归 runtime 层后

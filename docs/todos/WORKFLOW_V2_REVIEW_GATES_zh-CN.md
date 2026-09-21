@@ -2,6 +2,13 @@
 
 > 状态：**设计稿 / 待评审**（2026-09-07，分支 `demo_0831`）
 > 范围：仅设计文档 + YAML 定义，**未动引擎代码**。落地上线前需评审 §4 的引擎扩展。
+>
+> ⚠️ **2026-09-21 部分作废**：本稿描述的双门（计划门 + 证据门）形态**只对
+> `agentflow/seed/workflows/` 的两条 scenario 流程仍然成立**。
+> `problem-log-diagnose`（Problem Center「分析new」）**已把修复段整体删除**——
+> 现在是 `诊断 → 计划 → 诊断输出门（终态节点）` 单门，通过/驳回都不再走本稿 §2 的
+> `→ fix` / `→ recap` 边（那两条边已不存在）。理由与形态见 `docs/design-v5.7.md` §7.2
+> 的「补记（2026-09-21）」。**§4 的打回闭环仍然未实现**，该 TODO 不受影响。
 > 关联：`bug-fix-scenario2`（M7 可跑闭环，本稿基线）、`bug-fix-pipeline`、`git-search-approval` 三张 workflow —— ⚠️ **它们现在只存在于租户库的 `workflows` 表**（原 `workflows/*.yaml` 文件已于 2026-09-16 删除，因为不在运行时链路上）；另见 `docs/TODO.md` §13。
 
 ---

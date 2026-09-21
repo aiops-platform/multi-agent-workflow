@@ -87,7 +87,9 @@ make lint      # ruff 检查
 
 4.1 **审批节点的 `on_reject`（abort | continue，默认 `abort`）**：
    - `abort` → 驳回 = **中止整条 run**（run 判 `failed`，节点状态保留 `rejected`）；
-   - `continue` → 沿图上 `when: approved == false` 的边路由（**图里必须写了那条边**）。
+   - `continue` → **不中止**；若图上有 `when: approved == false` 的边就沿它路由，
+     没有就只是"下游全部失活、run 照常收敛"（两种都合法，见下）。
+     ⚠️ 生产中的 `problem-log-diagnose` 用的就是**没有驳回边**的那一种：它的门是终态节点。
    - **每个审批节点都要显式声明**。不写就是 `abort`——图里若同时写了
      `approved == false → recap` 边，那条边**永远不可达**，等于骗人。
    - 判据看**状态**不看**动作**（`rejected_abort_node()`）：queue 模式下 Worker 是
