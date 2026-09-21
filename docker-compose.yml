@@ -95,6 +95,51 @@ services:
       timeout: 5s
       retries: 12
 
+  # 沙箱执行服务（design §4.1 / §10.2）—— Worker 的"写文件 / 跑测试"经它执行。
+  #
+  # ## 为什么与 pg/kafka 并列放在这里
+  #
+  # 它是**系统默认形态的一部分**，不是可选组件：不接它的后果不是"少个功能"，而是
+  # `ws_write_file` / `ws_run_tests` 一律 fail-closed（见 agents/tools.WORKSPACE_SANDBOXED）
+  # —— 修复不落盘、测试一条不跑，而 `tester` 只能如实报 `passed: false`。实测踩过
+  # （run_668981c0a7），图上一片绿、实际什么都没验证。
+  #
+  # ## 为什么用 java21 变体
+  #
+  # 测试床三个服务是 Java（`./gradlew test`）。基础镜像刻意不含工具链（它要保住
+  # "零依赖、离线可建"），Java 能力由 `Dockerfile.java21` 叠加，gradle 发行版与依赖
+  # 缓存已**烤进镜像**（冷跑 560s → 16.87s，且不需要网络）。
+  #
+  # ## 卷为什么挂在 $HOME 而不是 /tmp
+  #
+  # macOS 的 podman machine 是台 Linux VM，**只共享 $HOME / /Users / /private**，
+  # `/tmp` **不在**其中 —— 挂 `/tmp/agentflow-workspace` 会直接报
+  # `statfs ... no such file or directory`（实测）。所以宿主的 workspace_root 也一并
+  # 挪到 `$HOME/agentflow-workspace`（见 .env 的 AGENTFLOW_WORKSPACE_ROOT），
+  # 两边**必须同路径**：worker 按宿主机路径写 workspace，沙箱按同一条路径去读。
+  #
+  # ⚠️ **本容器一个凭据都不能有**（见 docker/sandbox/Dockerfile.java21 顶部）：
+  # 它执行的是仓库里的代码，而 worker 容器持有 DeepSeek key / DB DSN / MCP 凭证。
+  # 判据：谁持有密钥，谁不执行不可信代码。往这里塞任何 AGENTFLOW_* 密钥都等于把隔离作废。
+  sandbox:
+    image: localhost/agentflow-sandbox-java21:local
+    container_name: agentflow-sandbox
+    networks:
+      - default
+    ports:
+      - "44772:44772"
+    environment:
+      # 可写白名单（§10.2）。工作区必须在内，否则 ws_write_file 会被拒
+      # （报错文案是「路径不在可写白名单」——那是**正确**的拒绝，不是故障）
+      SBX_WRITABLE: "/workspace:/tmp:${HOME}/agentflow-workspace"
+    volumes:
+      - ${HOME}/agentflow-workspace:${HOME}/agentflow-workspace
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:44772/health')\" || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   pgdata:
   redisdata:

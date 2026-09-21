@@ -1,6 +1,8 @@
 """批 B（design-v5.3 §6/§8/§10）：接单 CAS + topic 租户化 + tenantctl + namespace 派生。"""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from agentflow.api.management_store import ManagementStore
@@ -317,3 +319,105 @@ async def test_action_executor_tenant_namespace_boundary(monkeypatch) -> None:
             "scale_deployment", namespace="other-ns", tenant_id="team-a",
             name="x", replicas=1,
         )
+
+
+# ======================================================================
+# 环境体检（_env_preflight）：pg / kafka / 沙箱 三件套
+# ======================================================================
+class _PreflightSettings:
+    """只带体检用到的字段。"""
+
+    def __init__(self, **kw) -> None:
+        self.state_store = "postgres"
+        self.queue = "kafka"
+        self.kafka_bootstrap = "localhost:19092"
+        self.sandbox_url = "http://127.0.0.1:44772"
+        self.workspace_root = "/Users/someone/agentflow-workspace"
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def test_preflight_ok_when_all_three_ready(monkeypatch) -> None:
+    """三件套都通 → 空列表（provision 会打 ✓）。"""
+    from agentflow import tenantctl
+
+    monkeypatch.setattr("socket.create_connection", lambda *a, **k: __import__("contextlib").nullcontext())
+    monkeypatch.setattr("urllib.request.urlopen", lambda url, timeout=0: _FakeResp(
+        {"limits": {"writable_allowlist": ["/workspace", "/tmp", "/Users/someone/agentflow-workspace"]}}
+    ))
+    assert tenantctl._env_preflight(_PreflightSettings()) == []
+
+
+def test_preflight_reports_missing_sandbox(monkeypatch) -> None:
+    """**没配沙箱必须报出来** —— 这是最容易漏、且症状完全静默的一个。
+
+    不接沙箱时 ws_write_file / ws_run_tests 一律 fail-closed：修复不落盘、测试一条
+    不跑，而 tester 只能如实报 passed: false（实测 run_668981c0a7）。
+    provision 时不说，就要等第一次 run 才发现。
+    """
+    from agentflow import tenantctl
+
+    monkeypatch.setattr("socket.create_connection", lambda *a, **k: __import__("contextlib").nullcontext())
+    problems = tenantctl._env_preflight(_PreflightSettings(sandbox_url=""))
+    assert any("AGENTFLOW_SANDBOX_URL" in p for p in problems), problems
+
+
+def test_preflight_reports_unreachable_sandbox(monkeypatch) -> None:
+    """配了但连不上 → 报"不可达"，并给出起容器的命令。"""
+    from agentflow import tenantctl
+
+    monkeypatch.setattr("socket.create_connection", lambda *a, **k: __import__("contextlib").nullcontext())
+
+    def boom(url, timeout=0):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    problems = tenantctl._env_preflight(_PreflightSettings())
+    assert any("不可达" in p and "sandbox" in p for p in problems), problems
+
+
+def test_preflight_reports_workspace_not_writable(monkeypatch) -> None:
+    """沙箱在跑、但**可写白名单不含工作区根** → 报出来。
+
+    这种最阴：沙箱是"活着"的（/health 通），而 ws_write_file 会被**正确地**拒掉
+    （"路径不在可写白名单"），症状同样是"修复没落盘"。
+    """
+    from agentflow import tenantctl
+
+    monkeypatch.setattr("socket.create_connection", lambda *a, **k: __import__("contextlib").nullcontext())
+    monkeypatch.setattr("urllib.request.urlopen", lambda url, timeout=0: _FakeResp(
+        {"limits": {"writable_allowlist": ["/workspace", "/tmp"]}}
+    ))
+    problems = tenantctl._env_preflight(_PreflightSettings())
+    assert any("可写白名单" in p for p in problems), problems
+
+
+def test_preflight_reports_bad_kafka_bootstrap(monkeypatch) -> None:
+    """kafka 连不上 → 报出来并给出 compose 命令。"""
+    from agentflow import tenantctl
+
+    def refuse(*a, **k):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("socket.create_connection", refuse)
+    monkeypatch.setattr("urllib.request.urlopen", lambda url, timeout=0: _FakeResp(
+        {"limits": {"writable_allowlist": ["/Users/someone/agentflow-workspace"]}}
+    ))
+    problems = tenantctl._env_preflight(_PreflightSettings())
+    assert any("Kafka" in p for p in problems), problems
+
+
+class _FakeResp:
+    """urlopen 的最小替身：with 语句 + read()。"""
+
+    def __init__(self, payload: dict) -> None:
+        self._body = json.dumps(payload).encode()
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a) -> None:
+        return None

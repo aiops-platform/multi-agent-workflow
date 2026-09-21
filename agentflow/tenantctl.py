@@ -124,6 +124,88 @@ def ensure_namespace(namespace: str) -> bool:
     return True
 
 
+def _env_preflight(settings) -> list[str]:
+    """开通租户后的**环境体检** —— pg / kafka / 沙箱三件套是否就绪。
+
+    ## 为什么要在这里查
+
+    系统默认形态是 **pg + kafka + 沙箱**（见 `.env.example` / `docker-compose.yml`），
+    但三者都是**外部进程**，少任何一个的表现都不是"启动报错"，而是**静默半可用**：
+
+    | 缺什么 | 症状 |
+    |---|---|
+    | postgres / kafka | run 发不出去，或跑到一半失败 |
+    | **沙箱** | `ws_write_file` / `ws_run_tests` 一律 fail-closed —— **修复不落盘、测试一条不跑**，而 `tester` 只能如实报 `passed: false` |
+
+    实测踩过（`run_668981c0a7`）：沙箱没接线，`fix` 改的文件根本没写进去、`test`
+    `tests_run: 0`，而节点全绿、run 算 completed —— 图上一片绿，实际什么都没验证。
+
+    所以趁"刚开完租户"这个时机查一次并把修复命令给出来，而不是等第一次 run 才发现。
+
+    ## 为什么是"体检"而不是"启动"
+
+    provision 只建库；它没有、也不该有拉起容器/k8s 的权限（那会让一个轻量 CLI 变成
+    编排器）。这里的职责是**把问题摆在正确的时刻**，并给出可直接粘贴的命令。
+
+    返回问题描述列表（空 = 三件套都通）。
+    """
+    import socket
+    import urllib.request
+
+    problems: list[str] = []
+
+    # ① StateStore：只报"配成了什么"，连通性由上面建库那步隐式验证过
+    #    （库都建出来了，pg 必然通）
+    if settings.state_store != "postgres":
+        problems.append(
+            f"StateStore 当前是 {settings.state_store!r}，不是 postgres"
+            "（.env: AGENTFLOW_STATE_STORE=postgres）"
+        )
+
+    # ② Kafka：TCP 可达即可 —— 这里只为"broker 在不在"，不做协议级握手
+    if settings.queue != "kafka":
+        problems.append(
+            f"队列当前是 {settings.queue!r}，不是 kafka（.env: AGENTFLOW_QUEUE=kafka）"
+        )
+    else:
+        host, _, port = (settings.kafka_bootstrap or "").partition(":")
+        try:
+            with socket.create_connection((host or "localhost", int(port or 9092)), timeout=3):
+                pass
+        except OSError as exc:
+            problems.append(
+                f"Kafka {settings.kafka_bootstrap} 连不上（{exc}）"
+                "→ docker compose up -d kafka"
+            )
+
+    # ③ 沙箱：**最容易漏的一个**，且漏了不报错、只是修复与测试静默失效
+    url = (settings.sandbox_url or "").strip()
+    if not url:
+        problems.append(
+            "未配置沙箱（AGENTFLOW_SANDBOX_URL 为空）→ 写文件与跑测试会**一律失败**："
+            "docker compose up -d sandbox 并在 .env 设 AGENTFLOW_SANDBOX_URL=http://127.0.0.1:44772"
+        )
+    else:
+        try:
+            with urllib.request.urlopen(f"{url.rstrip('/')}/health", timeout=3) as r:
+                body = json.loads(r.read().decode())
+        except Exception as exc:  # noqa: BLE001 - 任何失败都归为"沙箱不可达"
+            problems.append(
+                f"沙箱 {url} 不可达（{type(exc).__name__}: {exc}）→ docker compose up -d sandbox"
+            )
+        else:
+            # 可写白名单必须包含工作区根，否则 ws_write_file 会被**正确地**拒掉，
+            # 而现象同样是"修复没落盘"
+            allow = (body.get("limits") or {}).get("writable_allowlist") or []
+            ws = str(settings.workspace_root)
+            if allow and not any(ws == a or ws.startswith(a.rstrip("/") + "/") for a in allow):
+                problems.append(
+                    f"沙箱的可写白名单 {allow} 不含工作区根 {ws}"
+                    "（compose 的 sandbox.SBX_WRITABLE 要带上它）"
+                )
+    return problems
+
+
 async def provision(args) -> int:
     settings = get_settings()
     mgmt = build_management_store(settings)
@@ -201,6 +283,17 @@ async def provision(args) -> int:
         )
         if not settings.seed_defaults:
             print("[tenantctl] ⚠ AGENTFLOW_SEED_DEFAULTS=0 —— 未播种默认数据，该租户开箱不可用")
+
+        # 环境体检：三件套（pg/kafka/沙箱）缺任何一个，租户都是"半可用"状态，
+        # 且症状是静默的（详见 _env_preflight）。**不因此让 provision 失败** ——
+        # 库已经建好了，失败退出只会让人以为要重来。
+        problems = _env_preflight(settings)
+        if problems:
+            print("[tenantctl] ⚠ 环境体检发现问题（不影响本次开通，但 run 会受影响）：")
+            for p in problems:
+                print(f"    · {p}")
+        else:
+            print("[tenantctl] ✓ 环境体检：postgres / kafka / 沙箱 均就绪")
         return 0
     finally:
         await mgmt.close()
