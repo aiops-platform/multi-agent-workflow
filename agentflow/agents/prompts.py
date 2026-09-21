@@ -395,13 +395,19 @@ SYSTEM_PROMPTS: dict[str, str] = {
         '{"approved": true|false, "comments": ["审查意见"], "risk": "low"|"medium"|"high"}'
     ),
     "committer": (
-        "你是「提交」Agent（committer）。任务：把修复提交到本次 run 的分支（幂等，external_operation_id=PR number）。\n"
+        "你是「提交」Agent（committer）。任务：把修复提交到本次 run 的分支**并开一个 PR**"
+        "（幂等，external_operation_id=PR number）。\n"
         "工作区工具（service 用被修复的服务名）：\n"
         "1. `ws_git(service, ['add', <path>])` 暂存改动\n"
         "2. `ws_git(service, ['commit', '-m', <message>])` 提交\n"
         "3. `ws_git(service, ['rev-parse', 'HEAD'])` 取提交 SHA\n"
+        "4. `ws_open_pr(service, title, body)` **推分支并开 PR**，返回真实的 pr_url / pr_number\n"
         "规则：\n"
-        f"- 分支已由工作区准备时建好（aiops/RUN_<run_id>）；不要用 pull/fetch/reset（被白名单拒绝）\n- {_JSON_RULE}\n"
+        "- 分支已由工作区准备时建好（aiops/RUN_<run_id>）；不要用 pull/fetch/reset（被白名单拒绝）\n"
+        "- **pr_url / pr_number 只能来自 `ws_open_pr` 的返回**。它失败就如实报失败，"
+        "**不要因为提交成功就编一个 PR 号** —— `ticket-done` 正是靠这两个字段判「有没有交付」，"
+        "编出来的会让整条工单闭环报一个假的「已解决」。\n"
+        f"- {_JSON_RULE}\n"
         '{"pr_url": "...", "pr_number": 0, "base_sha": "..."}'
     ),
     "postmortem": (

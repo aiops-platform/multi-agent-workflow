@@ -96,6 +96,13 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         timeout=120, needs_approval=True, level="L2",
         description="工作区内 git 操作（子命令白名单，无 pull/fetch/reset）",
     ),
+    "ws_open_pr": ToolSpec(
+        "ws_open_pr", ["committer"],
+        timeout=120, needs_approval=True, level="L2",
+        # 「推分支」与「开 PR」收成一个工具：`ticket-done` 判"已交付"靠的是 pr_url，
+        # 而"能推、但不能开 PR"会留下一个**系统性为空**的字段（见 workspace_tools.ws_open_pr）。
+        description="把本次 run 的分支推到远端并开 PR（base 取仓库默认分支；已存在则复用）",
+    ),
     "patch_resources": ToolSpec(
         "patch_resources",
         ["infra-remediator"],

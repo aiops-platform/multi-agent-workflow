@@ -293,11 +293,13 @@ nodes:
   # 提交之后、复盘之前：把这次处置的结果回传给**原系统**（ServiceNow 一类），
   # 让工单在那边也走到终态 —— 否则活干完了、工单还挂在「处理中」。
   #
-  # ⚠️ **本节点目前只组装载荷，不真正投递**：平台还没有出站 HTTP 能力，
-  # MCP 侧也还没有对应的写工具，所以这个 agent **没有绑任何工具**
-  # （见 seed/agents/ticket-done.yaml 的 mcp_server_ids）。它的 prompt 明确要求输出
-  # `delivered: false` 并写明原因，**禁止谎报已投递**。
-  # 接上 MCP 写工具后，**只需给 agent 绑 server，本节点不用动**。
+  # **已接上投递能力（2026-09-21）**：agent 绑了 aiops-datasource 的
+  # `returnApmTicketStatus`（见 seed/agents/ticket-done.yaml 的 mcp_server_ids），
+  # `delivered` 取工具的真实返回 —— 投不出去就是 false，节点判红（VERDICT_FIELDS）。
+  #
+  # ⚠️ **绑定存在但工具不在**（server 没起 / 工具被改名）时，agent 会退回"没有工具"
+  # 而 prompt 说的是"你能投递" —— 于是它可能**编一个** delivered: true 出来。
+  # 改绑定的名字前先确认工具名逐字一致。
   #
   # on_failure 用默认的 abort（与 commit 一致）：回传失败必须让 run 失败。
   # 工单闭环是对外承诺，静默吞掉等于「界面看着成功、原系统那边什么都没收到」。

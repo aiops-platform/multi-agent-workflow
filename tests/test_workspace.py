@@ -483,3 +483,123 @@ async def test_unreachable_sandbox_does_not_fall_back(tmp_path, monkeypatch) -> 
     # 断言真的没写进去（不是"报了错但文件已经落了"）
     assert (repo / "a.txt").read_text(encoding="utf-8") == "x"
 
+
+
+# ----------------------------------------------------------------------
+# ws_open_pr：推分支 + 开 PR（治「pr_url 系统性为空」）
+# ----------------------------------------------------------------------
+class _FakeProc:
+    """gh 调用替身：只为 `_run` 提供 communicate()/returncode。"""
+
+    def __init__(self, out: str, rc: int = 0) -> None:
+        self._out = out.encode()
+        self.returncode = rc
+
+    async def communicate(self):
+        return self._out, None
+
+
+def _stub_gh(monkeypatch, *, existing: str = "", base: str = "main",
+             create_url: str = "https://github.com/o/r/pull/12"):
+    """拦下 `gh` 调用并记录 argv；**其余（git push 等）走真的**。
+
+    只桩 gh 是有意的：push 是真的在跑，所以"分支到底推出去没有"由裸仓库自己作证，
+    而不是由我们的桩点头。
+    """
+    import asyncio as _a
+
+    calls: list[list[str]] = []
+    real = _a.create_subprocess_exec
+
+    async def fake(*argv, **kw):
+        # ⚠️ `*argv` 收的是 **tuple**：`argv[1:3] == ["repo", "view"]` 恒为 False
+        #（tuple 永不等于 list）。第一版就是这么挂的，且症状是"桩没生效、走了兜底"。
+        a = list(argv)
+        if a and a[0] == "gh":
+            calls.append(a)
+            if a[1:2] == ["pr"] and "list" in a:
+                return _FakeProc(existing)
+            if a[1:3] == ["repo", "view"]:
+                return _FakeProc(base + "\n")
+            if a[1:2] == ["pr"] and "create" in a:
+                return _FakeProc(create_url + "\n")
+            return _FakeProc("", 1)
+        return await real(*argv, **kw)
+
+    monkeypatch.setattr(_a, "create_subprocess_exec", fake)
+    return calls
+
+
+def _with_origin(repo: Path, tmp_path: Path) -> Path:
+    """给工作区仓库挂一个**裸仓库**当 origin —— push 是真的。"""
+    origin = tmp_path / "origin.git"
+    git("init", "-q", "--bare", str(origin))
+    git("remote", "add", "origin", str(origin), cwd=repo)
+    return origin
+
+
+async def test_ws_open_pr_pushes_branch_and_returns_real_pr(tmp_path, monkeypatch) -> None:
+    """推分支 + 开 PR：**分支真的到远端**，pr_url 来自 gh 的返回。
+
+    实测背景（run_170dccffd9）：committer 的提示词只有 add/commit/rev-parse 三步，
+    输出契约里却声明了 pr_url —— 那个字段于是**系统性地永远是空串**，
+    每一次「修复成功」都被 ticket-done 回传成 failed。
+    """
+    from agentflow.agents.workspace_tools import ws_open_pr
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    origin = _with_origin(repo, tmp_path)
+    git("checkout", "-q", "-b", "aiops/RUN_x", cwd=repo)
+    (repo / "fix.txt").write_text("fixed", encoding="utf-8")
+    git("add", ".", cwd=repo)
+    git("commit", "-q", "-m", "fix", cwd=repo)
+    calls = _stub_gh(monkeypatch)
+    try:
+        out = await ws_open_pr(service=service, title="--加固磁盘写满", body="根因：ENOSPC")
+    finally:
+        _reset(toks)
+
+    # ① 分支真的推上去了（裸仓库作证，不是桩说了算）
+    assert git("rev-parse", "--verify", "aiops/RUN_x", cwd=origin)
+    # ② 返回的是 gh 给的 PR，不是自己编的
+    assert out["pr_url"] == "https://github.com/o/r/pull/12"
+    assert out["pr_number"] == 12 and out["created"] is True
+
+    create = next(c for c in calls if c[1:2] == ["pr"] and "create" in c)
+    # ③ base 取仓库默认分支，不由调用方传
+    assert "--base" in create and create[create.index("--base") + 1] == "main"
+    # ④ 标题走 `--title=` 单参形式 —— 以 `-` 开头的标题不会被 gh 当旗标解析
+    assert "--title=--加固磁盘写满" in create
+    assert not any(a == "--title" for a in create)
+
+
+async def test_ws_open_pr_reuses_existing_pr(tmp_path, monkeypatch) -> None:
+    """同 head 已开着 PR 就复用 —— 节点内重试不该把一次成功的提交变成失败。
+
+    （节点级幂等键 run_id:node_id 挡住的是**跨节点重放**；节点**内**的重试
+    仍会再次调到这里，那时 gh 会因为"PR 已存在"而报错。）
+    """
+    from agentflow.agents.workspace_tools import ws_open_pr
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)
+    calls = _stub_gh(monkeypatch, existing='{"url":"https://github.com/o/r/pull/7","number":7}')
+    try:
+        out = await ws_open_pr(service=service, title="x")
+    finally:
+        _reset(toks)
+
+    assert out["pr_number"] == 7 and out["created"] is False
+    assert not any("create" in c for c in calls), "已有 PR 时不该再 create（会报 already exists）"
+
+
+async def test_ws_open_pr_refuses_empty_title(tmp_path, monkeypatch) -> None:
+    """空标题直接拒 —— 不要拿一个空 PR 出去。"""
+    from agentflow.agents.workspace_tools import WorkspaceToolError, ws_open_pr
+
+    service, _repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(WorkspaceToolError):
+            await ws_open_pr(service=service, title="   ")
+    finally:
+        _reset(toks)
