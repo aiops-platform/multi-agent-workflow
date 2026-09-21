@@ -130,6 +130,18 @@ class StateStore(ABC):
     async def get_pending_approvals(self) -> list[dict]: ...
 
     @abstractmethod
+    async def get_approvals_for_run(self, run_id: str) -> list[dict]:
+        """该 run 的**全部**审批（含已处理的），按 node_id 排序。
+
+        ``get_pending_approvals`` 只返回 WAITING —— 于是**批过之后那次审批就从界面上
+        彻底消失了**：谁批的、批没批、为什么驳回，事后一概查不到，而 Run 详情页的
+        「审批」区会变成一片空白，看着像这个 run 从来没有过审批。
+
+        ⚠️ 表里**没有决策时间列**（只有 ``timeout_at``），所以这里给不出「什么时候批的」。
+        要补得先加列 + 迁移，本次不做 —— 把这件事写在这儿，免得下一个人以为是自己漏读了字段。
+        """
+
+    @abstractmethod
     async def get_approval(self, run_id: str, node_id: str) -> dict | None: ...
 
     @abstractmethod

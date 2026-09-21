@@ -162,6 +162,13 @@ async def test_approval_pending_then_approve(svc) -> None:
         assert p["trigger"] is None
         assert p["upstream"]["triage"] is not None  # 上游输出
 
+        # 审批**处理之前**：历史里就有这条，状态 WAITING、approved_by 为空。
+        # 判据是"审批是否曾经存在"，不是"是否还在等"——后者由 pending_approvals 管。
+        hist = run["approvals"]
+        assert [a["node_id"] for a in hist] == ["approve-changes"]
+        assert hist[0]["status"] == "WAITING_APPROVAL"
+        assert hist[0]["approved_by"] is None
+
         resp2 = await client.post(
             f"/runs/{run_id}/approve", json={"node_id": "approve-changes"}
         )
@@ -169,6 +176,14 @@ async def test_approval_pending_then_approve(svc) -> None:
         run2 = await _wait_status(client, run_id, {"success"})
         assert run2["nodes"]["approve-changes"]["status"] == "done"
         assert run2["nodes"]["commit"]["status"] == "done"
+
+        # **批完之后这条必须还在历史里** —— 这是本次加 approvals 的全部理由：
+        # 只有 pending_approvals 的话，这里会变成 []，审批区一片空白，
+        # 看着像这个 run 从来没经过人工审批。
+        assert run2["pending_approvals"] == []
+        hist2 = run2["approvals"]
+        assert [a["node_id"] for a in hist2] == ["approve-changes"], "批过就消失 = 查不到审批痕迹"
+        assert hist2[0]["status"] == "APPROVED"
 
 
 async def test_reject_approval_skips_downstream(svc) -> None:

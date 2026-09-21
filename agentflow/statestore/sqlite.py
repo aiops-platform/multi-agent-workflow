@@ -302,6 +302,19 @@ class SqliteStateStore(StateStore):
             out.append(d)
         return out
 
+    async def get_approvals_for_run(self, run_id: str) -> list[dict]:
+        cur = await self._c.execute(
+            "SELECT * FROM approvals WHERE run_id=? ORDER BY node_id", (run_id,)
+        )
+        rows = await cur.fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["approvers"] = json.loads(d["approvers"] or "[]")
+            d["params"] = json.loads(d["params"] or "{}")
+            out.append(d)
+        return out
+
     async def get_approval(self, run_id, node_id) -> dict | None:
         cur = await self._c.execute(
             "SELECT * FROM approvals WHERE run_id=? AND node_id=?", (run_id, node_id)

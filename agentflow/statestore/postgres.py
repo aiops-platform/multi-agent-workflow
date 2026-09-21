@@ -276,6 +276,13 @@ class PostgresStateStore(StateStore):
         rows = await cur.fetchall()
         return [self._approval_dict(_row_to_dict(cur, r)) for r in rows]
 
+    async def get_approvals_for_run(self, run_id: str) -> list[dict]:
+        cur = await self._c.execute(
+            "SELECT * FROM approvals WHERE run_id=%s ORDER BY node_id", (run_id,)
+        )
+        rows = await cur.fetchall()
+        return [self._approval_dict(_row_to_dict(cur, r)) for r in rows]
+
     @staticmethod
     def _approval_dict(d: dict) -> dict:
         # approvers/params 为 jsonb 列，psycopg 已解析（list/dict）；兜底空值

@@ -1005,6 +1005,27 @@ def _run_outcome(wf: Workflow | None, nodes_raw: dict) -> dict:
     }
 
 
+def _approval_history_row(a: dict) -> dict:
+    """approvals 行 →「审批」页签要的形状。
+
+    只挑前端用得上的字段：``params`` 是审批节点声明的引用表达式（``$.nodes.fix.output``
+    这类），不是给人看的；整行透传只会把响应撑大而不增加信息。
+
+    ``approved_by`` 在**未被处理**时是 NULL —— 别把它和「批了但没记名」混淆：
+    状态在 ``status`` 里（``WAITING_APPROVAL`` / ``APPROVED`` / ``REJECTED`` /
+    ``TIMED_OUT``），前者一眼可辨。
+    """
+    return {
+        "node_id": a.get("node_id"),
+        "status": a.get("status"),
+        "approved_by": a.get("approved_by"),
+        "comment": a.get("comment") or "",
+        # 超时闸门的落点（不是决策时间——表里没有决策时间列，见 base 的说明）
+        "timeout_at": a.get("timeout_at"),
+        "approvers": a.get("approvers") or [],
+    }
+
+
 @app.get("/runs")
 async def list_runs(
     status: str | None = None,
@@ -1170,6 +1191,13 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
         "total_cost": total_cost,
         "nodes": nodes,
         "pending_approvals": pending,
+        #: 该 run 的**全部**审批（含已处理的），给「审批」页签用。
+        #:
+        #: 只有 `pending_approvals` 的话，**批过之后审批就从界面上彻底消失了** ——
+        #: 谁批的、为什么驳回，事后一概查不到，审批区变成一片空白，看着像这个 run
+        #: 从来没有过审批。两个字段并存是有意的：`pending_approvals` 还带
+        #: `trigger`/`upstream`（要现算），历史那份是库里的原样记录。
+        "approvals": [_approval_history_row(a) for a in await store.get_approvals_for_run(run_id)],
         # 回显建 run 时的 inputs：此前完全不返回，导致连「诊断的是哪段时间窗」
         # （window_start/end，v5.5 §7.1 要求由调用方下发）都查不回来
         "inputs": run.get("inputs") or {},

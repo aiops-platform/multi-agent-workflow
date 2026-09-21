@@ -130,6 +130,12 @@ class InMemoryStateStore(StateStore):
     async def get_pending_approvals(self) -> list[dict]:
         return [a for a in self._approvals.values() if a["status"] == APPROVAL_WAITING]
 
+    async def get_approvals_for_run(self, run_id: str) -> list[dict]:
+        return sorted(
+            (a for a in self._approvals.values() if a["run_id"] == run_id),
+            key=lambda a: a["node_id"],
+        )
+
     async def get_approval(self, run_id, node_id) -> dict | None:
         return self._approvals.get(f"ap_{run_id}_{node_id}")
 
