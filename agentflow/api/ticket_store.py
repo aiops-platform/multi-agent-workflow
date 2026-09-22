@@ -527,18 +527,26 @@ def _ticket_fields_from_params(params: dict) -> dict[str, Any]:
     params 由 workflow 的 YAML 声明（`$.inputs.bug_report` 等），所以在**图上**就能看到
     这张工单由什么组成；这里只做形状映射，不做业务判断。
     """
-    bug = params.get("bug_report") if isinstance(params.get("bug_report"), dict) else {}
+    src_bug = params.get("bug_report") if isinstance(params.get("bug_report"), dict) else {}
+    # **浅拷贝**：下面要往 bug_report 里塞诊断结论，不能就地改调用方的 params。
+    bug = dict(src_bug)
     ci = bug.get("cmdb_ci") if isinstance(bug.get("cmdb_ci"), dict) else {}
+    # 诊断结论随工单走：拿到工单的人不必回平台翻诊断。
+    # ⚠️ 落点必须是 **`bug_report` 里面**，与 APM 侧 `_agentflow_create_ticket` 的
+    #    `bug_report["diagnosis"] = digest` 同一位置：SIP 工单详情页只渲染
+    #    `inputs.bug_report` 那一段 JSON（「工单内容（诊断的输入 bug_report）」那个 `<pre>`），
+    #    写在 `inputs` 顶层 = **写了没人看得见**。2026-09-22 实测：INC-20260922-0001 的
+    #    `inputs.diagnosis` 里 rca/plan 齐全，页面上一个字都没有（只有 APM 建的老单看得见，
+    #    因为老路径正好写在 bug_report 里）。
+    diag = {k: params[k] for k in ("rca", "plan") if params.get(k)}
+    if diag:
+        bug["diagnosis"] = diag
     inputs: dict[str, Any] = {"bug_report": bug}
     # 时间窗：None 时**不写键**（与 POST /tickets 的 _ticket_inputs 同约定——
     # workflow 的 window_start/end 声明为 required，缺键报错比传 null 更直白）
     for k in ("window_start", "window_end"):
         if params.get(k):
             inputs[k] = params[k]
-    # 诊断结论随工单走：拿到工单的人不必回平台翻诊断。
-    diag = {k: params[k] for k in ("rca", "plan") if params.get(k)}
-    if diag:
-        inputs["diagnosis"] = diag
     return {
         "title": str(bug.get("short_description") or params.get("title") or "").strip()[:200]
         or "未命名工单",

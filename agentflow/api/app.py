@@ -714,6 +714,23 @@ def _ticket_inputs(req: TicketRequest) -> dict:
     return inputs
 
 
+def _run_inputs_from_ticket(ticket: dict) -> dict:
+    """工单 → 本次 run 的 inputs：**剥掉诊断结论**。
+
+    `bug_report.diagnosis` 是**上一次 run 的产物**（建单节点写的，见
+    `ticket_store._ticket_fields_from_params`），留在工单里是为了详情页能显示它。
+    但工单的 inputs 会被原样当成下一次 run 的 inputs，而 workflow 里 `triage` / `logs` 的
+    params 是 `bug: "$.inputs.bug_report"` —— **整个 dict 交给模型**。
+    不剥掉的话，重跑同一张单时模型会先读到上一次的结论，问题已经变了也照着它走（锚定）。
+    **诊断是产物，不该回流成输入。**
+    """
+    inputs = dict(ticket.get("inputs") or {})
+    bug = inputs.get("bug_report")
+    if isinstance(bug, dict) and "diagnosis" in bug:
+        inputs["bug_report"] = {k: v for k, v in bug.items() if k != "diagnosis"}
+    return inputs
+
+
 @app.post("/tickets", status_code=201)
 async def create_ticket(
     req: TicketRequest, ctx: TenantContext = Depends(get_tenant_context)
@@ -829,6 +846,9 @@ async def run_ticket(
 
     组合端点，省掉前端「读工单 → 拼 inputs → POST /run → 回写关联」的往返。
     底层与 ``POST /run`` 共用 ``start_run``（配额/校验/租户语义一致）。
+
+    工单的 inputs 原样下发，**只有 `bug_report.diagnosis` 例外**——那是上一次 run 的产物，
+    回流会喂给模型（见 ``_run_inputs_from_ticket``）。
     """
     cs = await _control_stores(ctx)
     tickets = cs.ticket
@@ -855,7 +875,9 @@ async def run_ticket(
         raise HTTPException(status_code=400, detail=f"Workflow 解析失败: {exc}") from exc
 
     try:
-        out = await _service().start_run(ctx.tenant_id, workflow, ticket["inputs"])
+        out = await _service().start_run(
+            ctx.tenant_id, workflow, _run_inputs_from_ticket(ticket)
+        )
     except TenantQuotaExceeded as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     except InputsValidationError as exc:

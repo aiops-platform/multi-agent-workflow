@@ -152,6 +152,30 @@ async def test_run_ticket_creates_run_and_links_back(stores) -> None:
         assert runs[0]["inputs"]["bug_report"]["number"] == "INC0012345"
 
 
+async def test_run_ticket_strips_diagnosis_from_run_inputs(stores) -> None:
+    """诊断是**产物**，不该回流成下一次 run 的输入。
+
+    工单详情页要显示 `bug_report.diagnosis`（建单节点写进去的），而工单的 inputs 又是下一次
+    run 的 inputs —— 不剥掉的话，`triage` / `logs` 的 `bug: "$.inputs.bug_report"` 会**整个
+    dict 交给模型**，于是重跑同一张单时模型先读到上一次的结论。
+    """
+    async with _client() as client:
+        await client.post("/workflows", json={"name": "simple-flow", "yaml": VALID_YAML})
+        t = await _create(
+            client,
+            bug_report={**BUG_REPORT, "diagnosis": {"rca": {"root_cause_type": "code_bug"}}},
+        )
+        # 工单自己留着诊断（详情页靠它显示）
+        kept = (await client.get(f"/tickets/{t['id']}")).json()
+        assert kept["inputs"]["bug_report"]["diagnosis"]
+
+        out = (await client.post(f"/tickets/{t['id']}/run", json={})).json()
+        run = next(r for r in (await client.get("/runs")).json() if r["run_id"] == out["run_id"])
+        # 下发给 run 的那份剥掉了，其余字段原样
+        assert "diagnosis" not in run["inputs"]["bug_report"]
+        assert run["inputs"]["bug_report"]["number"] == "INC0012345"
+
+
 async def test_run_ticket_without_any_workflow_400(stores) -> None:
     async with _client() as client:
         t = await _create(client)
@@ -262,23 +286,20 @@ async def test_create_from_node_params_maps_bug_report_and_requires_source_ref(t
 
     ts = TicketStore(tmp_path / "t.db")
     await ts.connect()
-    out = await create_from_node_params(
-        ts,
-        "otr",
-        {
-            "source_ref": "PR-0100",
-            "bug_report": {
-                "number": "PR-0100",
-                "short_description": "结账单打印无反应",
-                "severity": "high",
-                "cmdb_ci": {"name": "order-service", "namespace": "order"},
-            },
-            "window_start": "2026-09-21T07:00:00+00:00",
-            "window_end": "2026-09-21T08:00:00+00:00",
-            "rca": {"hypotheses": ["NPE"]},
-            "plan": {"summary": "补空值校验"},
+    params = {
+        "source_ref": "PR-0100",
+        "bug_report": {
+            "number": "PR-0100",
+            "short_description": "结账单打印无反应",
+            "severity": "high",
+            "cmdb_ci": {"name": "order-service", "namespace": "order"},
         },
-    )
+        "window_start": "2026-09-21T07:00:00+00:00",
+        "window_end": "2026-09-21T08:00:00+00:00",
+        "rca": {"hypotheses": ["NPE"]},
+        "plan": {"summary": "补空值校验"},
+    }
+    out = await create_from_node_params(ts, "otr", params)
     assert out["created"] is True
     assert out["ticket_number"].startswith("INC-")
     row = await ts.get("otr", out["ticket_id"])
@@ -287,7 +308,12 @@ async def test_create_from_node_params_maps_bug_report_and_requires_source_ref(t
     assert row["namespace"] == "order"
     assert row["severity"] == "high"
     assert row["inputs"]["bug_report"]["number"] == "PR-0100"
-    assert row["inputs"]["diagnosis"]["plan"]["summary"] == "补空值校验"
+    # 诊断结论写在 **bug_report 里面** —— 工单详情页只渲染这一段（见
+    # `_ticket_fields_from_params` 的注释：写在 inputs 顶层等于没人看得见）
+    assert row["inputs"]["bug_report"]["diagnosis"]["plan"]["summary"] == "补空值校验"
+    assert "diagnosis" not in row["inputs"]
+    # 不能就地改调用方的 params（executor 交过来的那份是共用的形状）
+    assert "diagnosis" not in params["bug_report"]
 
     # 缺 source_ref（幂等判据）→ 失败，而不是建一张无法去重的单
     with pytest.raises(ValueError, match="source_ref"):
