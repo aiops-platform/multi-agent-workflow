@@ -284,6 +284,63 @@ make lint      # ruff 检查
    用 expressions.get_path 无此问题）。改 params 解析必跑 `test_param_resolution_output_accessor`。
 9.6 **沙箱（M4）——写与测试的执行边界**。判据一句话：**谁持有密钥，谁不执行不可信代码。**
 
+   - ⭐ **构建镜像：`make sandbox-image`（换机器第一步，就这一条命令）**
+
+     ```bash
+     make sandbox-image          # 建基础镜像 + java21 变体（有先后，见下）
+     podman images | grep agentflow-sandbox   # 确认：两个都在
+     ```
+
+     | 步骤 | 产物 | 联网 |
+     |---|---|---|
+     | `docker/sandbox/Dockerfile` | `localhost/agentflow-sandbox:local` | ❌ 纯 stdlib，**离线可建** |
+     | `docker/sandbox/Dockerfile.java21` | `localhost/agentflow-sandbox-java21:local` | ✅ apt 装 JDK21（~123MB）+ 下 gradle 发行版 |
+
+     **两步有先后**：变体是 `FROM localhost/agentflow-sandbox:local`，基础镜像不在就建不出来。
+     `make` 已经把顺序排好，别手动拆开跑。
+
+     - **容器 CLI 自动探测**（`CONTAINER ?=`，podman 优先否则 docker）——不用先决定用哪个。
+     - ⚠️ **`backend/.dockerignore` 不能删**。构建上下文是整个 `backend/`，而三个
+       Dockerfile 加起来只 `COPY` 了 `agentflow/` + `docker/sandbox/warmup/` +
+       `pyproject.toml` + `README.md`。**没有它，每次构建都要先把 609MB 塞进
+       VM/daemon**（其中 `venv/` 独占 375MB）—— 症状是「**构建卡在没有任何输出的
+       地方好几分钟**」，极易被误判成网络慢。有了它上下文是 **4.2MB（约 145×）**。
+       改它之前先看文件头的三个 Dockerfile 清单，**`COPY` 里出现过的路径一条都不能排掉**
+       （`!README.md` 那条负向规则就是为 worker 的 `COPY README.md` 留的）。
+     - ⚠️ **镜像名必须带 `localhost/` 前缀**，三个地方是硬绑定的：
+       `docker-compose.yml` 的 `sandbox` 服务写死 `localhost/agentflow-sandbox-java21:local`，
+       `Dockerfile.java21` 写 `FROM localhost/agentflow-sandbox:local`。
+       **不带前缀时 podman 会自动补 `localhost/`、docker 补 `docker.io/library/`** ——
+       所以同一句 `docker build -t agentflow-sandbox:local` 在 podman 上一直是对的，
+       **在 docker 上会建出另一个名字**，于是 `FROM` 找不到基础镜像、compose 也找不到服务镜像。
+       `make` 里固定带前缀，**照 make 跑就不会踩**；README/REPRODUCE 里那几条裸
+       `docker build` 是历史写法（已改为指向 `make`）。
+     - ⚠️ **耗时以"网络"为主，不以"CPU"为主 —— 实测最坏 86 分钟**。
+       基础镜像分钟级。java21 的成本全在**拉那个 ~130MB 的 gradle 发行版**
+       （`services.gradle.org`），实测（2026-09-22）反复失败重试了
+       `Connection refused` / `timeout (120000ms)` / **下到一半 zip 损坏**
+       （`zip END header not found`），前后 **86.5 分钟才建成**，
+       而 apt 装 JDK 那步其实是缓存命中的。
+       **对策就是重跑**——`make sandbox-image` 是幂等的，建成的层会命中缓存，
+       不会从头再来；**别因为慢就去改 apt 镜像源**（实测 deb.debian.org 反而最快）。
+       apt 偶发 `Hash Sum mismatch` 同理是常态而非意外（已设 `Acquire::Retries=5`）。
+     - **验证**（比 `podman images` 更有说服力，因为它证明缓存真的可用而不仅是"有镜像"）：
+       ```bash
+       # 干净副本 + --network none：能跑通就说明 gradle 发行版与依赖缓存**确实烤进去了**
+       cp -R <工作区>/repos/order-service /private/tmp/sbx-check && rm -rf /private/tmp/sbx-check/build
+       podman run --rm --network none -v /private/tmp/sbx-check:/work -w /work \
+           localhost/agentflow-sandbox-java21:local ./gradlew test --no-daemon -q
+       ```
+       实测：**6 个测试全过、全程 4 秒、零网络**（2026-09-22 对 `order-service` 实测）。
+       ⚠️ **不要给 `/gradle-home` 挂卷**（见下条），挂了这条验证会失败或退化成几分钟。
+       macOS 上路径要用 `/private/tmp/...` 而不是 `/tmp/...`（后者是软链，虚拟机里认不出）。
+     - **跳过它的症状不在"沙箱"上**：`docker-compose.yml` 的 sandbox 服务**只声明 `image`、
+       没有 `build`**，镜像不在就起不来。于是 `ws_write_file` / `ws_run_tests`
+       **fail-closed 报错**（不回退本地执行）→ agent 拿着"沙箱不可用"反复试错、烧完 ReAct
+       轮次 → 节点失败 → `fix`/`test` 走**默认的 `on_failure: abort`** → **整条 run 中止、
+       工单不回传**。而报错文案里**不会出现"沙箱镜像没建"**这几个字，方向指到别处。
+     - **K8s（minikube）还要多一步**：镜像得先塞进集群，否则 Pod `ImagePullBackOff`。
+       见 `REPRODUCE.md` 的 `minikube image load` 一段。compose 路径**不需要**这步。
    - **镜像分两层**：`docker/sandbox/Dockerfile`（基础）**永远可离线构建**，只跑 exec
      服务、不含工具链/不含 git/不含密钥；按 runtime 叠加变体
      `Dockerfile.java21`（JDK21 + **烤进镜像的 gradle 缓存**）。**没有 `WITH_JDK`
@@ -298,8 +355,30 @@ make lint      # ruff 检查
      测试床服务**逐字相同**（wrapper 的缓存路径哈希由 URL 算出，差一字符即白烤）；
      ② **不能给 `/gradle-home` 挂任何卷**（含 Dockerfile 里的 `VOLUME`）——挂载会
      **遮蔽**镜像里那一层，缓存全废、退回 560s。
-   - **exec 服务默认只绑 loopback**（`SBX_HOST` 是显式逃生阀）。它**没有认证**，
-     绑 `0.0.0.0` 会顺着 `hostNetwork` 暴露到节点网络。
+   - ⚠️ **exec 服务默认只绑 loopback —— 这条是给 K8s 的，compose 下必须显式设
+     `SBX_HOST=0.0.0.0`**（已在 `docker-compose.yml` 里设好）。
+
+     `a515ea1` 把默认绑定改成 `127.0.0.1`，理由写在 `exec_service.py` 的 docstring 里：
+     「需要它的只有同 Pod 的 worker（走 127.0.0.1），`kubectl port-forward` 打进的是
+     Pod 的 loopback」—— **这条推理只对 K8s 成立**。compose + podman(macOS) 下，宿主经
+     `ports:` 发布进来的落点是**容器的 eth0 IP**，不是 loopback，于是绑 loopback 的服务
+     收不到连接。
+
+     **症状极具误导性**：宿主 **TCP 连得上、HTTP 被 RST**
+     （`curl: (56) Recv failure: Connection reset by peer`），而容器**自己的 healthcheck
+     照样报 healthy**（它打的是容器内 127.0.0.1）—— 两处结论正好相反。
+     实测（2026-09-22）：同一镜像，`SBX_HOST=0.0.0.0` 宿主通、默认 loopback 不通，
+     其余条件完全相同。判据一句话：**绑在哪要看"连接从哪来"** ——
+     同 netns 来的（K8s sidecar / 容器内健康检查）loopback 就够；跨 netns 来的
+     （compose 端口发布）必须绑到 eth0 上。
+
+     ⚠️ **这个坑的隐蔽之处在于"老机器上没事"**：镜像停在改动之前的话，里面的默认值
+     还是 `0.0.0.0`，一切正常；**一旦重建镜像就立刻坏掉**，而报错指向沙箱不可达，
+     与"镜像"看上去毫无关系。所以它只在新机器/重建后才现形 —— 正是「无感」要挡的那类。
+   - **它没有认证**（只要连上就能 POST /exec 执行任意 shell），K8s 下绑 `0.0.0.0`
+     会顺着 `hostNetwork` 暴露到节点网络，所以那边**保持 loopback**。
+     compose 下绑 `0.0.0.0` 不越界：容器在 podman VM 的 `backend_default` 桥内，
+     桥上只有本栈自己的 pg/kafka/redis/sandbox。
    - **worker Pod 加 sidecar + 共享卷**（`deploy/worker-deployment.yaml`），两容器同挂
      `/workspace`；worker 的 `AGENTFLOW_WORKSPACE_ROOT` 必须与沙箱 `SBX_WRITABLE`
      指向**同一挂载点**，否则写校验必失败。沙箱容器**零 `AGENTFLOW_*`**。

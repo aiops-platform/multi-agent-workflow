@@ -179,6 +179,13 @@ def _env_preflight(settings) -> list[str]:
             )
 
     # ③ 沙箱：**最容易漏的一个**，且漏了不报错、只是修复与测试静默失效
+    #
+    # 先查**镜像在不在**、再查服务通不通 —— **这个顺序有讲究**：compose 的 sandbox
+    # 服务只声明 `image`、没有 `build`，镜像不在时 `docker compose up -d sandbox`
+    # 会以「pull access denied / No such image」失败，**报错看着像网络或权限问题**，
+    # 而真正要做的是 `make sandbox-image`。把根因摆在前面，别让人先追一条假线索。
+    problems.extend(sandbox_image_preflight())
+
     url = (settings.sandbox_url or "").strip()
     if not url:
         problems.append(
@@ -211,6 +218,63 @@ def _env_preflight(settings) -> list[str]:
     # 于是原系统那边**什么都收不到**。比"报 failed"更糟：是彻底没有回音。
     problems.extend(gh_preflight())
     return problems
+
+
+#: 沙箱镜像的名字 = 与 **`docker-compose.yml` 的 sandbox 服务** 和
+#: **`Dockerfile.java21` 的 `FROM`** 逐字一致。带 `localhost/` 前缀不是风格问题：
+#: 不带前缀时 podman 补 `localhost/`、**docker 补 `docker.io/library/`**，
+#: 于是同一个名字在两种 CLI 下指向不同的镜像（见 CLAUDE.md §9.6）。
+SANDBOX_IMAGES = (
+    "localhost/agentflow-sandbox:local",
+    "localhost/agentflow-sandbox-java21:local",
+)
+
+
+def sandbox_image_preflight() -> list[str]:
+    """沙箱镜像在不在本机；空列表 = 都在（或**判不了**）。
+
+    判不了时**刻意不报**：没有容器 CLI 的机器可能是纯 K8s 形态，凭"本机没有
+    podman/docker"就报警会制造假问题。但**一个 CLI 都没有**是另一回事 —— 那意味着
+    连 `make sandbox-image` 都跑不了，所以那种情况单独报。
+
+    抽成独立函数是为了可测：`image inspect` 要起子进程，测试里不该真去调容器运行时。
+    """
+    import shutil
+    import subprocess
+
+    cli = next((c for c in ("podman", "docker") if shutil.which(c)), None)
+    if cli is None:
+        return [
+            (
+                "找不到 podman / docker —— 无法构建或加载沙箱镜像"
+                "（装其一后跑 `make sandbox-image`，见 CLAUDE.md §9.6）"
+            )
+        ]
+
+    missing = []
+    for image in SANDBOX_IMAGES:
+        try:
+            r = subprocess.run(
+                [cli, "image", "inspect", image],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            # 查不动（CLI 有但机器没起、VM 未就绪……）→ 按"判不了"处理，不报警。
+            # 和 executor_alive 的三态同一条判据：**未知不等于没有**。
+            return []
+        if r.returncode != 0:
+            missing.append(image)
+
+    if not missing:
+        return []
+    return [
+        (
+            f"沙箱镜像不存在：{'、'.join(missing)} → 在 backend/ 下跑 `make sandbox-image`。"
+            "⚠️ 缺了它的症状**不在沙箱上**：compose 的 sandbox 服务只声明 image、没有 build，"
+            "起不来 → ws_write_file / ws_run_tests 一律 fail-closed → 修复不落盘、测试一条不跑，"
+            "而 agent 会拿着'沙箱不可用'反复试错直到耗尽轮次，报错里不会出现'镜像没建'"
+        )
+    ]
 
 
 def gh_preflight() -> list[str]:

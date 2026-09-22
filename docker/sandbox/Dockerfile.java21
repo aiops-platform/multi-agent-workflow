@@ -1,8 +1,14 @@
 # agentflow-sandbox-java21：Java 服务运行测试用的沙箱变体（design §10.2）
 #
-# 构建：
-#   docker build -t agentflow-sandbox-java21:local \
-#       -f docker/sandbox/Dockerfile.java21 .          # 依赖 agentflow-sandbox:local 已构建
+# 构建：**用 `make sandbox-image`**（在 backend/ 下）。它按正确顺序建两个镜像，
+# 且名字与下面那行 `FROM`、以及 docker-compose.yml 的 sandbox 服务都对得上：
+#   podman build -t localhost/agentflow-sandbox:local        -f docker/sandbox/Dockerfile .
+#   podman build -t localhost/agentflow-sandbox-java21:local -f docker/sandbox/Dockerfile.java21 .
+#
+# ⚠️ **`localhost/` 前缀不能省**。不带前缀时 podman 会替你补 `localhost/`，
+# 而 **docker 补的是 `docker.io/library/`** —— 于是下面那行 `FROM` 在 docker 下
+# 找不到基础镜像（在 podman 下却一切正常，所以这个坑只在别人的机器上现形）。
+# 判据不是"本机跑得通"，是"两种 CLI 下 `FROM` 都指得中"。
 #
 # 为什么是独立镜像而不是基础镜像的一个开关：见 docker/sandbox/Dockerfile 顶部注释——
 # 基础镜像要保住"零依赖、离线可建"，工具链按 runtime 各自成镜像。

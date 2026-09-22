@@ -160,13 +160,23 @@ curl -s --max-time 8 -X POST "http://localhost:18080/checkout?orderId=ORD2026081
 ### 6.1 构建沙箱镜像 + 加载
 ```bash
 cd $BACKEND
-# exec 服务是纯 stdlib（http.server），零 pip 依赖 → 基础镜像离线可建
-docker build -t agentflow-sandbox:local -f docker/sandbox/Dockerfile .
-# Java 服务的写/测试需要变体（JDK21；这一步要联网装 JDK，基础镜像不受影响）
-docker build -t agentflow-sandbox-java21:local -f docker/sandbox/Dockerfile.java21 .
-minikube image load agentflow-sandbox:local
-minikube image load agentflow-sandbox-java21:local
+# 一条命令建两个镜像（基础 → java21 变体，有先后）。容器 CLI 自动探测（podman 优先）。
+# 基础镜像纯 stdlib、离线可建；java21 变体要联网装 JDK21 + 拉 gradle 发行版。
+make sandbox-image
+
+# K8s 路径才需要这一步（compose 路径不需要）：把镜像塞进集群
+minikube image load localhost/agentflow-sandbox:local
+minikube image load localhost/agentflow-sandbox-java21:local
 ```
+
+> ⚠️ **镜像名要带 `localhost/` 前缀**。`Dockerfile.java21` 是
+> `FROM localhost/agentflow-sandbox:local`，compose 的 sandbox 服务也写死了
+> `localhost/agentflow-sandbox-java21:local`。
+> 不带前缀时 **podman 会自动补 `localhost/`、docker 补 `docker.io/library/`** ——
+> 所以裸 `docker build -t agentflow-sandbox:local` 在 podman 上碰巧是对的、
+> **在 docker 上会建出另一个名字**，于是 `FROM` 找不到基础镜像。
+> 照 `make sandbox-image` 跑就没这个问题（它固定带前缀）。
+> 详见 `CLAUDE.md` §9.6。
 
 ### 6.2 K8s 端到端验证
 ```bash

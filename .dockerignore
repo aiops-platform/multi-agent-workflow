@@ -1,0 +1,56 @@
+# 构建上下文默认是整个 backend/ 目录，而**真正被 COPY 的只有一点点**
+# （三个 Dockerfile 加起来：`agentflow/` + `docker/sandbox/warmup/` +
+#  `pyproject.toml` + `README.md`）。
+#
+# ⚠️ **不加这个文件，每次构建都要先把整个目录塞进 VM/daemon** —— 实测 609MB，
+# 其中 `venv/` 独占 375MB。症状是「构建卡在**没有任何输出**的地方好几分钟」，
+# 极容易被误判成"网络慢"或"镜像源慢"，实际是在传一个根本没人读的虚拟环境。
+# 换新机器时这一条尤其致命：新克隆的仓库往往还带着自己的 venv。
+#
+# ⚠️ 改动前先确认没把自己要的东西排掉。本文件同时服务三个 Dockerfile：
+#   docker/sandbox/Dockerfile        → agentflow/sandbox/{__init__,exec_service}.py + agentflow/__init__.py
+#   docker/sandbox/Dockerfile.java21 → docker/sandbox/warmup/
+#   docker/Dockerfile.worker         → agentflow/ + pyproject.toml + README.md
+# 判据：**`COPY` 里出现过的路径，一条都不能在这里被排掉**。
+
+# ---- 依赖与本地产物（体积大头）----
+venv/
+.venv/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# ---- 运行时数据与本地配置 ----
+# 这些本来也不该进镜像：`.env` 里是真实凭证，而沙箱镜像的约束是
+# 「一个凭据都不能有」（见 docker/sandbox/Dockerfile.java21 顶部）。
+data/
+.env
+.env.*
+*.sqlite
+*.sqlite3
+*.db
+
+# ---- 测试与工具链缓存 ----
+tests/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---- 文档 ----
+# `*.md` 全排掉，再把 README.md 单独捞回来 —— **worker 的 Dockerfile 会 COPY 它**，
+# 排掉会让 `docker build -f docker/Dockerfile.worker` 直接失败。
+# （.dockerignore 是**后面的规则覆盖前面的**，所以顺序有意义。）
+docs/
+*.md
+!README.md
+
+# ---- VCS 与编辑器 ----
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store

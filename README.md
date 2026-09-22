@@ -135,14 +135,19 @@ tests/                 # 300+ tests（DAG/幂等/Resume/审批/Worker/队列/多
 ## M4 沙箱（独立执行 Pod）
 
 ```bash
-# 1. 构建沙箱镜像（基础镜像离线可建）
-docker build -t agentflow-sandbox:local -f docker/sandbox/Dockerfile .
-# Java 服务的写/测试需要变体（JDK21；需联网，基础镜像不受影响）
-docker build -t agentflow-sandbox-java21:local -f docker/sandbox/Dockerfile.java21 .
-minikube image load agentflow-sandbox:local
-minikube image load agentflow-sandbox-java21:local
+# 1. 构建沙箱镜像 —— 一条命令建两个（基础 → java21 变体，有先后）。
+#    容器 CLI 自动探测（podman 优先，否则 docker）。基础镜像离线可建；
+#    java21 变体要联网装 JDK21 + 拉 gradle 发行版（**gradle 缓存烤进镜像**，
+#    否则首次 ./gradlew test 要 560s，超过所有超时阀值 → tester 拿到假失败）。
+#    ⚠️ 直接跑 compose 的话到这一步就够了；镜像没建的症状**不在沙箱上**
+#    （见 CLAUDE.md §9.6）。
+make sandbox-image
 
-# 2. K8s 端到端验证（拉起沙箱 Pod → exec → 销毁）
+# 2. （仅 K8s 路径）把镜像塞进集群；compose 路径不需要
+minikube image load localhost/agentflow-sandbox:local
+minikube image load localhost/agentflow-sandbox-java21:local
+
+# 3. K8s 端到端验证（拉起沙箱 Pod → exec → 销毁）
 ./venv/bin/python scripts/verify_sandbox.py
 ```
 

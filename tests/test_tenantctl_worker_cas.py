@@ -626,3 +626,107 @@ async def test_executor_alive_unknown_when_lock_errors() -> None:
     await store.update_run(run_id, status="running")
 
     assert await svc.executor_alive(run_id) is None
+
+
+# ======================================================================
+# 沙箱镜像体检
+# ======================================================================
+def test_sandbox_image_preflight_reports_missing_images(monkeypatch) -> None:
+    """镜像不在 → 报出来，且**指名 `make sandbox-image`**，不是那句会误导的
+    「docker compose up -d sandbox」。
+
+    顺序判据：compose 的 sandbox 服务只声明 image、没有 build。镜像不在时
+    `docker compose up -d sandbox` 会以「pull access denied / No such image」
+    失败 —— **报错看着像网络或权限问题**，而真正要做的是建镜像。
+    所以镜像检查必须**排在连通性检查前面**，把根因先摆出来。
+    """
+    from agentflow import tenantctl
+
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/podman" if name == "podman" else None)
+
+    class _Missing:
+        returncode = 1
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: _Missing())
+    problems = tenantctl.sandbox_image_preflight()
+    assert any("make sandbox-image" in p for p in problems), problems
+    # 必须点名**是哪个**镜像不在，否则还得自己一个个试
+    assert any("agentflow-sandbox-java21:local" in p for p in problems), problems
+
+
+def test_sandbox_image_preflight_ok_when_present(monkeypatch) -> None:
+    from agentflow import tenantctl
+
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/podman" if name == "podman" else None)
+
+    class _Ok:
+        returncode = 0
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: _Ok())
+    assert tenantctl.sandbox_image_preflight() == []
+
+
+def test_sandbox_image_preflight_silent_when_undecidable(monkeypatch) -> None:
+    """**CLI 在、但问不动**（机器没起 / VM 未就绪）→ 保持沉默。
+
+    这条是刻意的，和 `executor_alive` 的三态同一条判据：**未知不等于没有**。
+    把"查不到"当成"不存在"，会在容器运行时抖一下的时候报一个假问题，
+    而假问题会训练人忽略体检输出 —— 那比不查更糟。
+
+    注意与「一个 CLI 都没有」区分开：那是**真问题**（连 make sandbox-image
+    都跑不了），单独报，见下一条。
+    """
+    from agentflow import tenantctl
+
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/podman" if name == "podman" else None)
+
+    def _boom(*a, **k):
+        raise OSError("cannot connect to podman machine")
+
+    monkeypatch.setattr("subprocess.run", _boom)
+    assert tenantctl.sandbox_image_preflight() == []
+
+
+def test_sandbox_image_preflight_reports_no_container_cli(monkeypatch) -> None:
+    """一个容器 CLI 都没有 → 报，因为连建镜像这一条路都断了。"""
+    from agentflow import tenantctl
+
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    problems = tenantctl.sandbox_image_preflight()
+    assert any("podman" in p and "make sandbox-image" in p for p in problems), problems
+
+
+def test_preflight_puts_image_check_before_reachability(monkeypatch) -> None:
+    """**顺序**也要钉住：镜像是根因，连通性只是症状。
+
+    只断言"两者都报了"是不够的 —— 顺序错了照样全部通过，而使用者会先去追
+    「连不上沙箱」这条假线索。
+    """
+    from agentflow import tenantctl
+
+    class _S:
+        state_store = "postgres"
+        queue = "kafka"
+        kafka_bootstrap = "localhost:19092"
+        sandbox_url = "http://127.0.0.1:44772"
+        workspace_root = "/tmp/ws"
+        open_sandbox_api_key = type("X", (), {"get_secret_value": staticmethod(lambda: "")})()
+
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/podman" if name == "podman" else None)
+
+    class _Missing:
+        returncode = 1
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: _Missing())
+    monkeypatch.setattr("socket.create_connection", lambda *a, **k: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(tenantctl, "gh_preflight", lambda: [])
+
+    import urllib.request
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(OSError("refused")))
+
+    problems = tenantctl._env_preflight(_S())
+    i_img = next((i for i, p in enumerate(problems) if "make sandbox-image" in p), None)
+    i_url = next((i for i, p in enumerate(problems) if "不可达" in p), None)
+    assert i_img is not None and i_url is not None, problems
+    assert i_img < i_url, f"镜像检查应排在连通性之前，实际：{problems}"

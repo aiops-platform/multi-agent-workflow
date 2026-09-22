@@ -12,6 +12,7 @@
 | 缺什么 | 症状 |
 |---|---|
 | postgres / kafka | run 发不出去，或跑到一半失败 |
+| **沙箱镜像** | compose 的 sandbox 服务**只声明 image、没有 build** → 起不来。**报错看着像网络/权限问题**（pull access denied），而要做的是 `make sandbox-image` |
 | **沙箱** | `ws_write_file` / `ws_run_tests` fail-closed —— 修复不落盘、测试一条不跑，而 tester 只能如实报 `passed: false`（实测 run_668981c0a7） |
 | **gh CLI / 凭证** | `ws_open_pr` 起不来 → `commit` 节点失败 → `on_failure: abort` 让整条 run 中止 → **它下游的 `ticket-done` 根本不执行**，原系统那边什么都收不到 |
 
@@ -122,7 +123,7 @@ def main() -> int:
         )
 
     if not problems:
-        print("\n✓ 环境就绪（postgres / kafka / 沙箱 / gh 均可用）")
+        print("\n✓ 环境就绪（postgres / kafka / 沙箱镜像与沙箱 / gh 均可用）")
         return 0
 
     print("\n⚠ 发现以下问题：")
