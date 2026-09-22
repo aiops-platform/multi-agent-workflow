@@ -650,8 +650,14 @@ tenantctl.py 租户生命周期 CLI（**在顶层**，不在 api/ 下）
 workflows/   ⚠️ **已删除**（2026-09-16）——workflow 的真源是数据库，不是仓库文件。
              见下方「工作流的真源」。原设计的 DAG 形态留在 design-v5.2.md §8.1（仓库上一级目录）。
 scripts/     watch_run.py（run 逐阶段观测）+ mock_mcp_server.py + verify_sandbox.py
+             + push_seed_workflows.py（把 seed 的 workflow 推到已开通租户，见「工作流的真源」）
 docker/sandbox/  沙箱镜像（stdlib-only 离线可建）
 ```
+
+> **`docs/retro/` —— 回顾目录**。放"**我们做这件事的方式哪里在失效**"，
+> 与 design（系统长什么样）/ TODO（还欠什么）/ 本文件（改代码前必须知道什么）**各管一件事**。
+> 历次回顾见 `docs/retro/README.md`。有 Action 落地时，**改的是本文件的约束或测试**，
+> 而不是只把回顾写完就了事。
 
 ## 测试
 
