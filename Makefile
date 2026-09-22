@@ -1,4 +1,4 @@
-.PHONY: install test lint api doctor sandbox-image
+.PHONY: install test lint api doctor sandbox-image sync-workflows
 
 # 变量：此前几个目标各自硬编码 ./venv/bin/...，而 `doctor` 用了没定义的 $(PY)
 # —— 展开成空，于是它去执行脚本文件本身（`Permission denied`）。**这个目标从加进来
@@ -45,3 +45,17 @@ sandbox-image:
 	$(CONTAINER) build -t localhost/agentflow-sandbox-java21:local \
 	    -f docker/sandbox/Dockerfile.java21 .
 	@echo "✓ 沙箱镜像就绪：localhost/agentflow-sandbox-java21:local"
+
+# 把 seed 里的 workflow 推到**已开通租户**。
+#
+# 为什么需要这条：workflow 的真源是**数据库**，而 seed 是「空表才播、绝不覆盖」——
+# 改了 `agentflow/seed/workflows/*.yaml` 对新租户自动生效，**对已开通租户毫无效果、
+# 也没有任何提示**。这是本仓反复踩的一个坑（CLAUDE.md §6.0）。
+#
+#   make sync-workflows TENANT=otr
+#   make sync-workflows TENANT=otr DRY=1
+#
+# ⚠️ 只同步 workflow；agent 定义与 MCP 绑定另有自己的一套（见脚本头部说明）。
+sync-workflows:
+	@test -n "$(TENANT)" || { echo "用法：make sync-workflows TENANT=<租户id>"; exit 1; }
+	$(PY) scripts/push_seed_workflows.py --tenant $(TENANT) $(if $(DRY),--dry-run,)

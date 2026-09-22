@@ -231,6 +231,17 @@ make lint      # ruff 检查
      实际改了仓库 YAML 而没同步到库时，run 跑的还是旧流程，**且没有任何提示**。
    - **要改 workflow**：`PUT /workflows/{wid}`（或 `POST /workflows` 新建），改完立即生效
      （已发起的 run 不受影响——它们用 snapshot 冻结）。
+   - ⭐ **改完 `seed/workflows/*.yaml` 之后，把改动同步到已开通租户：**
+
+     ```bash
+     make sync-workflows TENANT=otr          # 先 --dry-run 也行：DRY=1
+     ```
+
+     它按**名字**配对逐条推（命中 PUT 保 id、未命中 POST），推完**回读逐字节校验**，
+     不一致就非零退出。**为什么需要这条**：seed 是「空表才播、绝不覆盖」，
+     所以 `git pull` 对**已开通租户毫无效果、也没有任何提示**（§6.0 开头那条）。
+     ⚠️ 它**只同步 workflow** —— agent 定义（`seed/agents/*.yaml` → `agent_configs`）
+     与 MCP 绑定（`seed/dataplane.yaml`）各有各的路，脚本头部写明了。
    - 原设计的 DAG 形态（节点类型 / when / join / 审批门禁）见 `design-v5.2.md` §8.1（**仓库上一级目录**，不在 `backend/docs/`——v5.6 §8 是「残余风险」不是这个）；
      当前流程的节点结构见 `docs/design-v5.8.md` §4（种子里的三条：scenario1 / scenario2 /
      problem-diagnose-fix，末者见 §4.15）。
