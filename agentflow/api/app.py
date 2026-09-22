@@ -696,6 +696,11 @@ class TicketRequest(BaseModel):
     # 库里那一列是 `workflow_name`，因为名字才是跨租户可移植的键（id 每库都不同）。
     # 不传 = 不钉，发起时退回「库里最新一条」（`_workflow_for_ticket` 的第三档）。
     workflow_id: str | None = None
+    # 这张单**从哪来**（`manual` / `workflow` / `apm`）——图按它决定跑完要不要回传原系统。
+    # **通常不用传**：不传时由 `_ticket_origin` 按 `source_ref` 推导（手建单即 `manual`）。
+    # 显式传只服务一种场景：**不是我建的、但上游认这张单**
+    # （如 spike 会话——工单由 APM 建、号也是 APM 记的，回传得投得出去）。
+    origin: str | None = None
 
 
 class TicketRunRequest(BaseModel):
@@ -718,6 +723,10 @@ def _ticket_inputs(req: TicketRequest) -> dict:
         inputs["window_start"] = req.window_start
     if req.window_end:
         inputs["window_end"] = req.window_end
+    # 来源。**不传就留空** —— 由 `_ticket_origin` 按 `source_ref` 推导（手建单即 `manual`），
+    # 这里写死默认值反而会把"没声明"与"声明了 manual"混成一件事。
+    if (req.origin or "").strip():
+        inputs["origin"] = req.origin.strip()
     return inputs
 
 
@@ -761,12 +770,44 @@ def _run_inputs_from_ticket(ticket: dict, workflow: Workflow) -> dict:
     工单里有 diagnosis，run 的 inputs 里被剥没了）。**角色由图定，别替它决定。**
     """
     inputs = dict(ticket.get("inputs") or {})
+    # 每次 run 都算一遍来源 —— 图按它决定跑完要不要回传原系统（`$.inputs.origin`）。
+    inputs["origin"] = _ticket_origin(ticket, inputs)
     if _consumes_diagnosis(workflow):
         return inputs
     bug = inputs.get("bug_report")
     if isinstance(bug, dict) and "diagnosis" in bug:
         inputs["bug_report"] = {k: v for k, v in bug.items() if k != "diagnosis"}
     return inputs
+
+
+def _ticket_origin(ticket: dict, inputs: dict) -> str:
+    """这张单**从哪来** —— 决定它跑完要不要回传原系统（`manual` / `workflow` / `apm`）。
+
+    图按它分流（`when: "$.inputs.origin != 'manual'"`），所以每次 run 都得算出来，
+    不能只在建单时写死：
+
+    - **显式声明优先**（`inputs.origin`）—— 留给"不是我建的、但上游认这张单"的场景
+      （目前是 spike 会话那条老路径：工单由 APM 建、号也是 APM 记的）。
+    - 否则按 `source_ref` 有无推导：**有 ⇒ `workflow`**（`kind: ticket` 节点建的，
+      它的建单契约要求 `source_ref` 必填）；**无 ⇒ `manual`**（人手喂进来的）。
+
+    ## 为什么在这里推导，而不是建单时写死、也不新增一列
+
+    - **存量工单自动正确**：老工单的 inputs 里没有这个键，靠推导一样得对
+      （otr 那批手建单 `source_ref` 全是 NULL → `manual`）——**不用回填、不用迁移**。
+    - **不新增列**：图只能读 `inputs`（`when` 读不到表列），存列等于两处存、两处同步。
+    - 放这个函数里，是因为它已经是**工单 → run inputs 的唯一漏斗**，
+      且已经有一次同类推导（按目标图剥 `bug_report.diagnosis`）。
+
+    ⚠️ **判错的方向是有代价的**，且两个方向不对称：
+    把该回传的推成 `manual` = **静默漏投**（而本轮要修的恰恰是"静默"）；
+    把手工单推成非 manual = 响亮地红。所以这里**只对"确实没有上游"的那一种给 `manual`**，
+    其余一律按"可能有上游"处理。
+    """
+    declared = str(inputs.get("origin") or "").strip()
+    if declared:
+        return declared
+    return "workflow" if str(ticket.get("source_ref") or "").strip() else "manual"
 
 
 async def _workflow_for_ticket(cs: Any, ticket: dict, req: TicketRunRequest | None) -> str:

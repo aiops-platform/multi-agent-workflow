@@ -518,3 +518,46 @@ async def test_create_from_node_params_maps_bug_report_and_requires_source_ref(t
     # 缺 source_ref（幂等判据）→ 失败，而不是建一张无法去重的单
     with pytest.raises(ValueError, match="source_ref"):
         await create_from_node_params(ts, "otr", {"bug_report": {"number": "X"}})
+
+
+# ======================================================================
+# 工单来源 origin —— 决定跑完要不要回传原系统
+# ======================================================================
+def test_run_inputs_derive_origin_from_source_ref() -> None:
+    """来源按 `source_ref` 推导：有 ⇒ `workflow`（run 内建单），无 ⇒ `manual`（手建单）。
+
+    关键性质：**每次 run 都算一遍**，所以存量工单自动正确 —— 老工单的 inputs 里
+    根本没有这个键，靠推导一样得对（otr 那批手建单 `source_ref` 全是 NULL），
+    **不用回填、不用迁移**。
+
+    这一点是刻意的：只在建单时写死的话，已经建好的单就永远是错的。
+    """
+    from agentflow.api.app import _run_inputs_from_ticket
+    from agentflow.core.workflow import Workflow
+
+    wf = Workflow.load_yaml(VALID_YAML)
+    # 手建单：POST /tickets 建的，source_ref 为 NULL
+    assert _run_inputs_from_ticket({"inputs": {"bug_report": {}}, "source_ref": None}, wf)[
+        "origin"
+    ] == "manual"
+    # run 内建单：kind: ticket 节点建的（它的建单契约要求 source_ref 必填）
+    assert _run_inputs_from_ticket({"inputs": {"bug_report": {}}, "source_ref": "INC-1"}, wf)[
+        "origin"
+    ] == "workflow"
+    # 显式声明优先 —— 留给"不是我建的、但上游认这张单"的场景（spike 老路径）
+    assert _run_inputs_from_ticket(
+        {"inputs": {"bug_report": {}, "origin": "apm"}, "source_ref": None}, wf
+    )["origin"] == "apm"
+
+
+async def test_create_ticket_origin_is_optional(stores) -> None:
+    """`POST /tickets` 可显式声明来源；**不传则留空**，由上面那个推导决定。
+
+    刻意不在这里写死默认值：写死会把"没声明"与"声明了 manual"混成一件事，
+    而这两者在 spike 那条路径上必须区分得开。
+    """
+    async with _client() as client:
+        t = await _create(client, origin="apm")
+        assert t["inputs"]["origin"] == "apm"
+        plain = await _create(client)
+        assert "origin" not in plain["inputs"]

@@ -381,8 +381,16 @@ edges:
   # 审批 → 提交 → 复盘
   - { from: approve-commit, to: commit, when: "$.nodes.approve-commit.output.approved == true" }
   - { from: approve-commit, to: recap, when: "$.nodes.approve-commit.output.approved == false" }
-  # 提交之后先回传原系统、再进复盘 —— 复盘要能提到工单是否已闭环
-  - { from: commit, to: ticket-done }
+  # 提交之后先回传原系统、再进复盘 —— 复盘要能提到工单是否已闭环。
+  #
+  # ── 回传分流：**手工单不走投递**（2026-09-22，与 scenario1 逐字同理）─────────────
+  # 手工单在原系统里没有对应物：送过去必然 404 → `delivered: false` → 节点 FAILED →
+  # 整条 run 中止。**那不是投递坏了，是我们不该把一张没有上游的单送过去。**
+  # 用负面测试（`!= 'manual'`）而非正向列举：多一种来源时默认回传 ——
+  # 判错的方向是响亮地红，而不是静默漏投。
+  - { from: commit, to: ticket-done, when: "$.inputs.origin != 'manual'" }
+  # 手工单直接去复盘。**不能省**：否则 `ticket-done` 的 SKIPPED 会级联把 `recap` 也带没。
+  - { from: commit, to: recap, when: "$.inputs.origin == 'manual'" }
   - { from: ticket-done, to: recap }
   # 定位失败 → 直接到终点（halt）。此时上面四条边全 INACTIVE，
   # 取数节点 SKIPPED 级联到 rca/plan/fix…，只花到 scope 为止的代价。

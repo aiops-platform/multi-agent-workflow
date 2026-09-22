@@ -1242,3 +1242,111 @@ edges:
     with pytest.raises(WorkflowDAGError, match="next_workflow"):
         Workflow.load_yaml(yaml_text)
     assert Workflow.load_yaml(yaml_text, strict=False).dag is not None
+
+
+# ======================================================================
+# `when` 读 `$.inputs.*` —— 图按入参分流（2026-09-22，工单来源）
+# ======================================================================
+def _when_yaml(cond: str) -> str:
+    return (
+        "name: when-flow\n"
+        "nodes:\n"
+        "  a: { agent: triage }\n"
+        "  b: { agent: triage }\n"
+        "edges:\n"
+        f'  - {{ from: a, to: b, when: "{cond}" }}\n'
+    )
+
+
+def test_eval_condition_reads_inputs() -> None:
+    """`$.inputs.*` 可求值；**路径取不到值时仍是"不满足"**（既有且承重的语义：
+
+    skipped 节点的 `output` 就是 `None`，`when` 必须能对它求值成不满足 ——
+    这条**不能**改成报错，否则条件边一遇到未执行的节点就炸。
+    """
+    from agentflow.core.expressions import eval_condition
+
+    inputs = {"origin": "manual", "bug_report": {"number": "INC-1"}}
+    assert eval_condition("$.inputs.origin == 'manual'", {}, inputs) is True
+    assert eval_condition("$.inputs.origin != 'manual'", {}, inputs) is False
+    assert eval_condition("$.inputs.bug_report.number == 'INC-1'", {}, inputs) is True
+    # 取不到 → 不满足（不是报错）
+    assert eval_condition("$.inputs.nope == 'x'", {}, inputs) is False
+    assert eval_condition("$.inputs.nope != 'x'", {}, inputs) is True
+
+
+def test_eval_condition_nodes_still_works() -> None:
+    """`$.nodes.*` 不回归（本次改的是分派方式，不是语义）。"""
+    from agentflow.core.expressions import eval_condition
+
+    states = {"t": {"status": DONE, "output": {"passed": True}}}
+    assert eval_condition("$.nodes.t.output.passed == true", states) is True
+    assert eval_condition("$.nodes.t.output.passed == false", states) is False
+
+
+def test_eval_condition_rejects_unknown_prefix() -> None:
+    """写错前缀**必须报错** —— 它在 2026-09-22 之前是**静默**的：
+
+    那时实现是 `left.replace("$.nodes.", "", 1)` 再去 node_states 里走，所以
+    `$.inputs.x == 'y'` 的 `replace` 不生效 → 原样当路径走 → 走不到 → `None`
+    → **`==` 恒假、`!=` 恒真，一声不吭**。一条永远只走同一分支的 `when`，
+    在页面上与"条件确实满足了"长得一模一样。
+    """
+    from agentflow.core.expressions import eval_condition
+
+    for bad in ("$.input.x == 1", "nodes.a.output == 1", "$.node.a.output == 1"):
+        with pytest.raises(ValueError, match="必须以"):
+            eval_condition(bad, {}, {})
+
+
+def test_dag_rejects_unknown_when_prefix_at_load() -> None:
+    """加载期就把写错前缀的 `when` 拦下来（strict 路径，作者改图时立刻知道）。"""
+    from agentflow.core.dag import WorkflowDAGError
+
+    with pytest.raises(WorkflowDAGError, match="必须以"):
+        Workflow.load_yaml(_when_yaml("$.input.x == 1"))
+    # 两个合法前缀都照常加载
+    Workflow.load_yaml(_when_yaml("$.inputs.x == 1"))
+    Workflow.load_yaml(_when_yaml("$.nodes.a.output.x == 1"))
+
+
+_GATE_YAML = """
+name: gate-flow
+nodes:
+  a: { agent: triage }
+  deliver: { agent: committer }
+  recap: { agent: postmortem }
+edges:
+  - { from: a, to: deliver, when: "$.inputs.origin != 'manual'" }
+  - { from: a, to: recap,   when: "$.inputs.origin == 'manual'" }
+  - { from: deliver, to: recap }
+"""
+
+
+async def _run_gate(origin: str) -> DAGExecutor:
+    runner, _ = make_runner()
+    wf = Workflow.load_yaml(_GATE_YAML)
+    ex = DAGExecutor(
+        "run_gate", "t", wf.dag, InMemoryStateStore(),
+        node_runner=runner, inputs={"origin": origin},
+    )
+    assert await ex.run() == "done"
+    return ex
+
+
+async def test_manual_origin_skips_the_delivery_node() -> None:
+    """**手工单不走投递**（本次要修的那件事）：投递节点 SKIPPED，复盘照跑。
+
+    改之前没有这条分流：手工单照样去投递 → 原系统 404 → `delivered: false`
+    → 节点 FAILED → `on_failure: abort` 把整条 run 中止变红。
+    """
+    ex = await _run_gate("manual")
+    assert ex.get_status("deliver") == SKIPPED
+    assert ex.get_status("recap") == DONE, "手工单必须照样走到复盘（否则 run 白少一环）"
+
+
+async def test_non_manual_origin_delivers() -> None:
+    """流程内建/上游建的单照常投递 —— 分流只对 `manual` 生效。"""
+    ex = await _run_gate("workflow")
+    assert ex.get_status("deliver") == DONE
+    assert ex.get_status("recap") == DONE
