@@ -1,4 +1,4 @@
-.PHONY: install test lint api doctor sandbox-image sync-workflows sync-agents
+.PHONY: install test lint api doctor sandbox-image sync-workflows sync-agents retro-harvest
 
 # 变量：此前几个目标各自硬编码 ./venv/bin/...，而 `doctor` 用了没定义的 $(PY)
 # —— 展开成空，于是它去执行脚本文件本身（`Permission denied`）。**这个目标从加进来
@@ -74,3 +74,14 @@ sync-workflows:
 sync-agents:
 	@test -n "$(TENANT)" || { echo "用法：make sync-agents TENANT=<租户id>"; exit 1; }
 	$(PY) scripts/push_seed_agents.py --tenant $(TENANT) $(if $(DRY),--dry-run,)
+
+# 经验回收：把一段时间内的提交「为什么」/ changelog / TODO 变更收拢成素材，
+# 交给 LLM 按 `docs/lessons/README.md` 的收录标准做三分类。
+#
+#   make retro-harvest SINCE="2 weeks ago"
+#   make retro-harvest SINCE="1 month ago" REPOS="../backend ../service-intelligence-platform-ui"
+#
+# ⚠️ **脚本不做判断** —— 三分类（可机器化 / 只能文档 / 丢弃）是 LLM 的活，它会打印出
+# 可直接粘贴的指令。为什么是"回收"而不是"让人记录"：见脚本头部。
+retro-harvest:
+	$(PY) scripts/retro_harvest.py --since "$(if $(SINCE),$(SINCE),2 weeks ago)" $(foreach r,$(REPOS),--repo $(r))
