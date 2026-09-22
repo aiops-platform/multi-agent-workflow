@@ -474,3 +474,71 @@ def test_gh_preflight_reports_not_logged_in(monkeypatch) -> None:
     monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
     problems = tenantctl.gh_preflight()
     assert any("未登录" in p and "gh auth login" in p and "GH_TOKEN" in p for p in problems), problems
+
+
+# ======================================================================
+# 执行租约：「这条 run 有执行者吗」
+# ======================================================================
+async def test_worker_holds_lease_while_executing() -> None:
+    """执行期间**持租约**、结束后**归还** —— 这是"有没有执行者"的唯一判据。
+
+    背景：Worker 认领 run 后的绑定（`_tasks`/`_executors`）只在**进程内存**里，
+    数据库那条 `running` 没有字段指出"谁在跑"。Worker 暴毙后它既不能被 trigger
+    （CAS 只从 queued 接）也不能被 resume（只从 paused/waiting_approval 接）——
+    僵尸。租约把那个绑定搬到共享存储，才能回答"还有没有执行者"。
+    """
+    import asyncio
+
+    from agentflow.lock import run_exec_lease_key
+    from agentflow.lock.memory import InMemoryLock
+    from agentflow.worker import Worker
+
+    lock = InMemoryLock()
+    store = InMemoryStateStore()
+    queue = InMemoryQueue()
+    started, unblock = asyncio.Event(), asyncio.Event()
+
+    async def runner(node, params):
+        started.set()
+        await unblock.wait()          # 卡住，好让测试在**执行中途**查租约
+        return {"ok": True}
+
+    svc = RunService(store, queue=queue)
+    wf = Workflow.load_yaml(SIMPLE_YAML)
+    run_id = (await svc.start_run("t1", wf, {}))["run_id"]
+
+    w = Worker(store, queue, node_runner=runner, lock=lock)
+    await w.handle_trigger({"type": "trigger", "run_id": run_id, "tenant_id": "t1"})
+    await asyncio.wait_for(started.wait(), 2)
+
+    key = run_exec_lease_key(run_id)
+    assert await lock.is_locked(key) is True, "执行中途必须持有租约"
+
+    unblock.set()
+    await w.wait_run(run_id)
+    assert await lock.is_locked(key) is False, "执行结束后必须归还"
+
+
+async def test_worker_without_lock_still_runs() -> None:
+    """没接 lock 时**照常执行**（只是存活状态不可判定）。
+
+    租约是**增强**不是执行前提：redis 挂了不该让整个平台停摆。代价是那种部署下
+    "有没有执行者"是**未知**，而未知不允许被当成"没有" —— 见 `pause_run` 的分流。
+    """
+    store = InMemoryStateStore()
+    queue = InMemoryQueue()
+    calls = {"n": 0}
+
+    async def runner(node, params):
+        calls["n"] += 1
+        return {"ok": True}
+
+    svc = RunService(store, queue=queue)
+    wf = Workflow.load_yaml(SIMPLE_YAML)
+    run_id = (await svc.start_run("t1", wf, {}))["run_id"]
+
+    w = Worker(store, queue, node_runner=runner)      # 不传 lock
+    await w.handle_trigger({"type": "trigger", "run_id": run_id, "tenant_id": "t1"})
+    await w.wait_run(run_id)
+    assert calls["n"] == 1
+    assert (await store.get_run(run_id))["status"] == "done"

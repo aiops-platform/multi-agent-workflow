@@ -28,6 +28,12 @@ from .config import get_settings
 from .core.dag import TERMINAL
 from .executor.dag_executor import DAGExecutor, NodeRunner, WorkflowNodeFailed
 from .executor.resume import resume_executor
+from .lock import (
+    LEASE_REFRESH_SEC,
+    LEASE_TTL_SEC,
+    build_lock,
+    run_exec_lease_key,
+)
 from .queue import build_queue
 from .queue.base import TOPIC_COMMAND, TOPIC_TRIGGER, Queue, topic_command, topic_trigger
 from .statestore.base import StateStore
@@ -44,6 +50,7 @@ class Worker:
         node_runner: NodeRunner | None = None,
         *,
         tenant_id: str | None = None,
+        lock=None,
     ) -> None:
         # store 可为普通 StateStore（单库）或 TenantStoresRouter——统一经 resolver
         # 按租户解析（design-v5.3 §5.3：每次操作落到该租户自己的库）
@@ -53,12 +60,72 @@ class Worker:
         # 绑定租户（v5.3 §6.2 生产形态：每租户 Worker 只消费自己的 topic）；
         # None = 消费全局 topic（单租户回退 / 未注册租户 dev 兜底）
         self.tenant_id = tenant_id
+        # 执行租约用（见 `lock/__init__.py` 的说明）。**None = 不持租约**：
+        # 单测与未接线 redis 的部署走这条，此时"有没有执行者"是**未知**而不是"没有"
+        # （见 `api/app.py` 的 `executor_alive` 三态）—— 判不出就不许强制暂停。
+        self.lock = lock
         # 本 Worker 正在执行的 run；审批挂起/暂停/终态即移出 → 零占用（§8.6）
         self._tasks: dict[str, asyncio.Task] = {}
         self._executors: dict[str, DAGExecutor] = {}  # run_id → executor（pause 反查用）
+        self._lease_tasks: dict[str, asyncio.Task] = {}  # run_id → 续期任务
 
     async def _store(self, tenant_id: str | None) -> StateStore:
         return await self._stores.resolve(tenant_id or "local")
+
+    # ------------------------------------------------------------------
+    # 执行租约：「这条 run 有执行者」—— 键名与 TTL 见 lock/__init__.py
+    # ------------------------------------------------------------------
+    async def _claim_lease(self, run_id: str) -> None:
+        """接单后取租约并起续期任务。
+
+        **取不到不阻断执行** —— redis 挂了不该让整个平台停摆。代价是那条 run 的
+        "有没有执行者"变成**未知**，而未知**不允许**被当成"没有"：暂停分流只在
+        明确无租约时才强制（见 `RunService.pause_run`）。
+        """
+        if self.lock is None:
+            return
+        key = run_exec_lease_key(run_id)
+        try:
+            ok = await self.lock.acquire(key, ttl=LEASE_TTL_SEC)
+        except Exception as exc:  # noqa: BLE001 - 租约是增强，不是执行前提
+            log.warning("[%s] 取执行租约失败（%s）—— 该 run 的存活状态将不可判定", run_id, exc)
+            return
+        if not ok:
+            log.warning("[%s] 执行租约已被占用 —— 仍继续执行，但存活状态不可判定", run_id)
+            return
+        self._lease_tasks[run_id] = asyncio.create_task(self._renew_lease(run_id))
+
+    async def _renew_lease(self, run_id: str) -> None:
+        """定期续期，直到续不动或任务被取消。
+
+        续不动意味着**本 Worker 已被认为不再执行这条 run**（TTL 到期后有人接管，
+        或锁易主）。此时不自动中止执行 —— 那需要 fencing（把租约代际传给下游写操作），
+        属后续工作；但必须**大声说出来**，因为它意味着可能有两个执行体。
+        """
+        key = run_exec_lease_key(run_id)
+        while True:
+            await asyncio.sleep(LEASE_REFRESH_SEC)
+            try:
+                if not await self.lock.refresh(key, ttl=LEASE_TTL_SEC):
+                    log.error(
+                        "[%s] 执行租约续期失败 —— 该 run 可能已被判定为无执行者并被接管。"
+                        "本 Worker 仍在执行，两条执行体会写同一份 checkpoint",
+                        run_id,
+                    )
+                    return
+            except Exception as exc:  # noqa: BLE001 - 抖动不该直接放弃租约
+                log.warning("[%s] 续期异常（%s），下一轮重试", run_id, exc)
+
+    async def _release_lease(self, run_id: str) -> None:
+        task = self._lease_tasks.pop(run_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+        if self.lock is None:
+            return
+        try:
+            await self.lock.release(run_exec_lease_key(run_id))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%s] 释放执行租约失败（%s）—— TTL 到期后自动消失", run_id, exc)
 
     # ------------------------------------------------------------------
     # 常驻消费（trigger 与 command 并行消费）
@@ -111,6 +178,7 @@ class Worker:
             return
         ex = await self._build_executor(run_id, tenant, store)
         log.info("[%s] Worker 接单（trigger）", run_id)
+        await self._claim_lease(run_id)
         self._executors[run_id] = ex
         self._tasks[run_id] = asyncio.create_task(self._execute(run_id, ex, tenant))
 
@@ -133,6 +201,11 @@ class Worker:
         finally:
             self._tasks.pop(run_id, None)
             self._executors.pop(run_id, None)
+            # 租约**先于**状态落库释放：释放它 = "这条 run 不再有执行者"，
+            # 而紧随其后的 `update_run` 才把 run 推进到释放点（paused/终态）。
+            # 顺序反过来的话，中间那一瞬会出现"状态还是 running、但已无执行者"，
+            # 正是僵尸的指纹 —— 虽然极短，但没必要制造。
+            await self._release_lease(run_id)
         await store.update_run(run_id, status=outcome)
         log.info("[%s] Worker 执行结束 -> %s", run_id, outcome)
 
@@ -187,6 +260,7 @@ class Worker:
             return
         ex = await self._build_executor(run_id, tenant, store)
         log.info("[%s] Worker 接单（resume）", run_id)
+        await self._claim_lease(run_id)
         self._executors[run_id] = ex
         self._tasks[run_id] = asyncio.create_task(self._execute(run_id, ex, tenant))
 
@@ -246,17 +320,20 @@ class WorkerPool:
         *,
         tenants_provider: Callable[[], Awaitable[list[str]]] | None = None,
         rescan_interval: float = 30.0,
+        lock=None,
     ) -> None:
         self._stores = store_resolver(store)
         self.queue = queue
         self.node_runner = node_runner
         self._tenants_provider = tenants_provider
         self._rescan_interval = rescan_interval
+        # 执行租约：池里每个 Worker 共用同一个 Lock 适配器（各自 token 不同，互不干扰）
+        self.lock = lock
         self._consumers: list[asyncio.Task] = []
 
     async def run_forever(self) -> None:
         # 全局 Worker：兜底未注册租户（dev）+ 兼容旧全局 topic
-        base = Worker(self._stores, self.queue, self.node_runner)
+        base = Worker(self._stores, self.queue, self.node_runner, lock=self.lock)
         self._consumers.append(asyncio.create_task(base.run_forever()))
         seen: set[str] = set()
         while True:
@@ -266,7 +343,8 @@ class WorkerPool:
                         if tid in seen:
                             continue
                         seen.add(tid)
-                        w = Worker(self._stores, self.queue, self.node_runner, tenant_id=tid)
+                        w = Worker(self._stores, self.queue, self.node_runner,
+                                   tenant_id=tid, lock=self.lock)
                         self._consumers.append(asyncio.create_task(w.run_forever()))
                         log.info("WorkerPool：已接入租户 %s 的消费循环", tid)
                 except Exception:
@@ -401,7 +479,8 @@ async def main(argv: list[str] | None = None) -> None:
         node_runner = await build_node_runner(settings, _FixedStores(bundle))
         log.info("Worker(tenant=%s, dsn 直连)：消费 %s / %s",
                  args.tenant, topic_trigger(args.tenant), topic_command(args.tenant))
-        await Worker(store, queue, node_runner=node_runner, tenant_id=args.tenant).run_forever()
+        await Worker(store, queue, node_runner=node_runner, tenant_id=args.tenant,
+                     lock=build_lock(settings)).run_forever()
         return
 
     # node_runner 装配（需 router 已建：per-tenant MCP store + agent 配置路由）。
@@ -411,7 +490,8 @@ async def main(argv: list[str] | None = None) -> None:
     if args.tenant:
         log.info("Worker(tenant=%s)：消费 %s / %s",
                  args.tenant, topic_trigger(args.tenant), topic_command(args.tenant))
-        await Worker(router, queue, node_runner=node_runner, tenant_id=args.tenant).run_forever()
+        await Worker(router, queue, node_runner=node_runner, tenant_id=args.tenant,
+                     lock=build_lock(settings)).run_forever()
         return
     active = await mgmt.list_tenants(status="active")
     if active:
@@ -420,10 +500,12 @@ async def main(argv: list[str] | None = None) -> None:
 
         log.info("WorkerPool 启动（queue=%s）：为 %d 个 active 租户起消费循环", settings.queue, len(active))
         await WorkerPool(router, queue, node_runner=node_runner,
-                         tenants_provider=_active_tenants).run_forever()
+                         tenants_provider=_active_tenants,
+                         lock=build_lock(settings)).run_forever()
         return
     log.warning("管理库暂无 active 租户且未指定 --tenant：退化为全局 topic Worker（单库 dev 形态）")
-    await Worker(router, queue, node_runner=node_runner).run_forever()
+    await Worker(router, queue, node_runner=node_runner,
+                 lock=build_lock(settings)).run_forever()
 
 
 if __name__ == "__main__":  # pragma: no cover

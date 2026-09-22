@@ -354,6 +354,10 @@ async def init() -> RunService:
             worker = WorkerPool(
                 stores_router, queue, node_runner=service.node_runner,
                 tenants_provider=_active_tenant_ids,
+                # 执行租约：与下面 `lock=build_lock(settings)` 给 RunService 的是
+                # **两个不同实例**（token 不同），这不冲突 —— 配额锁与执行租约
+                # 本来就是两把不同的锁（键名也不同）。
+                lock=build_lock(settings),
             )
             _worker_task = asyncio.create_task(worker.run_forever())
             print("[agentflow] run_mode=queue + memory：进程内 Worker 已启动")
