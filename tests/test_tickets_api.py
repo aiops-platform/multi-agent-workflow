@@ -30,6 +30,14 @@ nodes:
 edges: []
 """
 
+#: 一个**读工单里那份诊断**的图 —— 修复流程的形态（plan 靠它拿根因与方案）。
+READS_DIAGNOSIS_YAML = """
+name: fix-flow
+nodes:
+  plan: { agent: fix-planner, params: { rca: "$.inputs.bug_report.diagnosis.rca" } }
+edges: []
+"""
+
 
 def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
@@ -153,10 +161,10 @@ async def test_run_ticket_creates_run_and_links_back(stores) -> None:
 
 
 async def test_run_ticket_strips_diagnosis_from_run_inputs(stores) -> None:
-    """诊断是**产物**，不该回流成下一次 run 的输入。
+    """目标图**不读**诊断时，把它剥掉再下发（图读的情形见下一条）。
 
     工单详情页要显示 `bug_report.diagnosis`（建单节点写进去的），而工单的 inputs 又是下一次
-    run 的 inputs —— 不剥掉的话，`triage` / `logs` 的 `bug: "$.inputs.bug_report"` 会**整个
+    run 的 inputs —— 不剥的话，`triage` / `logs` 的 `bug: "$.inputs.bug_report"` 会**整个
     dict 交给模型**，于是重跑同一张单时模型先读到上一次的结论。
     """
     async with _client() as client:
@@ -218,6 +226,30 @@ async def test_run_ticket_uses_the_pinned_workflow_not_the_newest(stores) -> Non
             await client.post(f"/tickets/{pinned}/run", json={"workflow_id": "w-new"})
         ).json()
         assert out["workflow_id"] == "w-new"
+
+
+async def test_run_ticket_keeps_diagnosis_when_the_graph_reads_it(stores) -> None:
+    """图**读**它就别剥：修复流程的 plan 就是靠工单里那份诊断拿根因与方案的。
+
+    回归（run_12ebabdd80 实测）：`_run_inputs_from_ticket` 起初**无条件**剥掉
+    `bug_report.diagnosis`（理由是"诊断是产物，回流会锚定模型"），而
+    `problem-diagnose-fix` 恰恰把它当入参 —— 于是升级建出来的单点「发起」**必然挂在
+    plan 的 require 上**，报「未满足 require ['rca', 'solution']」，而工单里明明有诊断。
+    判据现在交给图自己（params 里引用了就留着），两条需求不再互相踩。
+    """
+    async with _client() as client:
+        await client.post(
+            "/workflows", json={"name": "fix-flow", "yaml": READS_DIAGNOSIS_YAML}
+        )
+        diag = {"rca": {"summary": "NPE"}, "plan": {"summary": "补判空"}}
+        t = await stores["ticket"].create(
+            "local",
+            title="升级建出来的单",
+            inputs={"bug_report": {**BUG_REPORT, "diagnosis": diag}},
+        )
+        out = (await client.post(f"/tickets/{t}/run", json={})).json()
+        run = next(r for r in (await client.get("/runs")).json() if r["run_id"] == out["run_id"])
+        assert run["inputs"]["bug_report"]["diagnosis"] == diag
 
 
 async def test_run_ticket_409_when_pinned_workflow_is_gone(stores) -> None:

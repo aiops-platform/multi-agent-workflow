@@ -717,17 +717,48 @@ def _ticket_inputs(req: TicketRequest) -> dict:
     return inputs
 
 
-def _run_inputs_from_ticket(ticket: dict) -> dict:
-    """工单 → 本次 run 的 inputs：**剥掉诊断结论**。
+def _consumes_diagnosis(workflow: Workflow) -> bool:
+    """这张图**读不读**工单里那份诊断（`$.inputs.bug_report.diagnosis.*`）。
 
-    `bug_report.diagnosis` 是**上一次 run 的产物**（建单节点写的，见
-    `ticket_store._ticket_fields_from_params`），留在工单里是为了详情页能显示它。
-    但工单的 inputs 会被原样当成下一次 run 的 inputs，而 workflow 里 `triage` / `logs` 的
-    params 是 `bug: "$.inputs.bug_report"` —— **整个 dict 交给模型**。
-    不剥掉的话，重跑同一张单时模型会先读到上一次的结论，问题已经变了也照着它走（锚定）。
-    **诊断是产物，不该回流成输入。**
+    判据是**图自己的 params 引用**，不由平台替它决定 —— 同一份诊断对不同的图是两个角色：
+
+    - 诊断流程（`problem-log-diagnose`）：它是**上一次的产物**。`triage` / `logs` 的
+      `bug: "$.inputs.bug_report"` 是整个 dict 交给模型，回流会给模型锚定（问题已经变了
+      也照着旧结论走）。
+    - 修复流程（`problem-diagnose-fix`）：它是**入参** —— `plan` 就靠它拿根因与方案，
+      剥掉 = 必然在 `require` 处 fail-fast。
+
+    所以"谁读谁自己声明"：params 里**显式引用**了就当它存在，没引用才剥。
+    （整包读 `bug_report` 的节点（`bug: "$.inputs.bug_report"`）**不算**引用 ——
+    它并不知道自己拿到了诊断，那正是要防的锚定。）
+    """
+    prefix = "$.inputs.bug_report.diagnosis"
+
+    def _hits(obj: Any) -> bool:
+        if isinstance(obj, str):
+            return obj.strip().startswith(prefix)
+        if isinstance(obj, dict):
+            return any(_hits(v) for v in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return any(_hits(v) for v in obj)
+        return False
+
+    return any(_hits(n.params) for n in workflow.dag.nodes.values())
+
+
+def _run_inputs_from_ticket(ticket: dict, workflow: Workflow) -> dict:
+    """工单 → 本次 run 的 inputs：目标图**不读**诊断时，才把 `bug_report.diagnosis` 剥掉。
+
+    `bug_report.diagnosis` 是建单节点写的（见 `ticket_store._ticket_fields_from_params`），
+    留在工单里是为了详情页能显示它；而工单的 inputs 会被原样当成下一次 run 的 inputs。
+    剥不剥由 :func:`_consumes_diagnosis` 按**目标图**判 —— 这条曾经写成无条件剥离，
+    理由是"诊断是产物、回流会锚定模型"，而修复流程恰恰把它当入参读，
+    于是升级建出来的单点「发起」**必然挂在 plan 的 require 上**（run_12ebabdd80 实测：
+    工单里有 diagnosis，run 的 inputs 里被剥没了）。**角色由图定，别替它决定。**
     """
     inputs = dict(ticket.get("inputs") or {})
+    if _consumes_diagnosis(workflow):
+        return inputs
     bug = inputs.get("bug_report")
     if isinstance(bug, dict) and "diagnosis" in bug:
         inputs["bug_report"] = {k: v for k, v in bug.items() if k != "diagnosis"}
@@ -888,8 +919,8 @@ async def run_ticket(
     组合端点，省掉前端「读工单 → 拼 inputs → POST /run → 回写关联」的往返。
     底层与 ``POST /run`` 共用 ``start_run``（配额/校验/租户语义一致）。
 
-    工单的 inputs 原样下发，**只有 `bug_report.diagnosis` 例外**——那是上一次 run 的产物，
-    回流会喂给模型（见 ``_run_inputs_from_ticket``）。
+    工单的 inputs 原样下发，**只有 `bug_report.diagnosis` 例外**——目标图不读它时剥掉
+    （见 ``_run_inputs_from_ticket``：读它的图，比如修复流程，会原样拿到）。
     用哪条 workflow 由 ``_workflow_for_ticket`` 定：**工单钉的优先于"最新一条"**。
     """
     cs = await _control_stores(ctx)
@@ -910,7 +941,7 @@ async def run_ticket(
 
     try:
         out = await _service().start_run(
-            ctx.tenant_id, workflow, _run_inputs_from_ticket(ticket)
+            ctx.tenant_id, workflow, _run_inputs_from_ticket(ticket, workflow)
         )
     except TenantQuotaExceeded as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
