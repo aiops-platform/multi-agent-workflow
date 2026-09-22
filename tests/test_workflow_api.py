@@ -161,3 +161,53 @@ async def test_preview_returns_graph_without_saving(ws) -> None:
         assert resp.json()["graph"]["name"] == "test-flow"
         # 预览不落库
         assert (await client.get("/workflows")).json() == []
+
+
+# ── PUT 的部分更新语义：不传 name 不该把名字冲掉 ──────────────────────
+#
+# 实测背景（2026-09-22）：两次"只改 YAML 注释"的 PUT 把 otr 两条 workflow 的名字
+# 双双抹成「未命名」。原因是 `WorkflowCreate.name` 有**默认值**「未命名」，
+# 于是"没传 name"与"显式传了未命名"不可区分，而 PUT 拿那个值**无条件覆盖**。
+# 症状直到有人打开 Workflow Studio 才被发现 —— **静默**。
+
+
+async def test_update_without_name_keeps_existing(ws) -> None:
+    """**只传 yaml 的 PUT 必须保留原名** —— 改注释不该顺手把名字冲掉。"""
+    async with _client() as client:
+        created = (await _create(client, VALID_YAML)).json()
+
+        resp = await client.put(f"/workflows/{created['id']}", json={"yaml": VALID_YAML})
+        assert resp.status_code == 200
+        assert resp.json()["name"] == "test-flow", "只改 yaml 的 PUT 把名字冲掉了"
+
+        got = (await client.get(f"/workflows/{created['id']}")).json()
+        assert got["name"] == "test-flow"
+
+        listed = [w for w in (await client.get("/workflows")).json() if w["id"] == created["id"]]
+        assert listed and listed[0]["name"] == "test-flow", "列表里也必须是原名"
+
+
+async def test_update_with_blank_name_keeps_existing(ws) -> None:
+    """显式传空串同样是"没提供" —— 归为保留原值，而不是写成空名。"""
+    async with _client() as client:
+        created = (await _create(client, VALID_YAML)).json()
+        resp = await client.put(
+            f"/workflows/{created['id']}", json={"name": "   ", "yaml": VALID_YAML}
+        )
+        assert resp.json()["name"] == "test-flow"
+
+
+async def test_update_falls_back_to_name_declared_in_yaml(ws) -> None:
+    """库里那行的 name 已经是空的（历史遗留）→ 退回 YAML 里声明的 `name:`。
+
+    这一档是给**已经被冲掉过**的行兜底的：它们的 name 列空了，但 YAML 里那份还在。
+    """
+    async with _client() as client:
+        created = (await _create(client, VALID_YAML)).json()
+        # 先把名字冲成空（模拟那次事故留下的行）
+        await client.put(f"/workflows/{created['id']}", json={"name": "", "yaml": VALID_YAML})
+        store = app_mod.workflow_store
+        await store.update(created["id"], "", VALID_YAML)
+
+        resp = await client.put(f"/workflows/{created['id']}", json={"yaml": VALID_YAML})
+        assert resp.json()["name"] == "test-flow", "空行应退回 YAML 里声明的 name"

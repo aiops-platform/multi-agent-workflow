@@ -138,6 +138,26 @@ class WorkflowCreate(BaseModel):
     yaml: str
 
 
+class WorkflowUpdate(BaseModel):
+    """``PUT /workflows/{id}`` 的请求体：**``name`` 是可选的**。
+
+    ⚠️ 与 `WorkflowCreate` 分开是必须的，不是洁癖。那边 `name` 有默认值
+    「未命名」，于是"没传 name"与"显式传了未命名"**不可区分** —— 而 PUT 先前
+    正是拿这个值**无条件覆盖**库里那一行。
+
+    后果实测过（2026-09-22）：两次只改 YAML 注释的 PUT 把 otr 两条 workflow 的
+    名字双双抹成「未命名」，**而且完全不报错** —— 直到有人打开 Workflow Studio
+    才发现列表里两条都叫"未命名"，而图里显示的又是 YAML 里的真名，
+    "同名不同名"。
+
+    判据：**「这个字段没被提供」必须能与「提供了空值」区分开**。做不到就说明这个
+    模型是给「创建」用的，不该拿来「部分更新」。
+    """
+
+    name: str | None = None
+    yaml: str
+
+
 class WorkflowPreviewRequest(BaseModel):
     yaml: str
 
@@ -509,17 +529,32 @@ async def get_workflow(wid: str, ctx: TenantContext = Depends(get_tenant_context
 
 @app.put("/workflows/{wid}")
 async def update_workflow(
-    wid: str, req: WorkflowCreate, ctx: TenantContext = Depends(get_tenant_context)
+    wid: str, req: WorkflowUpdate, ctx: TenantContext = Depends(get_tenant_context)
 ) -> dict:
-    """更新一条 workflow（校验 YAML 合法性）。"""
+    """更新一条 workflow（校验 YAML 合法性）。
+
+    ``name`` 未提供时**保留原值**；原值本就是空的再退回 YAML 里声明的 ``name:``。
+    这条是**刻意的部分更新语义**：只改 YAML 的调用方（改注释、调 params）不该
+    顺手把名字冲掉 —— 那件事发生过，代价是两条 workflow 变成「未命名」且无人察觉。
+    """
     try:
         wf = Workflow.load_yaml(req.yaml)
     except (ValueError, yaml.YAMLError, WorkflowDAGError) as exc:
         raise HTTPException(status_code=400, detail=f"Workflow 解析失败: {exc}") from exc
     cs = await _control_stores(ctx)
-    if not await cs.workflow.update(wid, req.name, req.yaml):
+    existing = await cs.workflow.get(wid)
+    if existing is None:
         raise HTTPException(status_code=404, detail="workflow 不存在")
-    return {"id": wid, "name": req.name, "graph": _workflow_graph(wf)}
+    # 三级回退：显式传的 > 库里原值 > YAML 里声明的。最后一档是为了救历史遗留的
+    # 空名字行（它们的 name 列已经空了，但 YAML 里那份还在）。
+    name = (
+        (req.name or "").strip()
+        or (existing.get("name") or "").strip()
+        or wf.name
+    )
+    if not await cs.workflow.update(wid, name, req.yaml):
+        raise HTTPException(status_code=404, detail="workflow 不存在")
+    return {"id": wid, "name": name, "graph": _workflow_graph(wf)}
 
 
 @app.delete("/workflows/{wid}")
