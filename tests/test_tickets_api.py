@@ -518,3 +518,53 @@ async def test_create_from_node_params_maps_bug_report_and_requires_source_ref(t
     # 缺 source_ref（幂等判据）→ 失败，而不是建一张无法去重的单
     with pytest.raises(ValueError, match="source_ref"):
         await create_from_node_params(ts, "otr", {"bug_report": {"number": "X"}})
+
+
+async def test_run_ticket_aligns_the_dispatched_ticket_number(stores) -> None:
+    """run 的入参里，`bug_report.number` 必须是**派单号**（工单自己的 number）。
+
+    实测（run_a80df3e5d3）：工单 ``number=INC-20260922-0002``（派单号），而载荷
+    ``bug_report.number=PR-20260922-0001``（问题单号，APM 侧用 ``rec["record_id"]`` 填的）。
+    `ticket-done` 按提示词取的是后者 → 回传端点只认派单号 → **404「没有持有工单 PR-…」**、
+    整条 run 红在最后一公里。"修复已完成、PR 也开了"，但原系统永远收不到。
+    """
+    async with _client() as client:
+        await client.post("/workflows", json={"name": "fix-flow", "yaml": READS_DIAGNOSIS_YAML})
+        other = {"bug_report": {**BUG_REPORT, "number": "PR-20260922-0001",
+                                "diagnosis": {"rca": {"summary": "x"}}},
+                 "number": "INC-20260922-0002"}
+        t = await _create(client, **other)
+
+        resp = await client.post(f"/tickets/{t['id']}/run")
+        assert resp.status_code == 200, resp.text
+        run_id = resp.json()["run_id"]
+        run = next(r for r in (await client.get("/runs")).json() if r["run_id"] == run_id)
+
+    bug = run["inputs"]["bug_report"]
+    assert bug["number"] == "INC-20260922-0002", "回传要的是派单号，run 里就得是它"
+    assert bug["problem_number"] == "PR-20260922-0001", "问题单号要留痕，别悄悄丢"
+    # 工单自己那份记录**不能被动过**（详情页显示的仍是原样）
+    stored = await stores["ticket"].get(t["tenant_id"], t["id"])
+    assert stored["inputs"]["bug_report"]["number"] == "PR-20260922-0001"
+    assert "problem_number" not in stored["inputs"]["bug_report"]
+
+
+async def test_run_ticket_same_number_needs_no_problem_number(stores) -> None:
+    """两个号**本来就一样**时（显式不传 → 建单接口从载荷兜底取）→ 什么都不改。
+
+    这是对齐逻辑的负向对照：只在"工单号 ≠ 载荷号"时才改写并留痕，别给每张单都塞一个
+    `problem_number`（那会把"两个号"这件事变成噪音，反而看不出哪里真的对不上）。
+    """
+    async with _client() as client:
+        await client.post("/workflows", json={"name": "simple-flow", "yaml": VALID_YAML})
+        t = await _create(client, number=None)  # 兜底取 bug_report.number
+        assert t["number"] == BUG_REPORT["number"]
+
+        resp = await client.post(f"/tickets/{t['id']}/run")
+        assert resp.status_code == 200, resp.text
+        run_id = resp.json()["run_id"]
+        run = next(r for r in (await client.get("/runs")).json() if r["run_id"] == run_id)
+
+    bug = run["inputs"]["bug_report"]
+    assert bug["number"] == BUG_REPORT["number"]
+    assert "problem_number" not in bug

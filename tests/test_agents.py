@@ -145,3 +145,79 @@ edges:
     assert ex.get_output("a").get("found") is False  # 负证据
     assert ex.get_output("a").get("error")
     assert ex.get_status("b") == "done"
+
+
+# ----------------------------------------------------------------------
+# 失败要留判据：AgentOutputError 带**头 + 尾 + 总长**
+# ----------------------------------------------------------------------
+def test_agent_output_error_keeps_head_and_tail() -> None:
+    """截断的断口在**尾部** —— 只留头，事后分不清"被截断"还是"JSON 写坏了"。
+
+    实测（run_3f977237be / run_74a0db73ae 的 review 节点，两次同一形态）：错误里只有
+    前 200 字符，看到的是 `{"approved": true, "comments": ["…编译无` 这种"合法开头"，
+    而**成因恰恰藏在被丢掉的那一段后面** —— 只能靠猜。现在尾部与总长都在。
+    """
+    from agentflow.agents.scopes import AgentOutputError
+
+    body = '{"approved": true, "comments": ["' + "长" * 400 + '编译无'
+    msg = str(AgentOutputError("reviewer", body))
+    assert "共 " in msg and str(len(body)) in msg, f"要带总长：{msg[:120]}"
+    assert msg.rstrip("'").endswith("编译无"), "尾部（截断断口）必须留下"
+    assert "中略" in msg, "长文本要标出省略了多少"
+    assert '"approved": true' in msg, "开头也要留（判断是不是 JSON 形状）"
+
+
+def test_agent_output_error_short_text_is_not_cluttered() -> None:
+    """短输出不必加尾 —— 全文都在，加省略标记只是噪音。"""
+    from agentflow.agents.scopes import AgentOutputError
+
+    msg = str(AgentOutputError("tester", "I could not finish."))
+    assert "中略" not in msg and "I could not finish." in msg
+
+
+# ----------------------------------------------------------------------
+# 输出上限必须**显式**给：不设就走 provider 默认，长回复被截在句子中间
+# ----------------------------------------------------------------------
+def test_models_send_explicit_max_tokens() -> None:
+    """两个模型构造处都要带上 `max_tokens`（配置驱动），别留给 provider 默认。
+
+    截断的下游表现是「未输出合法 JSON」，与"JSON 写坏"无法区分 —— 实测两次 review 挂掉
+    都是这个形态。显式设上限，它就从"隐式的 provider 默认"变成"配置里看得见的东西"。
+    """
+    from agentflow.agents.scopes import build_model, build_reasoning_model
+    from agentflow.config import Settings
+
+    s = Settings(deepseek_api_key="sk-test", deepseek_max_tokens=4096)
+    assert build_model(s).parameters.max_tokens == 4096
+    assert build_reasoning_model(s).parameters.max_tokens == 4096
+    # 无 key → 回退 ScriptedJsonModel（路径不变）
+    assert build_model(Settings(deepseek_api_key="")) is not None
+
+
+def test_extract_json_tolerates_raw_newlines_in_strings() -> None:
+    """字符串里的**裸换行**要能解析（`strict=False`），否则长中文散文必然被判非法。
+
+    实测（run_c2c44f9ff8 的 recap/postmortem）：1964 字符的输出头部尾部都完整合法
+    （尾部以 `"]}` 收口），坏在中间 —— 而模型写"复盘摘要/根因"这种散文时，
+    在字符串里直接换行是最常见的形态。RFC 8259 不许裸控制字符，但模型的**意图完全清楚**，
+    把它判成"没输出合法 JSON"是拿标准去惩罚一个不存在的歧义。
+    """
+    from agentflow.agents.scopes import extract_json
+
+    assert extract_json('{"summary": "第一行\n第二行"}') == {"summary": "第一行\n第二行"}
+    assert extract_json('{"a": "x\ty"}') == {"a": "x\ty"}
+    # 真正的残缺仍然判 None（放宽的是控制字符，不是结构）
+    assert extract_json('{"a": "没有闭合') is None
+
+
+def test_agent_output_error_keeps_raw_escapes() -> None:
+    """预览**不许折叠空白**：裸换行要显示成 `\\n`（而不是被压成空格）。
+
+    折叠过就分不清"字符串里裸换行"（写飞）与"合法的转义 `\\n`"（正常）——
+    而这两种的诊断结论完全相反。
+    """
+    from agentflow.agents.scopes import AgentOutputError
+
+    msg = str(AgentOutputError("postmortem", '{"summary": "第一行\n第二行"}'))
+    assert "\\n" in msg, f"裸换行要以 \\n 现形：{msg}"
+    assert "第一行 第二行" not in msg, "不许被折叠成一个空格"

@@ -2239,6 +2239,25 @@ VERDICT_FIELDS = {"tester": "passed", "reviewer": "approved", "ticket-done": "de
    `failed → issues → summary → note` 的**链尾是 `note`**，因为 `ticket-done` 的
    "为什么不交付"写在那儿。
 
+**同一族的另一半：产物字段**（`ARTIFACT_FIELDS`，本节之后补的，2026-09-22）。
+
+```python
+ARTIFACT_FIELDS = {"fix-implementer": "files_changed"}
+```
+
+| 判据 | 抓的是 | 实测 |
+|---|---|---|
+| `VERDICT_FIELDS` 结论字段为 `False` | 跑完了但**结论是"没通过/没交付"** | run_843dd83d86 / run_668981c0a7 |
+| `ARTIFACT_FIELDS` 声称产物而**无写操作支撑** | 跑完了但**东西根本没改** | run_fc9e158b55 |
+
+`fix-implementer` 是"没有结论字段可判"的那一类：它的输出 `required:
+["diff","files_changed"]`，于是写盘全失败时**模型只能编一份 diff 出来交差**
+（实测那轮它还自己承认了"diff 系手工构造"，而 `ws_git status` 已回了
+`nothing to commit`）。判据刻意窄 —— 只认"一次成功的写都没有，却声称改了东西"，
+不逐条核对路径（散文 vs 工具入参，拼法对不上会误判，而 `fix` 是 `on_failure: abort`）。
+判不了（拿不到流水、或有成功的 `sandbox_run_shell`）就不判，只记 warning。
+详见 CLAUDE.md §3.3。
+
 ### 13.3 三仓链路
 
 ```

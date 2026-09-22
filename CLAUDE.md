@@ -57,6 +57,16 @@ make lint      # ruff 检查
 
 1. **AgentScope 锁定 2.0.3**（design §5）。升级前必须重跑 S-001/S-011；升级后 streaming
    事件 API 可能变化。模型统一走 `agents/config`（DeepSeek `deepseek-v4-flash`）。
+   ⚠️ **输出上限必须显式设**（`deepseek_max_tokens`，默认 8192，两个 builder 都传
+   `Parameters(max_tokens=…)`）：不设就走 provider 默认，模型写长一点会被**截在句子中间**，
+   而下游只看到「agent 未输出合法 JSON」—— 与"JSON 写坏了"无法区分（实测 `reviewer`
+   两次挂在这上面：run_74a0db73ae / run_3f977237be，见 `docs/TODO.md` §32⑤）。
+   判据一句话：**任何"模型输出解析失败"的报错，都要能看出是断了还是写飞了**
+   （`AgentOutputError` 现在带头 + 尾 + 总长，且**不折叠空白** —— 裸换行显示 `\n`、
+   合法转义显示 `\\n`，这两种的诊断结论完全相反）。
+   **写飞**的那一类里，字符串裸换行最常见（长中文散文）：`extract_json` 用
+   `json.loads(strict=False)` 容忍它 —— RFC 8259 不许裸控制字符，但模型的意图毫无歧义，
+   拿标准去惩罚它只会把"散文换了行"变成整条 run 中止（实测 run_c2c44f9ff8 的 recap）。
 2. **基础设施可插拔**：StateStore/Queue/Lock 只通过 `agentflow/statestore|queue|lock/base.py`
    接口访问，配置驱动切换（`config.py`）。本地 InMemory/SQLite，生产 M6 接 Kafka/Postgres/Redis。
 3. **DAG 语义**（`core/dag.py`）：边带 `when`，join `any|all`，全 INACTIVE → SKIPPED 级联。
@@ -109,6 +119,32 @@ make lint      # ruff 检查
    > **副作用节点清单也要同步**：`SIDE_EFFECT_AGENTS` 判据是
    > 「**这个 agent 一旦重跑，外部世界会不会多一次可见的变化**」。
    > `ticket-done` 接上 MCP 写工具后即属此类（否则 resume/重放会**重复投递**）。
+
+3.3 **「声称改了」≠「真改了」：产物字段判失败**（`ARTIFACT_FIELDS`，同文件）
+
+   ```python
+   ARTIFACT_FIELDS = {"fix-implementer": "files_changed"}
+   ```
+
+   声称了非空产物、而本节点**连一次可能改动工作区的成功调用都没有** → 节点判 FAILED。
+   与 §3.2 同族、同一条理由（判定在 `on_failure` 之外、失败保留 `output` 作证据、
+   加一个 agent 就是加一条映射）。
+
+   实测（run_fc9e158b55）：沙箱不可达，9 次 `ws_write_file` **全失败**，而 fix agent
+   拿读到的源码**手工构造了一份 diff**、填上 `files_changed: [3 个文件]`、返回 `done` ——
+   那轮 `ws_git status` 已经回了 `nothing to commit`。**它没有结论字段可判**（§3.2 只管
+   tester/reviewer/ticket-done），而 schema `required: ["diff","files_changed"]` 逼它
+   编一个 diff 出来。这次是 tester 静态核对文件系统兜住的；没有那一步，run 会绿着、
+   什么都没交付。
+
+   - **判据刻意窄**：不逐条核对路径 —— `files_changed` 是模型写的散文，与工具入参的
+     path 拼法可以不同，而 `fix` 三个 seed 里都是 `on_failure: abort`，一次误判就中止整条
+     run。只认最没有歧义的那种形态：**一次成功的写都没有，却声称改了东西**。
+   - **证据只认 `result_state == "success"`**：失败的工具调用在流水里也有一行，那是反证。
+   - **判不了就不判**（记 warning）：拿不到流水（mock runner / 该节点没跑过）、或有成功的
+     `sandbox_run_shell`（`sed -i` 同样改文件，看不出来）。
+   - 证据取自 runner 的**跨 attempt 累计**视图（`peek_tool_calls`）—— `retry` 会覆盖
+     明细行，而"写过什么"是累计事实；否则重试后会把**已经改好的**树判成编造。
 
 4. **审批 CAS + 终态不可逆 + 时间原子判定**（`statestore/base.py:cas_update_approval`）。
    严禁绕过 CAS 改终态。CAS 除状态谓词外还带 `approval_time_guard` 时间谓词（§8.3.2）：
@@ -383,6 +419,23 @@ make lint      # ruff 检查
    - **worker Pod 加 sidecar + 共享卷**（`deploy/worker-deployment.yaml`），两容器同挂
      `/workspace`；worker 的 `AGENTFLOW_WORKSPACE_ROOT` 必须与沙箱 `SBX_WRITABLE`
      指向**同一挂载点**，否则写校验必失败。沙箱容器**零 `AGENTFLOW_*`**。
+     ⚠️ **"在白名单里" ≠ "在卷里"** —— 两条要分别满足。compose 只挂
+     `${HOME}/agentflow-workspace`（`docker-compose.yml` 的 `volumes`），而工作区根默认
+     是 `/tmp/agentflow-workspace`：它在 `SBX_WRITABLE` 里（白名单带 `/tmp`）、**不在卷里**。
+     两种平台各自演化成不同形态，**而两种情况下 `ws_write_file` 原先都回「新建 …（沙箱）」**：
+       - Linux：白名单放行 → 沙箱把文件写进**容器自己的 `/tmp`**，宿主侧工作区一点没变
+         （`written: true`，从头到尾没有任何异常可抓）；
+       - macOS：`_safe_path` 会 `.resolve()`，路径成了 `/private/tmp/…`，而容器侧白名单是
+         `/tmp`（容器里 `/tmp` 不是软链）→ 沙箱**拒写**，但拒写走的是
+         **HTTP 200 + `{"written": false}`**，旧客户端只看 `status_code` → 读成了成功。
+     现在三道拦网：客户端认 `written` 标志、`ws_write_file_sandboxed` **写后在本进程复读**
+     （看不到就报错，不报成功）、`_env_preflight` ③ **往返探针**（写进工作区根再读回来，
+     `make doctor` 会跑）。**判据：白名单回答"许不许写"，卷回答"写完谁看得见"。**
+     实测（2026-09-22，run_fc9e158b55）：`fix` 写了个寂寞 → `test` 拿到一个没改过的仓库 →
+     靠 tester 静态核对文件系统才发现；同日的 run_74a0db73ae 换根后一次跑通（沙箱里能看到
+     `otr/<run>/repos/order-service`、JUnit 报告与真跑出来的 rc=0）。
+     花括号别省：`AGENTFLOW_WORKSPACE_ROOT=${HOME}/…` —— python-dotenv 只展开 `${VAR}`，
+     裸 `$HOME` 原样保留（会得到字面量目录名 `$HOME`）。
    - **哪些工具经沙箱**（`agents/tools.WORKSPACE_SANDBOXED`）：
      `ws_write_file` / `ws_run_tests` **必须经**（它们执行仓库代码）；
      `ws_read_file` / `ws_list_files` **刻意不经**——诊断链的 `code-locator` 靠它们，
@@ -400,9 +453,19 @@ make lint      # ruff 检查
      命令里**不用写 `GRADLE_USER_HOME`** —— `Dockerfile.java21` 已 `ENV` 设成
      `/gradle-home`（缓存烤进镜像，挂卷反而遮蔽它）。实测 `./gradlew test --no-daemon -q`
      在工作区里 17 秒跑完、rc=0。
-   - **`ws_git` 一律带 `-c core.hooksPath=/dev/null`**：`git commit` 会执行仓库自带的
-     `pre-commit`，而 `.git/hooks/` 也在可写的工作区里——不堵就是"不可信仓库在持有
-     全部密钥的 worker 里执行任意代码"。
+   - **`ws_git` 一律带两个 `-c`（`core.hooksPath=/dev/null`、`core.editor=true`）**：
+     前者：`git commit` 会执行仓库自带的 `pre-commit`，而 `.git/hooks/` 也在可写的工作区里
+     ——不堵就是"不可信仓库在持有全部密钥的 worker 里执行任意代码"。
+     后者 + `stdin=DEVNULL` + `GIT_TERMINAL_PROMPT=0`（`gh` 另加 `GH_PROMPT_DISABLED=1`）+ 超时：
+     **git/gh 绝不能停在交互式输入上** —— `ws_git` 与 `ws_open_pr` 里的 `_run` **共用
+     同一份 `_subprocess_env()`**（各写一份必然漂移，漂移的那一半不会有任何提示）。
+     凭证那条尤其要注意：本机 `credential.helper` 为空时，`git push` over https 会去终端
+     问用户名 —— 所以启用 GitHub 远端前要么配 `gh auth setup-git`，要么就得靠这层兜底。
+     实测（run_63a334c90d）：模型把提交信息填在 `message=` 参数里（签名可见，`ToolSpec` 不做
+     参数 schema），而那个参数当时**只校验、不参与构造命令** → 真跑的是裸 `git commit` →
+     git 拉起 `vi` → vi 继承终端 stdin → **节点永久 running**：没有流水、没有报错、
+     run 行停在 `waiting_approval`。**判据：子进程继承终端 stdin 且没有超时 = 一条永久挂起
+     路径**，而挂起比报错难查得多（没有现场）。见 `docs/TODO.md` §23.5/§23.6。
    - **网络隔离在当前形态下做不到**（sidecar 与 worker 共享 netns；NetworkPolicy 按 Pod
      选且 hostNetwork 下不生效）。分叉与理由见 `docs/TODO.md` §3。
    - ActionExecutor 动作是**有限集合 + 白名单**（§10.3），新增动作需评审。
@@ -411,6 +474,18 @@ make lint      # ruff 检查
      **租户 deny 规则从未生效**。别照着这行写代码，见 `docs/TODO.md` §23.3。
    - SandboxClient 本地联调仍可经 `kubectl port-forward`（打进 Pod loopback，绑
      127.0.0.1 不受影响）。
+     ⚠️ 但**经它跑 `ws_write_file` 就不行**了：那个工具写完要在**自己的**文件系统里复读
+     一遍（判"两侧是不是同一个卷"），而 port-forward 打进的是 Pod 的卷、本机看不到 ——
+     于是 fail-closed 报"两侧挂的不是同一个工作区卷"。这是**设计内**的：那种形态下本机
+     确实改不到 Pod 里的代码，报成功才是骗人。要在本机改 Pod 里的代码，请用 sidecar 形态
+     （worker 与沙箱同 Pod 共享卷）。
+   - 顺带：`SandboxClient` 建 httpx 时是 `trust_env=False` —— **loopback sidecar 不该走
+     代理**。httpx 默认会认 `http_proxy`/`all_proxy` 且**不像 urllib 那样跳过 loopback**，
+     于是同一条 URL 在 worker 侧经代理、在 `_env_preflight`（走 urllib）侧直连，
+     **两处结论可以相反**。实测（2026-09-22，本机 `http_proxy=127.0.0.1:7890`）：经代理打
+     不通的端口得到**代理的 502**，直连得到 `httpx.ReadError`。另：`ReadError` 的 `str()`
+     是**空串** —— 工具文案只写 `{exc}` 会得到「沙箱写文件失败（…）: 」，冒号后什么都没有，
+     agent 拿它反复重试 9 轮也纠正不了。**错误文案一律带 `{type(exc).__name__}: {exc!r}`。**
 
 9.7 **PR 后端（gh CLI）—— 与沙箱同一类：机器相关、缺了静默断链**
 

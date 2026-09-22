@@ -68,6 +68,9 @@ def build_model(settings: Settings | None = None) -> ChatModelBase:
             base_url=settings.deepseek_base_url,
         ),
         model=settings.deepseek_model,
+        # 显式给输出上限：不设就走 provider 默认，长回复会被**截在句子中间**，而下游
+        # 只看到"未输出合法 JSON"（见 `deepseek_max_tokens` 的说明）。
+        parameters=OpenAIChatModel.Parameters(max_tokens=settings.deepseek_max_tokens),
         stream=True,
     )
 
@@ -93,7 +96,11 @@ def build_reasoning_model(settings: Settings | None = None) -> ChatModelBase:
             base_url=settings.deepseek_base_url,
         ),
         model=settings.deepseek_model,
-        parameters=DeepSeekChatModel.Parameters(thinking_enable=True),
+        parameters=DeepSeekChatModel.Parameters(
+            thinking_enable=True,
+            # 同上：输出上限必须显式给，别让 provider 默认把长回复截断
+            max_tokens=settings.deepseek_max_tokens,
+        ),
         stream=True,
     )
 
@@ -136,9 +143,22 @@ class AgentOutputError(RuntimeError):
     """
 
     def __init__(self, agent_name: str, text: str) -> None:
-        preview = " ".join((text or "").split())[:200]
+        # **头 + 尾 + 总长**，三样都要：只剩头会把唯一的判据丢掉。
+        # 实测（run_3f977237be / run_74a0db73ae 的 review 节点，两次同一形态）：输出是
+        # "合法开头、句中截断"，而错误里只有前 200 字符 —— 于是「被输出上限截断」与
+        # 「JSON 里混了未转义字符」两种成因事后**完全无法区分**，只能靠猜。
+        # 现在：截断看尾（`…编译无` 这种断口 + 总长），写飞看形状。
+        # ⚠️ **不做空白折叠**（`" ".join(text.split())` 那种）。折叠会把"字符串里裸换行"
+        # 这个**最常见的写飞形态**压成空格 —— 而那正是要看的证据：`repr` 下裸换行显示
+        # 成 `\n`，合法转义显示成 `\\n`，两者一眼可分。折叠过就再也没有区别了。
+        raw = text or ""
+        if len(raw) > 320:
+            preview = f"{raw[:200]!r}…[中略 {len(raw) - 320} 字符]…{raw[-120:]!r}"
+        else:
+            preview = repr(raw)
         super().__init__(
-            f"agent {agent_name} 未输出合法 JSON（§7 输出契约未满足）: {preview!r}"
+            f"agent {agent_name} 未输出合法 JSON（§7 输出契约未满足）"
+            f"（共 {len(raw)} 字符）: {preview}"
         )
         self.agent_name = agent_name
         self.text = text
@@ -169,6 +189,12 @@ def extract_json(text: str) -> dict | None:
     容忍 markdown 代码块与前后文噪音。返回 ``None``（而非 ``{}``）以区分
     「没有 JSON」与「JSON 恰好是空对象」——调用方据此决定失败语义
     （:func:`run_agent` 抛 AgentOutputError）。
+
+    ⚠️ 解析用 ``strict=False``：**允许字符串里出现裸控制字符**（换行/制表符）。
+    模型写长中文散文时极容易在字符串里直接换行，而 RFC 8259 不许 —— 严格解析会把
+    「意图完全清楚的 JSON」判成非法。实测（run_c2c44f9ff8 的 recap/postmortem）：
+    1964 字符的输出**头部与尾部都是完整合法的**（尾部以 ``"]}`` 收口），坏在中间 ——
+    正是这类"散文里换了行"。放宽容忍不会改变语义（裸换行就是字符串内容的一部分）。
     """
     if not text:
         return None
@@ -196,7 +222,7 @@ def extract_json(text: str) -> dict | None:
             if depth == 0:
                 raw = text[start : i + 1]
                 try:
-                    return json.loads(raw)
+                    return json.loads(raw, strict=False)  # 裸换行见 docstring
                 except json.JSONDecodeError:
                     return None
     return None

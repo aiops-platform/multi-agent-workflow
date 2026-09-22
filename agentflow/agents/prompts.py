@@ -406,7 +406,10 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "1. 关注正确性/安全性/回归风险\n"
         "2. 若 diff 为空/null → approved 必须为 false（无改动可审，不得默认放行）\n"
         "3. **最后一次回复必须只输出 JSON、不许再调工具**（轮次耗尽被截断会导致输出丢失）\n"
-        f"4. {_JSON_RULE}\n"
+        "4. `comments` **最多 3 条、每条 ≤ 100 字**，只讲判断依据与风险，**不要复述 diff**\n"
+        "   （写长了会在输出上限处被截断 → 整段 JSON 作废 → 节点失败、整条 run 中止；\n"
+        "   实测 run_3f977237be / run_74a0db73ae 的 review 都是这么挂的）\n"
+        f"5. {_JSON_RULE}\n"
         '{"approved": true|false, "comments": ["审查意见"], "risk": "low"|"medium"|"high"}'
     ),
     "committer": (

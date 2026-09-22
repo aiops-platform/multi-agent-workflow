@@ -205,11 +205,19 @@ def _env_preflight(settings) -> list[str]:
             # 而现象同样是"修复没落盘"
             allow = (body.get("limits") or {}).get("writable_allowlist") or []
             ws = str(settings.workspace_root)
+            allow_ok = True
             if allow and not any(ws == a or ws.startswith(a.rstrip("/") + "/") for a in allow):
+                allow_ok = False
                 problems.append(
                     f"沙箱的可写白名单 {allow} 不含工作区根 {ws}"
                     "（compose 的 sandbox.SBX_WRITABLE 要带上它）"
                 )
+            # 白名单过 ≠ 写得进去。白名单只证明"这个路径**允许**写"，不证明"写进去的东西
+            # **worker 看得见**"：卷没挂对时白名单照样通过（/tmp 就在白名单里），而写落在
+            # 容器自己的文件系统上 —— 静默（见 sandbox_workspace_roundtrip）。
+            # 白名单没过就不必再探：那条已经是根因，探针只会再报一句同样的话。
+            if allow_ok:
+                problems.extend(sandbox_workspace_roundtrip(url, settings.workspace_root))
 
     # ④ PR 后端（gh）：**和沙箱同一类** —— 机器相关、缺了不报错、只是闭环静默断掉
     #
@@ -275,6 +283,74 @@ def sandbox_image_preflight() -> list[str]:
             "而 agent 会拿着'沙箱不可用'反复试错直到耗尽轮次，报错里不会出现'镜像没建'"
         )
     ]
+
+
+def sandbox_workspace_roundtrip(url: str, workspace_root) -> list[str]:
+    """沙箱与 worker 是不是**同一份工作区**：经沙箱写一个探针文件，再在**本进程**读回来。
+
+    空列表 = 通。这条拦的是一类**别的检查都拦不住**的错配：工作区根落在
+    ``SBX_WRITABLE`` 白名单里、却**不在沙箱挂的那个卷里**。此时沙箱的写在**容器自己的
+    文件系统**上成功了（HTTP 200 + ``written: true``），宿主侧工作区却一点没变 ——
+    ``ws_write_file`` 报成功、``test`` 拿到一个没改过的仓库，全程没有一句报错。
+    实测（2026-09-22，run_fc9e158b55）：默认的 /tmp/agentflow-workspace 正是这个形状，
+    而 ``/health`` 通过、白名单检查也通过 —— ③ 里前面两条检查都拦不住它。
+
+    ⚠️ 比较的是**本进程**看到的文件系统。doctor/provision 与 worker 同机时，本进程就是
+    worker 那一侧；若在集群外经 ``kubectl port-forward`` 打 Pod 里的沙箱，则**判不了**
+    （文件在 Pod 的卷里，本机看不到）——那种形态的 worker 与沙箱同 Pod 共享卷，天然满足，
+    故这一条对它是误报；文案里写了怎么区分。
+    """
+    import urllib.request
+    import uuid
+    from pathlib import Path
+
+    root = Path(str(workspace_root))
+    probe = root / f".agentflow-probe-{uuid.uuid4().hex[:8]}"
+    payload = "agentflow sandbox probe\n"
+    try:
+        req = urllib.request.Request(
+            f"{url.rstrip('/')}/write",
+            data=json.dumps({"path": str(probe), "content": payload}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                body = json.loads(r.read().decode())
+        except Exception as exc:  # noqa: BLE001 - 任何失败都归为"探针写不进去"
+            return [
+                (
+                    f"沙箱写探针失败（{type(exc).__name__}: {exc!r}）→ 沙箱在执行写操作这一步"
+                    "就不可用（docker compose up -d sandbox；跨 Pod 用 port-forward）"
+                )
+            ]
+        # exec 服务的**拒写也是 HTTP 200**（`{"written": false, "error": "路径不在可写白名单…"}`），
+        # 只看状态码会把"被拒"读成"成功"。白名单那条检查理论上先拦过一遍，这里再兜一层。
+        if body.get("written") is not True:
+            return [
+                (
+                    f"沙箱拒绝写入工作区根 {root}（{body.get('error') or body}）"
+                    "→ 把它加进 compose 的 sandbox.SBX_WRITABLE"
+                )
+            ]
+        try:
+            seen = probe.read_text(encoding="utf-8") if probe.is_file() else None
+        finally:
+            probe.unlink(missing_ok=True)
+        if seen != payload:
+            return [
+                (
+                    f"沙箱写进 {root} 后**本进程读不到**"
+                    f"（{'内容不一致' if seen is not None else '文件不存在'}）"
+                    "—— 两侧挂的不是同一个工作区卷：AGENTFLOW_WORKSPACE_ROOT 必须落在 "
+                    "docker-compose.yml 里 sandbox 服务的 volumes 上（那边挂的是 "
+                    "${HOME}/agentflow-workspace）。不修的话 ws_write_file 报成功而工作区没变。"
+                    "（若你是在集群外经 kubectl port-forward 打 Pod 的沙箱，这条对你不适用："
+                    "那种形态 worker 与沙箱同 Pod 共享卷）"
+                )
+            ]
+    except Exception as exc:  # noqa: BLE001 - 探针自身出错也不能把 doctor 带崩
+        return [f"沙箱工作区往返探针自身出错（{type(exc).__name__}: {exc!r}）"]
+    return []
 
 
 def gh_preflight() -> list[str]:

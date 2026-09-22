@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     deepseek_api_key: SecretStr = Field(default=SecretStr(""), validation_alias=AliasChoices("AGENTFLOW_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"))
     deepseek_base_url: str = Field(default="https://api.deepseek.com/v1", validation_alias=AliasChoices("AGENTFLOW_DEEPSEEK_BASE_URL", "DEEPSEEK_BASE_URL"))  # 非密钥，保持 str
     deepseek_model: str = Field(default="deepseek-v4-flash", validation_alias=AliasChoices("AGENTFLOW_DEEPSEEK_MODEL", "DEEPSEEK_MODEL"))
+    #: 单次回复的**输出上限**（tokens）。**必须显式设**，不能留给 provider 的默认：
+    #: 模型写得长一点就会撞上那个默认、被**截在句子中间**，而下游看到的是
+    #: 「未输出合法 JSON」—— 与"JSON 写坏了"在现象上无法区分（实测 run_3f977237be 与
+    #: run_74a0db73ae 的 review 节点，两次同一形态，见 docs/TODO.md §32⑤）。
+    #: 8192 实测本 provider 接受（2026-09-22）；调小等于把截断风险放回来。
+    deepseek_max_tokens: int = Field(default=8192, validation_alias=AliasChoices("AGENTFLOW_DEEPSEEK_MAX_TOKENS", "DEEPSEEK_MAX_TOKENS"))
 
     # ---- StateStore ----
     state_store: str = "sqlite"  # sqlite | memory | postgres(M6)

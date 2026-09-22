@@ -751,7 +751,24 @@ def _consumes_diagnosis(workflow: Workflow) -> bool:
 
 
 def _run_inputs_from_ticket(ticket: dict, workflow: Workflow) -> dict:
-    """工单 → 本次 run 的 inputs：目标图**不读**诊断时，才把 `bug_report.diagnosis` 剥掉。
+    """工单 → 本次 run 的 inputs。两件事：**票号对齐** + 目标图不读诊断时剥掉它。
+
+    ## 票号对齐（2026-09-22）
+
+    工单自己的 ``number``（**派单号**，如 ``INC-20260922-0002``）与载荷里
+    ``bug_report.number``（**问题单号**，如 ``PR-20260922-0001`` —— APM 侧
+    ``_build_ticket(rec)`` 用的是 ``rec["record_id"]``）**是两个号**，而下游一直把它们当同一个：
+    `ticket-done` 的提示词写的是"``ticket_id`` 原样取自入参 ``ticket.number``（如 INC95528）"
+    —— 它要的一直是派单号。回传端点 ``records.find_by_ticket`` 也只认派单号（APM 那条记录的
+    evidence 里存的就是它），传问题单号过去必然 **404「没有持有工单 PR-… 的问题单」**
+    （接收端刻意"不建单、不猜"）。实测 run_a80df3e5d3：工单 ``number=INC-20260922-0002``
+    而载荷 ``bug_report.number=PR-20260922-0001`` → 回传 404、整条 run 红在最后一公里。
+
+    ⚠️ 改的是 **run 的入参副本**，**不动工单自己那份记录**（工单详情页仍显示原样）。
+    原问题单号保留在 ``bug_report.problem_number``（只在对不上时写）—— 两个号同源但用途不同，
+    留个痕，事后能分辨"这条 run 修的是哪个问题单"。
+
+    ## 诊断剥离
 
     `bug_report.diagnosis` 是建单节点写的（见 `ticket_store._ticket_fields_from_params`），
     留在工单里是为了详情页能显示它；而工单的 inputs 会被原样当成下一次 run 的 inputs。
@@ -761,11 +778,17 @@ def _run_inputs_from_ticket(ticket: dict, workflow: Workflow) -> dict:
     工单里有 diagnosis，run 的 inputs 里被剥没了）。**角色由图定，别替它决定。**
     """
     inputs = dict(ticket.get("inputs") or {})
-    if _consumes_diagnosis(workflow):
-        return inputs
     bug = inputs.get("bug_report")
-    if isinstance(bug, dict) and "diagnosis" in bug:
-        inputs["bug_report"] = {k: v for k, v in bug.items() if k != "diagnosis"}
+    if isinstance(bug, dict):
+        bug = dict(bug)  # 改副本：工单那份原样留着
+        number = str(ticket.get("number") or "").strip()
+        problem = str(bug.get("number") or "").strip()
+        if number and number != problem:
+            bug["problem_number"] = problem
+            bug["number"] = number
+        if not _consumes_diagnosis(workflow):
+            bug.pop("diagnosis", None)
+        inputs["bug_report"] = bug
     return inputs
 
 

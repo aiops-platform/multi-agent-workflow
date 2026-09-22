@@ -1242,3 +1242,185 @@ edges:
     with pytest.raises(WorkflowDAGError, match="next_workflow"):
         Workflow.load_yaml(yaml_text)
     assert Workflow.load_yaml(yaml_text, strict=False).dag is not None
+
+
+# ======================================================================
+# 产物守卫：声称改了文件，而本节点一次成功的写都没有（ARTIFACT_FIELDS）
+# ======================================================================
+#
+# 实测背景（run_fc9e158b55）：沙箱不可达，fix-implementer 的 9 次 ws_write_file 全失败
+# （fail-closed 是对的），它却手工构造了一份 diff、填 `files_changed: [3 个文件]`、
+# 返回 done —— 而当轮 `ws_git status` 已经回了 `nothing to commit, working tree clean`。
+# 那次是 tester 愿意静态核对文件系统才兜住；没有它，这条 run 会**绿着、什么都没交付**。
+
+ARTIFACT_YAML = """
+name: artifact
+version: "1.0.0"
+inputs: {}
+nodes:
+  fix:
+    agent: fix-implementer
+edges: []
+"""
+
+CLAIM = {
+    "diff": "--- a/A.java\n+++ b/A.java\n",   # 编出来的 diff（模型是照着源码手写的）
+    "files_changed": ["src/A.java", "src/B.java", "src/C.java"],
+    "explanation": "加空值校验",
+}
+
+
+def _tool_row(name: str, *, state: str, path: str = "src/A.java") -> dict:
+    """一条 tool_call 流水的**最小形态**（真身见 `agents/transcript.py:TraceRecorder`）。"""
+    return {
+        "kind": "tool_call",
+        "name": name,
+        "payload": {"result_state": state, "input": {"service": "order-service", "path": path}},
+    }
+
+
+class _ArtifactRunner:
+    """脚本化 runner：固定输出 + 固定工具流水。
+
+    `peek_tool_calls` 是**累计视图**（真身见 `AgentNodeRunner.peek_tool_calls`）；传 `None`
+    模拟"拿不到流水"（mock runner / 该节点没跑过）。
+    """
+
+    def __init__(self, output: dict, rows: list[dict] | None = None) -> None:
+        self.output = output
+        self.rows = rows
+
+    async def __call__(self, node, params) -> dict:
+        return dict(self.output)
+
+    def peek_tool_calls(self, node) -> list[dict] | None:
+        return self.rows
+
+
+async def _run_artifact(rows: list[dict] | None, output: dict | None = None) -> DAGExecutor:
+    wf = Workflow.load_yaml(ARTIFACT_YAML)
+    ex = DAGExecutor(
+        "run_art", "t", wf.dag, InMemoryStateStore(),
+        node_runner=_ArtifactRunner(CLAIM if output is None else output, rows),
+    )
+    with pytest.raises(WorkflowNodeFailed):
+        await ex.run()
+    return ex
+
+
+async def test_fabricated_artifacts_mark_node_failed() -> None:
+    """**复现 run_fc9e158b55**：声称改了 3 个文件，而 9 次写调用**全是 error** → 节点 failed。
+
+    证据只认 `result_state == "success"`：失败的工具调用在流水里同样有一行 ——
+    那是**反证**，不是证据。
+    """
+    rows = [_tool_row("ws_write_file", state="error") for _ in range(9)]
+
+    ex = await _run_artifact(rows)
+
+    assert ex.get_status("fix") == "failed", "产物对不上必须判 failed，不能绿着走完"
+    state = ex.node_states["fix"]
+    assert "产物不在" in state["error"], state["error"]
+    assert "3 个文件" in state["error"], state["error"]
+    # 失败也要**保留输出**作证据（与结论型失败同款：用户要看的就是那份编出来的 diff）
+    assert state["output"]["files_changed"] == CLAIM["files_changed"]
+
+
+async def test_artifacts_backed_by_successful_write_stay_done() -> None:
+    """有成功的写调用 → 节点 done（负向对照：守卫不该碰正常的修复）。"""
+    rows = [
+        _tool_row("ws_write_file", state="error"),          # 先失败过也没关系
+        _tool_row("ws_write_file", state="success", path="src/A.java"),
+    ]
+
+    wf = Workflow.load_yaml(ARTIFACT_YAML)
+    ex = DAGExecutor("run_art_ok", "t", wf.dag, InMemoryStateStore(),
+                     node_runner=_ArtifactRunner(CLAIM, rows))
+    assert await ex.run() == "done"
+    assert ex.get_status("fix") == "done"
+
+
+@pytest.mark.parametrize("tool", ["ws_write_file", "sandbox_write_file"])
+async def test_both_write_tools_count_as_evidence(tool: str) -> None:
+    """**两张写工具都算**：`fix-implementer` 同时注册了 `sandbox_write_file`，而它的
+    描述（"沙箱内写文件（writable_allowlist 内）"）比 `ws_write_file` 还诱人。
+
+    只认一张表 = 用另一张表改代码的**正常**修复会被判成编造，而 `fix` 是
+    `on_failure: abort` —— 一次误判就中止整条 run。
+    """
+    wf = Workflow.load_yaml(ARTIFACT_YAML)
+    ex = DAGExecutor(f"run_art_{tool}", "t", wf.dag, InMemoryStateStore(),
+                     node_runner=_ArtifactRunner(CLAIM, [_tool_row(tool, state="success")]))
+    assert await ex.run() == "done"
+
+
+async def test_sandbox_exec_makes_claims_unverifiable() -> None:
+    """成功的 `sandbox_run_shell`/`run_python` → **判不了，不判**。
+
+    `sed -i` 或重定向同样改工作区，只是从流水里看不出来 —— 判据（"一次成功的写都没有"）
+    不再成立。宁可漏判，也不要把合法的修复判成编造。
+    """
+    wf = Workflow.load_yaml(ARTIFACT_YAML)
+    ex = DAGExecutor("run_art_sh", "t", wf.dag, InMemoryStateStore(),
+                     node_runner=_ArtifactRunner(CLAIM, [_tool_row("sandbox_run_shell", state="success")]))
+    assert await ex.run() == "done"
+
+
+@pytest.mark.parametrize("output", [
+    {"diff": "…", "explanation": "没声称改了哪些文件"},      # 字段缺失
+    {"diff": "", "files_changed": [], "explanation": "什么都没改"},  # 声称了个空的
+])
+async def test_empty_claim_does_not_fail(output: dict) -> None:
+    """**判据单边定义**：只在"声称了非空产物"时才判 —— 与 `VERDICT_FIELDS` 的
+    「只认 `is False`」同源。字段缺失 / 空列表不判（那是输出契约该管的事）。"""
+    wf = Workflow.load_yaml(ARTIFACT_YAML)
+    ex = DAGExecutor("run_art_empty", "t", wf.dag, InMemoryStateStore(),
+                     node_runner=_ArtifactRunner(output, []))
+    assert await ex.run() == "done"
+
+
+async def test_missing_trace_is_unverifiable_not_a_conviction() -> None:
+    """拿不到工具流水（mock/脚本化 runner，或该节点没跑过）→ **不判**，只记 warning。
+
+    "没有流水"与"没有写过"是两件事：幂等命中直接复用结果时 runner 根本不会被调用
+    （`execute_with_idempotency` 命中即 return），那时流水为空而产物是真的。
+    """
+    wf = Workflow.load_yaml(ARTIFACT_YAML)
+    ex = DAGExecutor("run_art_nt", "t", wf.dag, InMemoryStateStore(),
+                     node_runner=_ArtifactRunner(CLAIM, None))
+    assert await ex.run() == "done"
+    assert ex.get_status("fix") == "done"
+
+
+async def test_fix_implementer_must_not_become_a_side_effect_agent() -> None:
+    """`fix-implementer` **不能**进 `SIDE_EFFECT_AGENTS` —— 那会让产物守卫判不了。
+
+    进了那张表就有了 `run_id:node_id` 确定性幂等键，重跑/续跑时**直接复用上次的输出**、
+    根本不调 runner → 工具流水为空 → 守卫只能"判不了"（见 `peek_tool_calls` 的说明）。
+    判据本身没错（复用的产物当初是真写过的），但守卫就白装了。
+    """
+    from agentflow.executor.dag_executor import SIDE_EFFECT_AGENTS
+
+    assert "fix-implementer" not in SIDE_EFFECT_AGENTS
+
+
+async def test_artifact_guard_ignores_on_failure_continue() -> None:
+    """`on_failure: continue` **不能**把"产物对不上"变回 DONE —— 判定在它的**外面**。
+
+    与 `test_negative_verdict_ignores_on_failure_continue` 同一个理由：放 runner 里抛会走
+    `on_error` → `on_failure: continue` 把它转成**负证据**、节点照样标 DONE，而那正是要
+    避免的"看着成功"。代价是：给这类 agent 写 `continue` 的图作者要接受这一种形态不生效
+    （见 `ARTIFACT_FIELDS` 的注释）。
+    """
+    yaml_text = ARTIFACT_YAML.replace("  fix:\n    agent: fix-implementer",
+                                      "  fix:\n    agent: fix-implementer\n    on_failure: continue")
+    assert "on_failure: continue" in yaml_text, "替换没生效，测的就不是这条规则了"
+
+    wf = Workflow.load_yaml(yaml_text)
+    ex = DAGExecutor(
+        "run_art_cont", "t", wf.dag, InMemoryStateStore(),
+        node_runner=_ArtifactRunner(CLAIM, [_tool_row("ws_write_file", state="error")]),
+    )
+    with pytest.raises(WorkflowNodeFailed):
+        await ex.run()
+    assert ex.get_status("fix") == "failed"

@@ -1473,7 +1473,10 @@ Worker 日志             →  [run_xxx] run 已终态，忽略 resume      ← 
 `sandbox_client` / `action_executor` **两个参数都没传**，于是
 `agents/tools.py:150` 的分支判断恒为假，L2 工具**根本不会被建出来**。
 
-### 23.5 `ws_git` 有两个**只校验、不生效**的参数
+### 23.5 ~~`ws_git` 有两个**只校验、不生效**的参数~~ ✅ 已修（2026-09-22）
+
+> **这条从"看着在把关"升级成了"把整条 run 挂死"** —— 详见下面「后果」。
+> 修法：`message` 真正生效（且 `args` 里的 `-m` 也照收），`remote` 删除。
 
 `agents/workspace_tools.py` 的 `ws_git(service, args, message="", remote="origin")`：
 
@@ -1491,8 +1494,62 @@ full = ["git", *args]          # ← message / remote 都没出现在这里
 `ToolSpec` 不做参数 schema，所以这两个参数对 LLM **是可见的**，模型会照着签名去填。
 与 §23 其余几条同族：**看着在把关，实际没把关**。
 
-改法二选一：让 `message` 真正生效（`sub == "commit"` 时由它拼 `-m`，并禁止 `args` 再带
-`-m`），或把两个参数都删掉、由 `args` 全权表达。**属独立缺陷，未与安全修复混提**。
+#### 后果：`commit` 节点永久卡在 `running`（run_63a334c90d）
+
+模型照签名填了 `message=`、**没在 args 里带 `-m`** → 真跑的是裸 `git commit` → git 拉起
+编辑器（`GIT_EDITOR`/`core.editor` 都没设 → `vi`）→ **`vi` 继承了终端 stdin，永远等键盘**：
+
+```
+uvicorn --reload → git -c core.hooksPath=/dev/null commit → vi …/.git/COMMIT_EDITMSG   （7 分 32 秒，一直挂着）
+```
+
+`ws_git` 的 `communicate()` 没有超时（`ToolSpec(…, timeout=120)` 是空转的，见 §23.6），
+于是节点没有流水、没有报错、run 行停在 `waiting_approval` —— 就是 §28 那个僵尸形态，
+**但成因在工具自己身上**。判据：**只要一个子进程继承终端 stdin 且没有超时，就是一条
+永久挂起路径**，而挂起比报错难查得多（没有任何现场）。
+
+#### 修法（已实施）
+
+四道保险，缺一不可（`_git_argv` + `ws_git`）：
+
+1. `message` 真的接进命令（args 里已带 `-m`/`--message`/`-F` 就不重复加）；`remote` 删掉。
+2. `-c core.editor=true` → 要编辑器的路径**立刻以空信息失败**，不拉 `vi`。
+3. `stdin=DEVNULL` + `GIT_TERMINAL_PROMPT=0` + `GIT_PAGER=cat` → **没有可读的终端**，
+   交互式子命令只能失败（`git push` 缺凭证同样会停在用户名提示上，这条一并堵住）。
+4. `_GIT_TIMEOUT_SEC=120` 超时 → kill + 抛错：**把"挂死"换成"响亮地失败"**。
+
+测试：`test_ws_git_commit_uses_the_message_parameter`（只传 `message=`，用 `wait_for` 兜住
+回归形态）、`test_git_argv_always_disables_hooks_and_editor`、`-F -` 走 stdin 的响亮失败。
+
+#### 同一套保险也补给了 `_run`（`ws_open_pr` 的执行器，2026-09-22 同日）
+
+`ws_open_pr` 内部跑命令用的是另一个辅助函数 `_run`（`git push`、`gh pr list/create`），
+它原先**也是**继承 stdin + 无超时 —— 同一个挂起形态，只是触发条件是**缺凭证**：
+`git push` over https 会去终端问用户名（实测本机 `credential.helper` 为空），`gh` 也会
+问"选哪个仓"。而这条路径恰恰是**第一次真跑 GitHub 远端时**才走到。现在两处共用
+`_subprocess_env()`（`GIT_TERMINAL_PROMPT=0` / `GIT_ASKPASS=true` / `GIT_PAGER=cat` /
+`GH_PROMPT_DISABLED=1`）+ `stdin=DEVNULL` + `_SUBPROC_TIMEOUT_SEC`。
+
+> 共用一份 env 是刻意的：两个消费方各写一份，漂移的那一半不会有任何提示 ——
+> 本仓为"两份实现"付过代价（`_mark_cancelled`，CLAUDE.md §11）。
+
+测试：`test_run_disables_all_interactive_prompts`（变异：删掉 env → 红）、
+`test_run_times_out_instead_of_hanging`（变异：删掉超时 → 30 秒后红）、
+`test_run_gives_subprocess_no_terminal`（只锁契约，**抓不住漏传 DEVNULL** —— 已注明）。
+
+### 23.6 `ToolSpec.timeout` **全仓零消费方** —— 声明了 120 秒，实际没有超时
+
+```python
+class ToolSpec:            # agents/tools.py:15
+    timeout: int = 30      # ← 没有任何地方读它
+```
+
+`grep -rn "spec.timeout"` 全仓零命中；`build_toolkit` 注册时也不传（`Toolkit(tools=…, mcps=…)`）。
+`level` / `needs_approval` 有消费方（API/UI 要用），`timeout` / `rate_limit` 没有 ——
+**与 §23.3 的 `ToolPolicy` 同族**：声明在那儿，看着像有约束，实际没有。
+
+§23.5 那个挂死能被"声明的 120 秒"拦住吗？不能 —— 拦住的必须是**代码里真的在等的那个超时**
+（`_GIT_TIMEOUT_SEC`）。**未修**（要么在注册处真正接线，要么把字段删掉别摆着）。
 
 ---
 
@@ -1787,3 +1844,118 @@ HTTP 500  耗时 10.02s     ← 正是那个 10.0s 轮询超时
 要么让 MCP server 侧持有租户→地址的映射。
 
 **现在不做**，但要把这个前提记下来：它会决定那张配置表长什么样。
+
+## 32. 沙箱链路的两道新拦网**各有边界**（产物守卫 / 往返探针）
+
+> 2026-09-22 记。本次为 run_fc9e158b55 加了两道拦网（`ARTIFACT_FIELDS` 产物守卫、
+> `_env_preflight` 的沙箱↔工作区往返探针，见 CLAUDE.md §3.3/§9.6）。它们**故意窄**，
+> 边界登记在此 —— 别把"没报"当成"没问题"。
+
+**① 写盘自校验只覆盖 `ws_write_file`。** `ws_write_file_sandboxed` 写完会在 worker 侧
+复读（判"两侧是不是同一个卷"）；而 L2 的 `sandbox_write_file` 只到
+`SandboxClient.write_file` 为止 —— 它现在会认沙箱回的 `written` 标志（**拒写**不再被读成
+成功），但**不做复读**，所以"写成功了、东西落在别处"这个形态经它改代码仍看不出来
+（`fix-implementer` 两张表都注册了）。环境层面的错配由 ③ 的探针兜住，但**单次调用**没有
+判据。要么把复读下沉到 client 层（client 不知道 worker 的工作区根，得加参数），要么把
+`sandbox_write_file` 从 fix 的工具表里去掉。**未做**。
+
+**② 产物守卫只判"一次成功的写都没有"。** "改了一部分"（声称 3 个、只成功了 1 个）不判 ——
+逐条核对路径的假阳性面太大（`files_changed` 是模型写的散文，工具入参是另一份字符串；
+而 `fix` 是 `on_failure: abort`，一次误判就中止整条 run）。那一层交给下游 `test` 核对工作区。
+
+**③ 往返探针只探工作区根一个路径**，且**在集群外经 port-forward 打 Pod 沙箱时会误报**
+（文件在 Pod 的卷里、本机看不到）—— 文案里写了怎么区分。K8s 形态 worker 与沙箱同 Pod
+共享卷，天然满足，不受影响。
+
+**④ `WorkspaceManager.__init__` 的默认值 `Path("/tmp/workspace")` 与 `config.py` 的
+`/tmp/agentflow-workspace` 不一致**（`workspace/manager.py:90`）。当前所有调用方都显式传
+`workspace_root`（`service.py:231` 传 settings、`workspace_tools._workspace_root()` 也传），
+所以这个默认值**到不了**运行期 —— 但它是个漂移面：将来有人直接 `WorkspaceManager(t, r)`
+就会落到另一个目录，且**没有任何提示**。**未做**（改默认值要连带看三个测试替身）。
+
+**⑤ ~~`reviewer` 的输出会被截断 → `AgentOutputError` → 整条 run 中止~~ ✅ 已修（2026-09-22，见下）**。
+实测 `run_74a0db73ae`（2026-09-22，验证本次沙箱修复时跑的）：
+`fix`/`test` 都过了（测试真跑、`rc=0`、JUnit `tests=5 failures=0`），而 `review` 判
+`执行失败（重试耗尽）: agent reviewer 未输出合法 JSON`，错误文本里那段 JSON 停在半句
+（`"已核对 QuotationException 定义（extends`）—— **模型把 `comments` 写得太长、输出被
+截断**，JSON 因此不合法。它声明了默认的 `on_failure: abort`，于是 run 就此中止，
+`commit`/`ticket-done` 都不执行 —— **工单不回传**。
+
+与 §10/§23 里那条 `code-locator` 的"未输出合法 JSON"**不是同一个成因**（那条是
+`Executed maximum iterations of reasoning-acting loop`，轮次耗尽）。这条更像输出长度上限：
+该节点 3 次 LLM 调用、`tokens=7000`。
+
+#### ✅ 已修（2026-09-22）：三处，先让它可诊断、再消因、最后降概率
+
+**复发过一次**（`run_3f977237be`，同日 07:50，同一个节点、同一形态）—— 所以不是偶发，
+按下面三条一起修了：
+
+1. **`AgentOutputError` 带 头 + 尾 + 总长**（`agents/scopes.py`）。原来只有 `[:200]` 的
+   头，而**成因恰恰藏在被丢掉的那一段后面**：「被输出上限截断」与「JSON 里混了未转义
+   字符」两种事后完全无法区分 —— 这条不补，后面两条只能靠猜。这一条是**下一步的判据**。
+2. **`max_tokens` 显式设**（`config.py:deepseek_max_tokens`，默认 8192；两个模型构造处
+   `build_model` / `build_reasoning_model` 都传 `Parameters(max_tokens=…)`）。
+   不设就走 provider 默认，长回复被**截在句子中间**。8192 实测该 provider 接受
+   （2026-09-22，直接打 `/chat/completions` 验的）。
+3. **`reviewer` 的输出约束**（内置提示词）：`comments` 最多 3 条、每条 ≤ 100 字、
+   **不要复述 diff** —— 从"输出小一点"这一侧降概率。otr 没有 DB 覆盖行，改内置的就生效
+   （有覆盖的租户要在 `agent_configs` 里同步改）。
+
+测试：`test_agent_output_error_keeps_head_and_tail`（变异：退回"只留头" → 红）、
+`test_models_send_explicit_max_tokens`（变异：`build_model` 不带 parameters → 红）。
+**仍未做**：parse 失败时的"修复轮"（把上次输出回喂给模型让它只补 JSON）—— 那是另一件事，
+且要先有 1 的判据才知道值不值得做。
+
+## 33. 工单回传用错了号：**派单号 ≠ 问题单号** ✅ 已修（2026-09-22）
+
+**现象**：`ticket-done` 报 `delivered=false`，工具回
+`HTTP 404 {"code":"NOT_FOUND","reason":"没有持有工单 PR-20260922-0001 的问题单"}` ——
+修复做完了、PR 也开了，**原系统永远收不到**。
+
+**根因**：一张升级工单上有**两个号**，而下游把它们当成了同一个：
+
+| 号 | 例子 | 出处 | 谁认它 |
+|---|---|---|---|
+| **派单号** | `INC-20260922-0002` | APM `problems.py:1225`（`next_ticket_number()`）→ 写进 agentflow 工单的 `number`，同时进 APM 记录的 evidence | `records.find_by_ticket`（**只认它**） |
+| **问题单号** | `PR-20260922-0001` | APM `problems.py:404`：`_build_ticket(rec)` 用 `rec["record_id"]` → 成了载荷里的 `bug_report.number` | `ticket-done` 的提示词（"ticket_id 原样取自入参 `ticket.number`，如 `INC95528`"）—— 它**要的本来是派单号** |
+
+`find_by_ticket` 只按 evidence 里的 `ticket_number`/`ticket_id`（或 `resolve_reason='escalated:<号>'`）
+匹配 → 传问题单号**必然 404**（接收端刻意"不建单、不猜"，见 `storage/records.py:108`）。
+实测 `run_a80df3e5d3`：工单 `number=INC-20260922-0002`、载荷 `bug_report.number=PR-20260922-0001`。
+**它影响的是所有从这张工单发起的 run**（那条工单的 `run_ids` 躺着 11 条，每条都会红在最后一公里）。
+
+**修法**（agentflow 侧，`api/app.py:_run_inputs_from_ticket`）：run 的**入参副本**里把
+`bug_report.number` 对齐成**工单自己的 `number`**（派单号），原问题单号留在
+`bug_report.problem_number`（**只在对不上时写**，免得每张单都多一个噪音字段）。
+**不动工单记录本身**（详情页仍显示原样）。测试：
+`test_run_ticket_aligns_the_dispatched_ticket_number`（变异：撤掉对齐 → 红）。
+
+**没做**：APM 侧 `find_by_ticket` 是否该顺带支持按 `record_id` **精确匹配** —— 那是另一个仓的
+设计决定（做了等于"问题单号也能反查到"）。当前只在**发起侧**对齐，回传契约不变。
+
+### 32⑥ ~~postmortem 的 JSON 里带裸换行~~ ✅ 已修（2026-09-22，同日第三例）
+
+**现象**：`run_c2c44f9ff8` 的 `recap` 报 `未输出合法 JSON（共 1964 字符）`。
+**这次能一眼定性，靠的正是同一天补的 ①**：错误里带上了**尾部**，而尾部是完整的
+`…保持稳定"]}` —— 所以**不是截断**，是 JSON 本身坏在**中间**。
+
+**根因**：`postmortem` 的字段全是长中文散文（`summary` / `root_cause` / `actions[]` /
+`followups[]`），模型**在字符串里直接换行** —— RFC 8259 不许裸控制字符，`json.loads` 因此报错。
+而它的**意图完全清楚**（那个换行就是字符串内容的一部分），用标准去惩罚一个不存在的歧义
+是错的。
+
+**修法**（两处，`agents/scopes.py`）：
+
+1. `extract_json` 用 `json.loads(raw, **strict=False**)` —— 允许字符串里的裸控制字符。
+   这是**放宽**，对合法 JSON 零影响（`abort` 类节点不再因为"散文换了行"整条 run 中止）。
+2. **错误预览不再折叠空白**。原来 `" ".join(text.split())` 会把"字符串里裸换行"压成空格
+   —— 而那正是最常见的写飞形态，压完就再也看不出来了。现在 `repr` 下**裸换行显示 `\n`、
+   合法转义显示 `\\n`**，两者一眼可分（诊断结论完全相反）。
+
+测试：`test_extract_json_tolerates_raw_newlines_in_strings`、
+`test_agent_output_error_keeps_raw_escapes`（两条都做了变异验证：撤掉 → 红）。
+
+> **同一条 run 的另一半是好消息**：它的 `ticket-done` 是 **done**，带回
+> `{"ticket_id": "INC-20260922-0002", "status": "resolved"}` —— APM 那条记录实测已
+> `state=resolved`、`reason=agentflow:resolved:INC-20260922-0002`、evidence 多了一条
+> `ticket_status/resolved`。**§33 的票号对齐端到端生效**，三仓闭环第一次真正合上。

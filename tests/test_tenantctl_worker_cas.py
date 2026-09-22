@@ -345,6 +345,12 @@ def test_preflight_ok_when_all_three_ready(monkeypatch) -> None:
     monkeypatch.setattr("urllib.request.urlopen", lambda url, timeout=0: _FakeResp(
         {"limits": {"writable_allowlist": ["/workspace", "/tmp", "/Users/someone/agentflow-workspace"]}}
     ))
+    # 往返探针单独测（文件末尾那组）：它要写一个真文件再读回来，用上面这个"对任何 URL 都回
+    # 同一个载荷"的替身会走进"写不回来"分支 —— 这里替身掉它，本用例只关心"三件套齐了"。
+    # gh 也替身掉：本用例的名字就是"三件套"，而 gh 是 ④（它与本机装没装 gh 无关才对，
+    # 不然回归信号会随开发机的环境时红时绿 —— §10 的"回归信号不可信"就是这么来的）。
+    monkeypatch.setattr(tenantctl, "sandbox_workspace_roundtrip", lambda *a, **k: [])
+    monkeypatch.setattr(tenantctl, "gh_preflight", list)
     assert tenantctl._env_preflight(_PreflightSettings()) == []
 
 
@@ -730,3 +736,91 @@ def test_preflight_puts_image_check_before_reachability(monkeypatch) -> None:
     i_url = next((i for i, p in enumerate(problems) if "不可达" in p), None)
     assert i_img is not None and i_url is not None, problems
     assert i_img < i_url, f"镜像检查应排在连通性之前，实际：{problems}"
+
+
+# ----------------------------------------------------------------------
+# 沙箱 ↔ worker 工作区往返探针（_env_preflight ③ 的最后一条）
+# ----------------------------------------------------------------------
+def _fake_write_server(root, *, land: bool = True):
+    """urlopen 替身：`/write` 时按 ``land`` 决定**要不要真落盘**。
+
+    `land=True` 模拟正常环境（沙箱与 worker 挂同一个卷）；`land=False` 模拟本次踩到的
+    形态：沙箱回了 `written: true`，而文件落在**别人**的文件系统上。``/health`` 一律回
+    含工作区根的白名单载荷，让前两条检查先过（本组用例测的是第三条）。
+    """
+    from pathlib import Path
+
+    def urlopen(req, timeout=0):
+        url = getattr(req, "full_url", req)
+        if isinstance(url, str) and url.endswith("/write"):
+            body = json.loads(getattr(req, "data", b"{}").decode())
+            if land:
+                p = Path(body["path"])
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(body["content"], encoding="utf-8")
+            return _FakeResp({"written": True, "path": body["path"]})
+        return _FakeResp({"limits": {"writable_allowlist": ["/workspace", str(root)]}})
+
+    return urlopen
+
+
+def _quiet_other_checks(monkeypatch, tenantctl_mod) -> None:
+    """把 ①②④ 打桩掉：本组只测 ③ 的往返探针，别的检查红不红与本组无关。"""
+    import contextlib
+
+    monkeypatch.setattr("socket.create_connection", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(tenantctl_mod, "gh_preflight", list)
+    monkeypatch.setattr(tenantctl_mod, "sandbox_image_preflight", list)
+
+
+def test_preflight_roundtrip_ok_when_same_volume(monkeypatch, tmp_path) -> None:
+    """沙箱写进去、本进程读得到 → 空列表，且**探针文件不留下**。"""
+    from agentflow import tenantctl
+
+    _quiet_other_checks(monkeypatch, tenantctl)
+    monkeypatch.setattr("urllib.request.urlopen", _fake_write_server(tmp_path))
+    assert tenantctl._env_preflight(_PreflightSettings(workspace_root=str(tmp_path))) == []
+    assert list(tmp_path.iterdir()) == [], "探针文件必须自己收干净"
+
+
+def test_preflight_reports_volume_not_shared(monkeypatch, tmp_path) -> None:
+    """**这条是本组存在的理由**：白名单过了、/health 也通了，而写进去的东西 worker 看不见。
+
+    实测（2026-09-22，run_fc9e158b55）：工作区根默认 /tmp/agentflow-workspace 在
+    SBX_WRITABLE 里、却不在 compose 挂的卷里 —— 于是 fix 的写落在容器自己的文件系统上，
+    `test` 拿到一个没改过的仓库，而全程没有一句报错。前两条检查都拦不住它。
+    """
+    from agentflow import tenantctl
+
+    _quiet_other_checks(monkeypatch, tenantctl)
+    monkeypatch.setattr("urllib.request.urlopen", _fake_write_server(tmp_path, land=False))
+    problems = tenantctl._env_preflight(_PreflightSettings(workspace_root=str(tmp_path)))
+    assert any("不是同一个工作区卷" in p for p in problems), problems
+    assert any("AGENTFLOW_WORKSPACE_ROOT" in p for p in problems), problems
+
+
+def test_roundtrip_reports_rejected_write(monkeypatch, tmp_path) -> None:
+    """沙箱**拒写**也是 HTTP 200 —— 探针要认 `written` 标志，不能只看状态码。"""
+    from agentflow import tenantctl
+
+    def urlopen(req, timeout=0):
+        url = getattr(req, "full_url", req)
+        if isinstance(url, str) and url.endswith("/write"):
+            return _FakeResp({"written": False, "error": "路径不在可写白名单: /x"})
+        return _FakeResp({"limits": {"writable_allowlist": ["/workspace", str(tmp_path)]}})
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    problems = tenantctl.sandbox_workspace_roundtrip("http://127.0.0.1:1", tmp_path)
+    assert any("拒绝写入" in p and "SBX_WRITABLE" in p for p in problems), problems
+
+
+def test_roundtrip_reports_unreachable_sandbox_plainly(monkeypatch, tmp_path) -> None:
+    """探针自己连不上 → 报"写探针失败"，**带上异常类型名**（`str(exc)` 可能是空的）。"""
+    from agentflow import tenantctl
+
+    def boom(req, timeout=0):
+        raise ConnectionResetError()
+
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    problems = tenantctl.sandbox_workspace_roundtrip("http://127.0.0.1:1", tmp_path)
+    assert any("ConnectionResetError" in p for p in problems), problems

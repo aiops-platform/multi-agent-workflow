@@ -129,6 +129,8 @@ class AgentNodeRunner:
         # 按 id(node) 分槽（并行波安全）：executor 跑完取走（pop）→ retry/resume 只留末次成功
         self._trace_by_node: dict[int, list[dict]] = {}
         self._usage_by_node: dict[int, dict] = {}
+        # 同上的分槽，但**跨 attempt 累计**且只收 tool_call 行（守卫用，见 peek_tool_calls）
+        self._tool_rows_by_node: dict[int, list[dict]] = {}
         # Agent 级启用推理的节点 → thinking-enabled DeepSeek 模型（懒构建缓存，见 _reasoning）
         self._reasoning_model: UsageTrackingModel | None = None
 
@@ -140,8 +142,27 @@ class AgentNodeRunner:
 
     def take_trace(self, node: Node) -> list[dict] | None:
         """pop 取走该节点的明细行（无 → None）。executor 在节点**成功与失败时都**调用
-        —— 失败时那份明细是判"输出为什么不可解析"的唯一现场（见 `_capture`）。"""
+        —— 失败时那份明细是判"输出为什么不可解析"的唯一现场（见 `_capture`）。
+
+        顺带把累计视图（`peek_tool_calls`）也 pop 掉：它的消费方（产物守卫）在落库之前
+        就读完了，留着只会让这份按 `id(node)` 分槽的地图在 Worker 进程里无界增长。
+        """
+        self._tool_rows_by_node.pop(id(node), None)
         return self._trace_by_node.pop(id(node), None)
+
+    def peek_tool_calls(self, node: Node) -> list[dict] | None:
+        """该节点**跨 attempt 累计**的 tool_call 明细行（只读，**不 pop**）。
+
+        给 executor 的产物守卫用（"声称改了文件，可有一次写成功过？"）。为什么不是
+        `take_trace` 的半个：那份是**末次 attempt** 的快照（`__call__` 入口清槽 +
+        `_capture` 整体赋值），而守卫要判的是"这个节点到底动没动过工作区" —— 累计事实。
+        也**不能**让守卫去 pop：落库（`_flush_node_trace`）在成功与失败两条路径上都要用它。
+
+        `None`/空 = **判不了**（runner 没跑过这个节点，如幂等命中直接复用结果），
+        不是"没写过" —— 消费方必须把这两件事分开。
+        """
+        rows = self._tool_rows_by_node.get(id(node))
+        return list(rows) if rows else None
 
     def take_usage(self, node: Node) -> dict | None:
         """pop 取走该节点的 {tokens,cost}。防并行 agent 波串扰 + 幂等节点无 key 返回 None。"""
@@ -229,6 +250,14 @@ class AgentNodeRunner:
                 + scan_denied_blocks(denied_ctx)
             )
             self._usage_by_node[key] = usage
+            # **累计**视图（守卫用，见 peek_tool_calls）：与上面的 `_trace_by_node` 区别只在
+            # 「覆盖 vs 累计」—— 落库的流水按既有语义只留末次 attempt，而"这个节点到底成功
+            # 写过哪些文件"是**累计事实**：上一次 attempt 写进盘的文件不会因为重试而消失。
+            # 不累计的话，`retry: 1` 的节点（三个 seed 的 fix 都是）在第二次 attempt 里
+            # 只要没再写一次，就会被判成"编造产物" —— 而那棵树其实已经改好了。
+            self._tool_rows_by_node.setdefault(key, []).extend(
+                r for r in recorder.rows if r["kind"] == K_TOOL_CALL
+            )
             log.info(
                 "agent[%s] -> %s (tokens=%s, cost=$%.6f)%s",
                 agent,

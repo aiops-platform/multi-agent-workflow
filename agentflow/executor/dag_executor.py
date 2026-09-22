@@ -95,6 +95,44 @@ SIDE_EFFECT_AGENTS = frozenset({"committer", "infra-remediator", "ticket-done"})
 #: 真能分开时再说；在那之前一律按"没交付"如实呈现。）
 VERDICT_FIELDS = {"tester": "passed", "reviewer": "approved", "ticket-done": "delivered"}
 
+#: 「声称改了」≠「真改了」：这几个 agent 的输出里有一个**产物字段**（声称改了哪些文件），
+#: 当它**非空**、而本节点**连一次可能改动工作区的成功调用都没有**时，节点判 **FAILED**（红）。
+#:
+#: ## 实测背景（run_fc9e158b55）
+#:
+#: 沙箱不可达，`fix-implementer` 的 9 次 `ws_write_file` **全部失败**（fail-closed 是对的），
+#: 它却拿已读到的源码**手工构造了一份 diff**、填上 `files_changed: [3 个文件]`、
+#: 返回 `status: done` —— 而当轮 `ws_git status` 已经回了
+#: `nothing to commit, working tree clean`。这次是 `tester` 愿意静态核对文件系统才兜住；
+#: 哪天 `test` 只跑测试（或那条边被跳过），这条 run 就会**绿着、且什么都没交付** ——
+#: 与上面的 `VERDICT_FIELDS` 是同一族（"看着成功"），只是它连"结论字段"都没有：
+#: 模型是被 schema 逼出来的（`fix-implementer` 的输出 `required: ["diff","files_changed"]`，
+#: 写盘失败时不编一个 diff 就满足不了契约）。
+#:
+#: ## 判据为什么这么窄
+#:
+#: 不逐条核对 `files_changed` 里的路径：那是**模型写的散文**，而工具入参里的 path 是另一份
+#: 字符串，拼法可以不同（绝对/相对、带不带前缀），而 `fix` 在三个 seed 里都是
+#: `on_failure: abort` —— 一次误判就中止整条 run。这里只认最没有歧义的那一种形态：
+#: **一次成功的写都没有，却声称改了东西**。"改了一部分"交给下游 `test` 核对工作区。
+#:
+#: ## 与 `on_failure` 的关系
+#:
+#: 同 `VERDICT_FIELDS`：判定在 `_run_with_retry` **之外**，所以 `on_failure: continue`
+#: **拦不住它**（放 runner 里抛会被转成负证据、节点照样 DONE）。图作者若给这类 agent 写
+#: `continue`，对这一种失败形态是不生效的 —— 这是刻意的（"没交付"不该被吞成绿）。
+#: 加一个 agent 就是加一条映射，别在别处写特判。
+ARTIFACT_FIELDS = {"fix-implementer": "files_changed"}
+
+#: 哪些工具算"写下了文件"（判据：它的入参里带着**目标路径**，成功即那份文件变了）。
+#: 加新的写工具时**必须**加进来，否则合法的修复会被判成编造（假阳性）。
+WORKSPACE_WRITE_TOOLS = frozenset({"ws_write_file", "sandbox_write_file"})
+
+#: 哪些工具**可能**间接改动工作区（`sed -i`、重定向、脚本生成代码……），但看不出来改没改。
+#: 有它们成功过 → 判据**不成立**（判不了，不判），因为"没写调用"不再等于"没改文件"。
+#: `sandbox_write_file` 不在这张表里：它入参带 path，属上面那张。
+SANDBOX_EXEC_TOOLS = frozenset({"sandbox_run_shell", "sandbox_run_python"})
+
 
 class WorkflowNodeFailed(Exception):
     """节点失败 → run 判 failed。
@@ -640,6 +678,64 @@ class DAGExecutor:
             output=output,
         )
 
+    def _raise_on_unsupported_artifacts(self, nid: str, agent: str, output: Any) -> None:
+        """agent **声称改了文件**、而本节点连一次可能改动工作区的成功调用都没有 → 判失败。
+
+        见 `ARTIFACT_FIELDS` 的实测背景与判据取舍。三条边界写在这里，读代码的人不必回头猜：
+
+        - **判不了就不判**：runner 没有 `peek_tool_calls`（mock/脚本化 runner）、或流水为空
+          （该节点没跑过 —— 幂等命中直接复用结果，或节点被取消）→ 只记 warning。
+          "没有流水"和"没有写过"是两件事，混为一谈会把复用结果的路径判成编造。
+        - **有成功的沙箱执行调用就不判**：`sandbox_run_shell`/`sandbox_run_python` 可能
+          `sed -i` 改了文件，只是看不出来 → 判据不成立（`SANDBOX_EXEC_TOOLS`）。
+        - **证据只认 `result_state == "success"`**：失败的工具调用在流水里同样有一行
+          （`result_state == "error"`），那是**反证**不是证据 —— 实测 run_fc9e158b55 的
+          9 行全是 error，正是靠这一点判出来的。
+        """
+        field = ARTIFACT_FIELDS.get(agent)
+        if not field or not isinstance(output, dict):
+            return
+        claimed = output.get(field)
+        if not isinstance(claimed, list) or not claimed:
+            return  # 未声称 / 声称了个空的 → 不判（判据单边定义）
+
+        peek = getattr(self.node_runner, "peek_tool_calls", None)
+        rows = peek(self.dag.nodes[nid]) if callable(peek) else None
+        if not rows:
+            log.warning(
+                "[%s] %s 声称改了 %d 个文件，但拿不到本节点的工具流水（runner 无 "
+                "peek_tool_calls 或该节点没跑过）→ **判不了，放行**",
+                self.run_id, nid, len(claimed),
+            )
+            return
+
+        written = 0
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("payload"), dict):
+                continue
+            payload = row["payload"]
+            if payload.get("result_state") != "success":
+                continue
+            name = row.get("name")
+            if name in SANDBOX_EXEC_TOOLS:
+                return  # 可能间接改了工作区 → 判不了
+            if name in WORKSPACE_WRITE_TOOLS:
+                written += 1
+        if written:
+            return
+
+        paths = "、".join(str(p) for p in claimed[:3]) + ("…" if len(claimed) > 3 else "")
+        raise WorkflowNodeFailed(
+            nid,
+            RuntimeError(f"{agent} 声称的产物无写操作支撑"),
+            message=(
+                f"节点 {nid}（agent {agent}）**跑完了但产物不在**：声称改了 "
+                f"{len(claimed)} 个文件（{paths}），而本节点**没有任何一次成功的写调用**"
+                "（写操作全失败了）—— 那份 diff 是编出来的，不是改出来的"
+            ),
+            output=output,
+        )
+
     async def _create_ticket(self, node: Node, params: dict) -> dict:
         """``kind: ticket`` 的节点动作：在租户库里建一张工单。
 
@@ -775,6 +871,9 @@ class DAGExecutor:
                     node, params, external_operation_id=self._external_operation_id(node, ctx)
                 )
                 self._raise_on_negative_verdict(nid, node.agent, output)
+                # 与上面那条同族、同在 `_run_with_retry` 之外：结论/产物对不上就判失败，
+                # `on_failure: continue` 拦不住（见 `ARTIFACT_FIELDS`）。
+                self._raise_on_unsupported_artifacts(nid, node.agent, output)
             state: dict = {"status": DONE, "output": output, "params": params}
             # 真实 node_runner（AgentNodeRunner）暴露 take_usage → 合并 token/cost 计量
             # （按节点 pop，防并行 agent 波串扰）；mock _default_runner 无该方法 → 保持无计量

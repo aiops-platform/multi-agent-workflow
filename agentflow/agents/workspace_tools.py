@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,13 @@ _TEST_TIMEOUT_SEC = 300
 
 # git 子命令白名单（§4.6：无 pull/fetch/reset——run 期间禁止漂移）
 _GIT_ALLOWED = {"status", "diff", "add", "commit", "push", "rev-parse", "branch", "checkout", "log"}
+
+#: `ws_git` / `ws_open_pr` 起的**子进程墙钟上限**（秒）。必须存在：git 与 gh 的若干路径
+#: 会停在交互式输入上（编辑器 / 凭证提示 / 分页器 / gh 的"选哪个仓"），没有它 = 节点
+#: **永久 running**（实测 run_63a334c90d：一个 `vi` 挂了 14 分钟）。
+#: 与 `ToolSpec("ws_git", …, timeout=120)` 声明的值取齐 —— 但那个声明**全仓零消费方**
+#: （见 `docs/TODO.md` §23.6），真正生效的是这里。
+_SUBPROC_TIMEOUT_SEC = 120
 
 
 class WorkspaceToolError(RuntimeError):
@@ -149,7 +157,12 @@ async def ws_write_file(service: str, path: str, content: str) -> dict:
 
 
 async def ws_write_file_sandboxed(sandbox, service: str, path: str, content: str) -> dict:
-    """经沙箱写工作区内文件（沙箱与 worker 挂**同一个卷**，路径两侧一致）。"""
+    """经沙箱写工作区内文件（沙箱与 worker 挂**同一个卷**，路径两侧一致）。
+
+    那个"同一个卷"**是被检查的前提，不是假设**（见下面写后复读）：它不成立时，沙箱会在
+    **容器自己的文件系统**上把文件写得好好的、回一句 `written: true`，而 worker 侧的工作区
+    一点没变 —— 于是 `ws_git` / `tester` / `committer` 看到的还是改之前的代码，全程无报错。
+    """
     if len(content.encode("utf-8")) > _MAX_WRITE_BYTES:
         raise WorkspaceToolError(f"写入超限（>{_MAX_WRITE_BYTES} bytes）")
     repo = _resolve_repo(service)
@@ -158,13 +171,48 @@ async def ws_write_file_sandboxed(sandbox, service: str, path: str, content: str
     try:
         await sandbox.write_file(str(target), content)
     except Exception as exc:  # noqa: BLE001 —— 统一转成工具错误，带上"沙箱不可达"的判据
+        # 带上**类型名 + repr**：`str(httpx.ReadError(""))` 是空串，只写 `{exc}` 会得到
+        # 「沙箱写文件失败（…）: 」——冒号后什么都没有。实测 run_fc9e158b55：agent 拿着这句
+        # 反复重试 9 轮，既无从自我纠正，事后也判不出是 RST / 超时 / 还是别的。
         raise WorkspaceToolError(
-            f"沙箱写文件失败（沙箱不可达时**不会**回退到 worker 本地执行）: {exc}"
+            "沙箱写文件失败（沙箱不可达时**不会**回退到 worker 本地执行）"
+            f"（{type(exc).__name__}: {exc!r}）"
         ) from exc
+    await _verify_visible_to_worker(target, content, repo)
     return {
         "path": path, "created": not existed, "bytes": len(content.encode("utf-8")),
         "summary": f"{'新建' if not existed else '覆盖'} {path}（沙箱）",
     }
+
+
+async def _verify_visible_to_worker(target: Path, content: str, repo: Path) -> None:
+    """沙箱写完，**在 worker 侧复读一次**：看不到就报错，绝不报成功。
+
+    为什么必须有这一步：工具层"成功"的判据原来只有"沙箱 HTTP 回来了"。而**两侧不是同一个
+    卷**时（实测 2026-09-22：compose 只挂 `${HOME}/agentflow-workspace`，而工作区根默认是
+    `/tmp/agentflow-workspace` —— 它在可写白名单里，却不在卷里），沙箱把文件写进了容器自己的
+    文件系统，宿主侧什么都没变，调用方却收到一句「新建 …（沙箱）」。后果不是"报了个失败"，
+    是**整条修复链看的是改之前的代码**：`test` 拿假失败、`commit` 提交空 diff。
+    与 §3.2「写盘失败不许报成功」同族，只是判据从"HTTP 成功"换成"**我看得见**"。
+
+    有界重试 2 次：写是经宿主文件系统落盘的，理论上立刻可见；重试只为兜住跨文件系统视图
+    （virtiofs 属性缓存之类）的短暂滞后 —— 而这条路径上的**假失败**代价很高（`fix` 是
+    `on_failure: abort`，一次误报就中止整条 run）。
+    """
+    want = content.encode("utf-8")
+    for attempt in range(2):
+        seen = target.read_bytes() if target.is_file() else None
+        if seen == want:
+            return
+        if attempt == 0:
+            await asyncio.sleep(0.05)
+    raise WorkspaceToolError(
+        f"沙箱写文件返回成功，但 worker 侧看不到（{target}，"
+        f"期望 {len(want)} bytes，实际 {'无此文件' if seen is None else f'{len(seen)} bytes'}）"
+        "—— **两侧挂的不是同一个工作区卷**：工作区根必须落在沙箱挂载的那个卷里"
+        f"（compose 挂的是 ${{HOME}}/agentflow-workspace，当前仓库: {repo}）。"
+        "不修的话工作区一点没变而这里报成功，下游 test/commit 全在改之前的代码上跑。"
+    )
 
 
 def _fail_closed_ws_tool(name: str, original):
@@ -254,8 +302,11 @@ async def ws_run_tests_sandboxed(sandbox, service: str, timeout: int = _TEST_TIM
     try:
         res = await sandbox.run_shell(cmd, cwd=str(repo), timeout=timeout)
     except Exception as exc:  # noqa: BLE001
+        # 同 ws_write_file_sandboxed：`str(exc)` 可能是空的（httpx 的 ReadError 就是），
+        # 只写 `{exc}` 等于把原因吞掉。带类型名 + repr。
         raise WorkspaceToolError(
-            f"沙箱执行测试失败（沙箱不可达时**不会**回退到 worker 本地执行）: {exc}"
+            "沙箱执行测试失败（沙箱不可达时**不会**回退到 worker 本地执行）"
+            f"（{type(exc).__name__}: {exc!r}）"
         ) from exc
     return _test_result(
         cmd, res.rc, res.timed_out, (res.stdout or "") + (res.stderr or ""), where="沙箱"
@@ -294,10 +345,83 @@ def _truncate(text: str, limit: int) -> tuple[str, bool]:
     return f"{text[:limit]}\n... [输出被截断，省略 {omitted} 字符] ...", True
 
 
-async def ws_git(service: str, args: list[str], message: str = "", remote: str = "origin") -> dict:
+def _subprocess_env() -> dict[str, str]:
+    """跑 git / gh 时的环境：**让一切交互式输入变成失败**。
+
+    光给 `stdin=DEVNULL` 还不够明确 —— 这些开关是"别问，直接失败"的显式声明，
+    两条一起才把"挂死"变成"响亮地失败"：
+
+    - ``GIT_TERMINAL_PROMPT=0``：缺凭证时**不要**在终端上问用户名，直接报错。
+      实测本机 `credential.helper` 为空，没这一条，第一次 `git push` over https 就会挂。
+    - ``GIT_ASKPASS=true``：凡走 askpass 的路径也让它"什么都不给"。
+    - ``GIT_PAGER``/``PAGER=cat``：分页器同样会停在输入上。
+    - ``GH_PROMPT_DISABLED=1``：gh 的交互提示（"选哪个仓库"、确认类）一律改成失败。
+      `ws_open_pr` 里有一半调用要**把 stdout 当 JSON 解析**，提示混进来就是解析崩。
+
+    两个消费方（`ws_git`、`_run`）**共用这一份**：分开写必然漂移，而漂移的那一半
+    没有任何提示 —— 本仓为"两份实现"付过代价（`_mark_cancelled`，见 CLAUDE.md §11）。
+    """
+    return {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "true",
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
+        "GH_PROMPT_DISABLED": "1",
+        "GH_NO_UPDATE_NOTIFIER": "1",
+    }
+
+
+def _git_argv(args: list[str]) -> list[str]:
+    """构造 git 命令行。两个 ``-c`` 都是**安全项**，谁都不能拿掉：
+
+    - ``core.hooksPath=/dev/null``：**禁用仓库自带的 hook**。仓库内容不可信（沙箱写进去的、
+      来自工单定位到的代码），而 ``.git/hooks/`` 也在工作区里、同样可写 —— 不堵就是
+      "不可信仓库在持有全部密钥的 worker 里执行任意代码"。用 ``core.hooksPath`` 而不是
+      ``--no-verify``：后者只跳过 commit 的两个 hook，挡不住 ``pre-push`` 等其余钩子。
+    - ``core.editor=true``：任何"需要编辑器"的路径立刻以空信息失败，而不是拉起 ``vi`` 等键盘。
+
+    ``-c`` 是全局选项，**必须排在子命令之前**。
+    """
+    return ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.editor=true", *args]
+
+
+def _commit_message_in_args(args: list[str]) -> bool:
+    """``args`` 里是否已经带了提交信息（``-m`` / ``--message`` / ``-F`` / ``--file``）。
+
+    含 ``-m"信息"`` 这种贴在一起的写法（git 认），也含 ``--message=`` 形式。
+    """
+    return any(
+        a in ("-m", "-F")
+        or a.startswith(("-m", "--message", "-F", "--file"))
+        for a in args
+    )
+
+
+async def ws_git(service: str, args: list[str], message: str = "") -> dict:
     """在工作区执行 git 子命令（白名单 + 版本冻结语义，§4.6/§8.7）。
 
     ``pull``/``fetch``/``reset`` 不在白名单——run 期间工作区 HEAD 必须等于 base_sha。
+
+    ## 绝不允许 git 停在交互式输入上（实测 run_63a334c90d）
+
+    那次 `commit` 节点**永久卡在 running**，进程树是
+    ``uvicorn → git -c core.hooksPath=/dev/null commit → vi …/.git/COMMIT_EDITMSG``：
+    调用方把提交信息填在 ``message`` 参数里（签名里有它，模型就那么填），而本函数
+    **只校验、不参与构造命令**（`docs/TODO.md` §23.5）→ 真跑的是裸 ``git commit``
+    → git 拉起编辑器 → ``vi`` 继承终端 stdin → ``communicate()`` 永不返回。
+    节点没有流水、没有报错、run 行停在 `waiting_approval`（§28 的僵尸形态）。
+
+    四道保险，缺一不可：
+    1. ``message`` **真的接进命令**（args 里已带就不重复加）；
+    2. ``-c core.editor=true``：任何"要编辑器"的路径**立刻**以空信息失败，而不是等人敲键盘；
+       用命令行 ``-c``（排在子命令前）而不是改仓库配置 —— 优先级更高，恶意仓库覆盖不掉；
+    3. ``stdin=DEVNULL`` + ``GIT_TERMINAL_PROMPT=0``（``push`` 缺凭证时同样会停在
+       用户名提示上）+ 关掉分页器：**没有可读的终端，交互式子命令只能失败**；
+    4. 有界超时（``_SUBPROC_TIMEOUT_SEC``）→ kill 并抛错：把"挂死"换成"响亮地失败"。
+
+    ⚠️ 别把这里的 ``message`` 再改回"只校验"：那个参数的可见性来自函数签名
+    （`ToolSpec` 不做参数 schema），模型**看得见就会填**。
     """
     repo = _resolve_repo(service)
     if not args:
@@ -307,25 +431,33 @@ async def ws_git(service: str, args: list[str], message: str = "", remote: str =
         raise WorkspaceToolError(
             f"git 子命令不在白名单: {sub!r}（禁止 pull/fetch/reset——§4.6 版本冻结）"
         )
-    if sub == "commit" and not message:
-        raise WorkspaceToolError("git commit 需要 message")
+    if sub == "commit" and not (_commit_message_in_args(args) or message):
+        # 两种传法都收（`['commit','-m','…']` 与 `message='…'`）：签名上摆着 message，
+        # 提示词里写的是 `-m`，**模型两条路都会走**，只认一条就是给自己埋雷。
+        raise WorkspaceToolError(
+            "git commit 需要提交信息：args 里带 `-m <信息>`，或用 `message=` 参数"
+        )
+    if sub == "commit" and not _commit_message_in_args(args):
+        args = [*args, "-m", message]
 
-    # ⚠️ `core.hooksPath=/dev/null`：**禁用仓库自带的 hook**。
-    #
-    # 仓库内容是不可信的（沙箱写进去的、来自工单定位到的代码），而 `.git/hooks/`
-    # 也在工作区里、同样可写。`git commit` 会执行 `pre-commit` / `commit-msg`，
-    # `git push` 会执行 `pre-push` —— 恶意仓库因此能在 **worker 容器里**执行任意代码，
-    # 而 worker 持有 DeepSeek key / DB DSN / MCP 凭证 / git PAT。这条正好绕过
-    # "写和测试进沙箱"的隔离，所以必须堵。
-    #
-    # 用 `core.hooksPath` 而不是 `--no-verify`：后者只跳过 commit 的两个 hook，
-    # 挡不住 `pre-push` 等其余钩子。`-c` 是全局选项，**必须排在子命令之前**。
-    full = ["git", "-c", "core.hooksPath=/dev/null", *args]
+    # 两个 `-c` 安全项的由来见 `_git_argv`。
+    full = _git_argv(args)
+    # stdin 给 /dev/null：git（及其拉起的编辑器/凭证提示/分页器）**没有终端可读**，
+    # 遇到要输入的地方只能立刻失败 —— 这是"挂死"与"响亮地失败"之间的分水岭。
     proc = await asyncio.create_subprocess_exec(
-        *full, cwd=str(repo),
+        *full, cwd=str(repo), env=_subprocess_env(),
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
-    out, _ = await proc.communicate()
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_SUBPROC_TIMEOUT_SEC)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise WorkspaceToolError(
+            f"git {' '.join(args)} 超时（>{_SUBPROC_TIMEOUT_SEC}s）已中止 —— "
+            "该子命令多半停在交互式输入上（编辑器 / 凭证提示 / 分页器）"
+        ) from None
     text = out.decode("utf-8", "replace")
     if proc.returncode != 0:
         raise WorkspaceToolError(f"git {' '.join(args)} 失败: {text[:300]}")
@@ -440,12 +572,27 @@ async def _run(repo: Path, argv: list[str], *, check: bool = True) -> str:
     的远端」就是一条），一并进来就成了"JSON 开头多了一段英文"——
     ``json.loads`` 报 ``Expecting value: line 1 column 1``，**现场完全看不出是 stderr 混进来了**。
     实测：run_d595720e5b 的 commit 节点连试三次都是这个错。
+
+    ⚠️ **与 `ws_git` 同一套挂起保险**（2026-09-22 补，`_subprocess_env` + DEVNULL + 超时）：
+    这里跑的是 `git push` 与 `gh`。缺凭证时 git 会**在终端上问用户名**（实测本机
+    `credential.helper` 为空）、gh 会**问"选哪个仓库"** —— 而 stdin 一旦继承又没有超时，
+    就是又一条"节点永久 running"（`ws_git` 那次是一个 `vi` 挂了 14 分钟，见 §23.5）。
+    这条路径第一次真跑 `git push` over https 的时候最容易撞上。
     """
     proc = await asyncio.create_subprocess_exec(
-        *argv, cwd=str(repo),
+        *argv, cwd=str(repo), env=_subprocess_env(),
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
-    out, err = await proc.communicate()
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=_SUBPROC_TIMEOUT_SEC)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise WorkspaceToolError(
+            f"{' '.join(argv[:2])} 超时（>{_SUBPROC_TIMEOUT_SEC}s）已中止 —— "
+            "多半停在交互式输入上（凭证提示 / gh 的选择提示）"
+        ) from None
     text = out.decode("utf-8", "replace")
     detail = err.decode("utf-8", "replace")
     if check and proc.returncode != 0:

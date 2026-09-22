@@ -271,8 +271,7 @@ async def test_ws_git_disables_repo_hooks(tmp_path: Path, monkeypatch) -> None:
     try:
         (repo / "a.txt").write_text("y", encoding="utf-8")
         await ws_git(service, ["add", "a.txt"])
-        # message 是 ws_git 的签名参数（只被校验、不参与构造命令，见 TODO §23.5），
-        # 提交信息实际由 args 里的 -m 提供——这里按现状传，别把两件事混在一个提交里
+        # 两种传法都收（args 里的 `-m` 与 `message=`）——这里同时给，验证不会重复加 -m
         out = await ws_git(service, ["commit", "-m", "改一下"], message="改一下")
     finally:
         exec_context.current_run.reset(tok_run)
@@ -282,6 +281,79 @@ async def test_ws_git_disables_repo_hooks(tmp_path: Path, monkeypatch) -> None:
     # 正常提交不受影响（不是把 commit 一起禁掉了）
     assert out["rc"] == 0
     assert "改一下" in git("log", "-1", "--pretty=%s", cwd=repo)
+
+
+def test_git_argv_always_disables_hooks_and_editor() -> None:
+    """两个 `-c` 是**安全项**，谁都不能拿掉；且 `-c` 必须排在子命令**之前**（git 的规矩）。
+
+    `core.editor=true` 是 2026-09-22 加的：run_63a334c90d 的 `commit` 节点被一个
+    `vi …/.git/COMMIT_EDITMSG` 永久卡住（`git commit` 没带 `-m` → git 拉起编辑器 →
+    vi 继承终端 stdin）。编辑器变成 `true` 之后，这类路径只会**立刻失败**，不会挂。
+    """
+    from agentflow.agents.workspace_tools import _git_argv
+
+    argv = _git_argv(["commit", "-m", "x"])
+    assert argv[0] == "git"
+    assert "core.hooksPath=/dev/null" in argv
+    assert "core.editor=true" in argv
+    assert argv.index("core.editor=true") < argv.index("commit"), "-c 是全局选项，必须在子命令前"
+
+
+async def test_ws_git_commit_uses_the_message_parameter(tmp_path, monkeypatch) -> None:
+    """`message=` **必须真的进命令** —— 实测 run_63a334c90d 就是这条挂死的。
+
+    模型按**签名**填了 `message=`（`ToolSpec` 不做参数 schema，签名对 LLM 可见），而函数
+    只校验、不参与构造命令（`docs/TODO.md` §23.5）→ 真跑的是裸 `git commit` → git 拉起
+    编辑器 → 节点永久 running、流水一行都没有、run 行停在 `waiting_approval`。
+    这里只传 `message=`、args 里**不带** `-m`，正是模型当时的传法。
+    """
+    import asyncio
+
+    from agentflow.agents.workspace_tools import ws_git
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    try:
+        (repo / "a.txt").write_text("y", encoding="utf-8")
+        await ws_git(service, ["add", "a.txt"])
+        # wait_for 兜住回归形态：万一又变成"等编辑器"，超时 → 红，而不是把测试挂死
+        await asyncio.wait_for(ws_git(service, ["commit"], message="fix: 空值守卫"), timeout=20)
+    finally:
+        _reset(toks)
+
+    assert git("log", "-1", "--pretty=%s", cwd=repo) == "fix: 空值守卫"
+
+
+@pytest.mark.parametrize("args", [["commit"], ["commit", "-a"], ["commit", "--amend"]])
+async def test_ws_git_commit_without_message_is_rejected(args, tmp_path, monkeypatch) -> None:
+    """没有任何提交信息 → **报错**，而不是让 git 去开编辑器。"""
+    from agentflow.agents.workspace_tools import WorkspaceToolError, ws_git
+
+    service, _repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(WorkspaceToolError, match="需要提交信息"):
+            await ws_git(service, list(args))
+    finally:
+        _reset(toks)
+
+
+async def test_ws_git_stdin_message_fails_loudly(tmp_path, monkeypatch) -> None:
+    """`-F -`（从 stdin 读提交信息）→ **响亮失败**，不挂。
+
+    stdin 是 /dev/null，git 拿到空信息直接非零退出。与 `core.editor=true`、
+    `_GIT_TIMEOUT_SEC` 一起，三条路都堵上：没有哪条能停在交互输入上。
+    """
+    import asyncio
+
+    from agentflow.agents.workspace_tools import WorkspaceToolError, ws_git
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    try:
+        (repo / "a.txt").write_text("y", encoding="utf-8")
+        await ws_git(service, ["add", "a.txt"])
+        with pytest.raises(WorkspaceToolError, match="失败"):
+            await asyncio.wait_for(ws_git(service, ["commit", "-F", "-"]), timeout=20)
+    finally:
+        _reset(toks)
 
 
 # ----------------------------------------------------------------------
@@ -355,19 +427,47 @@ def test_test_cmd_returns_configured(monkeypatch) -> None:
 # 写 / 测试必须经沙箱；读刻意不经（诊断链不该被沙箱拖住）
 # ----------------------------------------------------------------------
 class _FakeSandbox:
+    """一个**行为正确**的沙箱：它真的把文件写进工作区。
+
+    为什么必须真写：`ws_write_file_sandboxed` 写完会在 worker 侧复读一次（判"两侧是不是
+    同一个卷"），只记 `{"ok": True}` 而不落盘的假沙箱等于模拟"写到了别处"——那是**故障**形态，
+    该由 `_WriteNowhere` 表达。这个替身代表的是正常环境：沙箱与 worker 挂同一个卷。
+    """
+
     def __init__(self) -> None:
         self.writes: list[tuple[str, str]] = []
         self.runs: list[tuple[str, str | None]] = []
 
     async def write_file(self, path: str, content: str) -> dict:
         self.writes.append((path, content))
-        return {"ok": True}
+        # 照 exec_service.write_file 的真实动作来（含建父目录），别让替身比真身"弱"：
+        # 少一步就会让被测代码在别的分支上报错，测出来的东西就跑了偏。
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return {"written": True, "path": path}
 
     async def run_shell(self, cmd: str, *, cwd=None, timeout: int = 300):
         from types import SimpleNamespace
 
         self.runs.append((cmd, cwd))
         return SimpleNamespace(rc=0, stdout="BUILD SUCCESSFUL", stderr="", timed_out=False)
+
+
+class _WriteNowhere:
+    """沙箱**收下了写、回了成功**，而工作区里什么都没有 —— 两侧不是同一个卷。
+
+    这正是 2026-09-22 的实测形态（run_fc9e158b55 的近亲）：沙箱把文件写进了容器自己的
+    文件系统，宿主侧工作区一点没变，而调用方收到的是成功。工具层必须自己发现这件事。
+    """
+
+    async def write_file(self, path: str, content: str) -> dict:
+        return {"written": True, "path": path, "bytes": len(content.encode("utf-8"))}
+
+    async def run_shell(self, cmd: str, *, cwd=None, timeout: int = 300):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(rc=0, stdout="", stderr="", timed_out=False)
 
 
 class _UnreachableSandbox:
@@ -451,6 +551,28 @@ async def test_write_goes_through_sandbox(tmp_path, monkeypatch) -> None:
     assert path == str(repo / "src/A.java"), f"沙箱侧路径不一致（两侧挂同一卷）: {path}"
     assert content == "class A {}"
     assert "沙箱" in out["summary"]
+
+
+async def test_sandbox_write_invisible_to_worker_is_an_error(tmp_path, monkeypatch) -> None:
+    """沙箱报成功、worker 侧看不到 → **必须报错**，不许返回成功。
+
+    实测背景（2026-09-22）：compose 只挂 `${HOME}/agentflow-workspace`，而工作区根默认是
+    `/tmp/agentflow-workspace`（它在可写白名单里、却不在卷里）。沙箱于是把文件写进了
+    **容器自己的文件系统**，宿主侧工作区一点没变 —— 而 `ws_write_file` 回的是
+    「新建 …（沙箱）」。后果不是"报了个失败"，是 `test` 拿假失败、`commit` 空 diff：
+    **整条修复链看的是改之前的代码，全程无报错**。
+    """
+    from agentflow.agents.workspace_tools import WorkspaceToolError
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(WorkspaceToolError, match="不是同一个工作区卷"):
+            await _tool("ws_write_file", _WriteNowhere())(
+                service=service, path="src/A.java", content="class A {}"
+            )
+    finally:
+        _reset(toks)
+    assert not (repo / "src/A.java").exists(), "假沙箱本就没落盘——这条测的正是'报成功但没落盘'"
 
 
 async def test_tests_go_through_sandbox_with_configured_cmd(tmp_path, monkeypatch) -> None:
@@ -669,3 +791,53 @@ async def test_ws_open_pr_ignores_gh_stderr(tmp_path, monkeypatch) -> None:
         _reset(toks)
     assert out["pr_number"] == 9, "stderr 不该污染 stdout 的 JSON"
     assert any("list" in c for c in calls)
+
+
+# ----------------------------------------------------------------------
+# `_run`（ws_open_pr 用的执行器）同样不许停在交互输入上
+# ----------------------------------------------------------------------
+# 为什么单独测这个私有函数：它跑的是 `git push` 与 `gh`，而"缺凭证时 git 会在终端上
+# 问用户名"这条路径**没法用真 git 复现**（要真有个需要认证的远端）。这里测的是
+# 它赖以不挂的三个开关本身，值不值得单测见 run_63a334c90d 那次 14 分钟的挂死。
+async def test_run_gives_subprocess_no_terminal() -> None:
+    """stdin 是 /dev/null：要读输入的命令**立刻失败**，而不是等着人敲键盘。
+
+    `read x` 在 EOF 上返回非零 —— 换成真终端的话它会一直等，正是我们要防的那件事。
+
+    ⚠️ **这条抓不住"忘了传 DEVNULL"**：pytest 自己的 stdin 本来就不是 tty，去掉
+    `stdin=DEVNULL` 这里照样会 EOF。它锁的是"子进程拿不到任何输入"这个**契约**，
+    tty 场景靠的是那三个环境开关（下一条用例，那条能抓住变异）。
+    """
+    import asyncio
+
+    from agentflow.agents.workspace_tools import WorkspaceToolError, _run
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(WorkspaceToolError, match="失败"):
+        await _run(Path("/tmp"), ["sh", "-c", "read x"])
+    assert loop.time() - started < 5, "应该立刻失败，而不是等输入"
+
+
+async def test_run_disables_all_interactive_prompts() -> None:
+    """两个"别问、直接失败"的开关真的到了子进程环境里（git 凭证 / gh 提示）。"""
+    from agentflow.agents.workspace_tools import _run
+
+    out = await _run(Path("/tmp"), ["sh", "-c",
+                                    "echo $GIT_TERMINAL_PROMPT/$GH_PROMPT_DISABLED/$GIT_PAGER"])
+    assert out.strip() == "0/1/cat", out
+
+
+async def test_run_times_out_instead_of_hanging(monkeypatch) -> None:
+    """超时 → kill + 抛错。没有它，"停住"就是永久（节点永远 running、run 卡死）。"""
+    import asyncio
+
+    from agentflow.agents import workspace_tools
+    from agentflow.agents.workspace_tools import WorkspaceToolError, _run
+
+    monkeypatch.setattr(workspace_tools, "_SUBPROC_TIMEOUT_SEC", 0.3)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(WorkspaceToolError, match="超时"):
+        await _run(Path("/tmp"), ["sh", "-c", "sleep 30"])
+    assert loop.time() - started < 5, "应该在超时点附近就返回，而不是等命令自己结束"

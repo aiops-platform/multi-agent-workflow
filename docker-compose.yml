@@ -151,6 +151,13 @@ services:
       # 那边走 sidecar 共享 netns，不经过端口发布（见 deploy/worker-deployment.yaml）。
       SBX_HOST: "0.0.0.0"
     volumes:
+      # ⚠️ **这个卷就是 worker 的 `AGENTFLOW_WORKSPACE_ROOT`**（两侧同路径读写同一份）。
+      # 只进 `SBX_WRITABLE` 白名单是不够的：路径没挂进容器时，沙箱的写落在**容器自己的
+      # 文件系统**上，宿主侧工作区一点没变，而 `ws_write_file` 报的是成功 —— **静默失效**。
+      # 实测（2026-09-22，run_fc9e158b55）：工作区根默认是 /tmp/agentflow-workspace，
+      # 它**只**在白名单里（SBX_WRITABLE 带 /tmp）、**不在**这个卷里，于是 fix 写了个寂寞、
+      # test 拿到一个没改过的仓库。改 .env 的 AGENTFLOW_WORKSPACE_ROOT 时要与这里对齐；
+      # `_env_preflight` 的往返探针（写进工作区根、worker 侧读回）会当场抓住不一致。
       - ${HOME}/agentflow-workspace:${HOME}/agentflow-workspace
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:44772/health')\" || exit 1"]

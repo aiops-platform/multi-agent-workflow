@@ -188,3 +188,65 @@ async def test_build_toolkit_l2_absent_without_executor() -> None:
     schemas = await tk.get_tool_schemas()
     names = [s["function"]["name"] for s in schemas]
     assert "sandbox_run_python" not in names
+
+
+# ======================================================================
+# SandboxClient：把"沙箱回的 200"翻译成**正确的成功/失败**
+# ======================================================================
+async def test_client_write_file_rejects_silent_refusal() -> None:
+    """exec 服务的**拒写也是 HTTP 200**（`{"written": false, "error": …}`）。
+
+    只看状态码会把"被拒"读成"成功"：`ws_write_file` 于是回一句「新建 X（沙箱）」，
+    而工作区里什么都没有 —— 又一条**静默成功**，且它不需要任何环境错配，只要工作区根
+    不在 `SBX_WRITABLE` 里就会发生（实测 2026-09-22 的 run_fc9e158b55 就是这条链）。
+    判据必须单边：**只认 `written` 为 true**。
+    """
+    import httpx
+
+    from agentflow.errors import DataSourceError
+    from agentflow.sandbox.client import SandboxClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/write"
+        return httpx.Response(200, json={"written": False, "error": "路径不在可写白名单: /x"})
+
+    c = SandboxClient("http://127.0.0.1:1")
+    await c._client.aclose()   # 换成假传输（httpx 标准姿势）：本用例不该真的连沙箱
+    c._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(DataSourceError, match="路径不在可写白名单"):
+            await c.write_file("/x", "y")
+    finally:
+        await c.aclose()
+
+
+async def test_client_write_file_passes_through_on_success() -> None:
+    """负向对照：真的写了（`written: true`）→ 原样返回，不误报。"""
+    import httpx
+
+    from agentflow.sandbox.client import SandboxClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"written": True, "path": "/x", "bytes": 1})
+
+    c = SandboxClient("http://127.0.0.1:1")
+    await c._client.aclose()
+    c._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        assert (await c.write_file("/x", "y"))["written"] is True
+    finally:
+        await c.aclose()
+
+
+def test_client_does_not_use_env_proxy() -> None:
+    """沙箱是 loopback sidecar，**不该走代理**（`trust_env=False`）。
+
+    httpx 默认 `trust_env=True`，会认 `http_proxy`/`all_proxy`，而且**不像 urllib
+    那样跳过 loopback** —— 于是同一条 URL 在 worker 侧经代理、在 `_env_preflight`
+    （走 urllib）侧直连，**两处结论可以相反**。实测（2026-09-22，本机有
+    `http_proxy=127.0.0.1:7890`）：经代理打不通的端口得到**代理的 502**，直连得到
+    `httpx.ReadError`（其 `str()` 是空串，会把错误文案的原因吞掉）。
+    """
+    from agentflow.sandbox.client import SandboxClient
+
+    assert SandboxClient("http://127.0.0.1:1")._client.trust_env is False
