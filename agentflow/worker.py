@@ -26,7 +26,7 @@ from typing import Any
 
 from .config import get_settings
 from .core.dag import TERMINAL
-from .executor.dag_executor import DAGExecutor, NodeRunner, WorkflowNodeFailed
+from .executor.dag_executor import DAGExecutor, NodeRunner, TicketCreator, WorkflowNodeFailed
 from .executor.resume import resume_executor
 from .lock import (
     LEASE_REFRESH_SEC,
@@ -49,6 +49,7 @@ class Worker:
         queue: Queue,
         node_runner: NodeRunner | None = None,
         *,
+        ticket_creator: TicketCreator | None = None,
         tenant_id: str | None = None,
         lock=None,
     ) -> None:
@@ -57,6 +58,8 @@ class Worker:
         self._stores = store_resolver(store)
         self.queue = queue
         self.node_runner = node_runner
+        #: `kind: ticket` 节点的建单实现（组合根注入；None = 该节点 fail-closed）
+        self.ticket_creator = ticket_creator
         # 绑定租户（v5.3 §6.2 生产形态：每租户 Worker 只消费自己的 topic）；
         # None = 消费全局 topic（单租户回退 / 未注册租户 dev 兜底）
         self.tenant_id = tenant_id
@@ -187,7 +190,10 @@ class Worker:
     ) -> DAGExecutor:
         # trigger 与 resume 统一走 checkpoint 重建：新 run 无 checkpoint → 全 pending，
         # 已有 checkpoint → 续跑（原 snapshot，§8.5）
-        return await resume_executor(run_id, tenant_id, store, node_runner=self.node_runner)
+        return await resume_executor(
+            run_id, tenant_id, store,
+            node_runner=self.node_runner, ticket_creator=self.ticket_creator,
+        )
 
     async def _execute(self, run_id: str, ex: DAGExecutor, tenant_id: str) -> None:
         store = await self._store(tenant_id)
@@ -318,6 +324,7 @@ class WorkerPool:
         queue: Queue,
         node_runner: NodeRunner | None = None,
         *,
+        ticket_creator: TicketCreator | None = None,
         tenants_provider: Callable[[], Awaitable[list[str]]] | None = None,
         rescan_interval: float = 30.0,
         lock=None,
@@ -325,6 +332,7 @@ class WorkerPool:
         self._stores = store_resolver(store)
         self.queue = queue
         self.node_runner = node_runner
+        self.ticket_creator = ticket_creator
         self._tenants_provider = tenants_provider
         self._rescan_interval = rescan_interval
         # 执行租约：池里每个 Worker 共用同一个 Lock 适配器（各自 token 不同，互不干扰）
@@ -333,7 +341,8 @@ class WorkerPool:
 
     async def run_forever(self) -> None:
         # 全局 Worker：兜底未注册租户（dev）+ 兼容旧全局 topic
-        base = Worker(self._stores, self.queue, self.node_runner, lock=self.lock)
+        base = Worker(self._stores, self.queue, self.node_runner,
+                      ticket_creator=self.ticket_creator, lock=self.lock)
         self._consumers.append(asyncio.create_task(base.run_forever()))
         seen: set[str] = set()
         while True:
@@ -344,6 +353,7 @@ class WorkerPool:
                             continue
                         seen.add(tid)
                         w = Worker(self._stores, self.queue, self.node_runner,
+                                   ticket_creator=self.ticket_creator,
                                    tenant_id=tid, lock=self.lock)
                         self._consumers.append(asyncio.create_task(w.run_forever()))
                         log.info("WorkerPool：已接入租户 %s 的消费循环", tid)
@@ -436,6 +446,25 @@ class _FixedStores:
         return self._bundle
 
 
+def build_ticket_creator(stores: Any) -> TicketCreator:
+    """造建单回调 ``(tenant_id, params) -> 工单行``（`kind: ticket` 节点用）。
+
+    与 ``store_resolver`` 同一手法：把「租户 → 该租户的 ticket store」这层解析**收在一处**，
+    执行引擎只看到一个裸回调，于是 `executor/` 不必 import `api/`（那条反向依赖会把
+    FastAPI/starlette 整个 web 栈拖进 Worker 进程，且不会有任何提示）。
+
+    ``stores`` 只需满足 ``.get(tenant_id) -> 有 .ticket 的对象``：Router 形态传
+    ``TenantStoresRouter``，``--dsn`` 直连形态传 ``_FixedStores(bundle)``。
+    """
+    from .api.ticket_store import create_from_node_params
+
+    async def create(tenant_id: str, params: dict) -> dict:
+        bundle = await stores.get(tenant_id)
+        return await create_from_node_params(bundle.ticket, tenant_id, params)
+
+    return create
+
+
 async def main(argv: list[str] | None = None) -> None:
     """独立 Worker 进程入口（v5.3 §6.2 多租户形态）。
 
@@ -476,21 +505,27 @@ async def main(argv: list[str] | None = None) -> None:
         bundle = await build_tenant_stores_at_dsn(
             args.dsn, args.tenant, settings, state=store
         )
-        node_runner = await build_node_runner(settings, _FixedStores(bundle))
+        fixed = _FixedStores(bundle)
+        node_runner = await build_node_runner(settings, fixed)
         log.info("Worker(tenant=%s, dsn 直连)：消费 %s / %s",
                  args.tenant, topic_trigger(args.tenant), topic_command(args.tenant))
-        await Worker(store, queue, node_runner=node_runner, tenant_id=args.tenant,
-                     lock=build_lock(settings)).run_forever()
+        await Worker(
+            store, queue, node_runner=node_runner,
+            ticket_creator=build_ticket_creator(fixed), tenant_id=args.tenant,
+            lock=build_lock(settings),
+        ).run_forever()
         return
 
     # node_runner 装配（需 router 已建：per-tenant MCP store + agent 配置路由）。
     # 此前 Worker 只传 model → 租户 MCP 绑定与 DB agent 配置全部丢失；此处补齐
     # API 侧同款装配。数据源查询全部经 MCP（design-v5.6），无进程内直连。
     node_runner = await build_node_runner(settings, router)
+    ticket_creator = build_ticket_creator(router)
     if args.tenant:
         log.info("Worker(tenant=%s)：消费 %s / %s",
                  args.tenant, topic_trigger(args.tenant), topic_command(args.tenant))
-        await Worker(router, queue, node_runner=node_runner, tenant_id=args.tenant,
+        await Worker(router, queue, node_runner=node_runner,
+                     ticket_creator=ticket_creator, tenant_id=args.tenant,
                      lock=build_lock(settings)).run_forever()
         return
     active = await mgmt.list_tenants(status="active")
@@ -500,11 +535,13 @@ async def main(argv: list[str] | None = None) -> None:
 
         log.info("WorkerPool 启动（queue=%s）：为 %d 个 active 租户起消费循环", settings.queue, len(active))
         await WorkerPool(router, queue, node_runner=node_runner,
+                         ticket_creator=ticket_creator,
                          tenants_provider=_active_tenants,
                          lock=build_lock(settings)).run_forever()
         return
     log.warning("管理库暂无 active 租户且未指定 --tenant：退化为全局 topic Worker（单库 dev 形态）")
     await Worker(router, queue, node_runner=node_runner,
+                 ticket_creator=ticket_creator,
                  lock=build_lock(settings)).run_forever()
 
 

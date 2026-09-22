@@ -108,7 +108,24 @@ def load() -> Workflow:
     return Workflow.load_yaml(WF_PATH)
 
 
-def build(outputs: dict | None = None, inputs=None) -> DAGExecutor:
+#: 建单节点的假实现。真实现（`TicketStore.create_once`）的幂等口径在
+#: `tests/test_tickets_api.py` 里单独测；这里只验"节点会不会被调到、输出怎么进图"。
+TICKET_NODE = "create-ticket"
+
+
+async def _fake_ticket_creator(tenant_id: str, params: dict) -> dict:
+    return {
+        "ticket_id": "tkt_test",
+        "ticket_number": "INC-TEST-0001",
+        "title": "t",
+        "service": None,
+        "severity": None,
+        "created": True,
+        "source_ref": params.get("source_ref"),
+    }
+
+
+def build(outputs: dict | None = None, inputs=None, ticket_creator=None) -> DAGExecutor:
     """按节点 id 返回脚本化输出；未给出的节点回落到 mock 形态。"""
     table = OK_OUTPUTS if outputs is None else outputs
 
@@ -119,6 +136,9 @@ def build(outputs: dict | None = None, inputs=None) -> DAGExecutor:
     return DAGExecutor(
         "run_log", "otr", wf.dag, InMemoryStateStore(),
         inputs=inputs or dict(INPUTS), node_runner=runner,
+        # 默认接上假建单器：**不接的话建单节点会 fail-closed**（那是它的正常姿态，
+        # 见 test_executor 里"未接线即失败"那条），本文件测的不是那件事。
+        ticket_creator=ticket_creator or _fake_ticket_creator,
     )
 
 
@@ -130,24 +150,43 @@ def test_workflow_loads_and_has_expected_nodes() -> None:
     # `know` 已移除：占位工具 search_knowledge 恒返回 INC0001，一次真实 run 却调了 5 次，
     # 纯开销。接真实知识库后加回，届时同步本断言与 rca.required_edges。
     # `fix/test/review/approve-commit/commit/recap` 已移除：本流程不再改代码（见文件头）。
-    assert set(dag.nodes) == {"triage", "logs", "locate", "rca", "plan", GATE, "halt"}
+    assert set(dag.nodes) == {"triage", "logs", "locate", "rca", "plan", GATE, TICKET_NODE, "halt"}
     assert dag.nodes[GATE].is_approval
+    assert dag.nodes[TICKET_NODE].is_ticket
     assert dag.nodes["halt"].is_halt
 
 
-def test_gate_is_terminal_with_no_out_edges() -> None:
-    """门是**终态节点**：图上一条出边都没有。
+def test_gate_has_exactly_one_out_edge_and_no_reject_edge() -> None:
+    """门**只有一条出边**（通过 → 建单），**驳回侧没有边**——两侧都是刻意的。
 
-    这不是漏写，是设计的落点——本流程的产物是「诊断输出 + 人的裁定」，裁定之后
-    要么由 APM 起新一轮 run（拒绝）、要么由 APM 建工单（升级），**没有本图内的下游**。
+    通过侧那条是本流程的落点：升级 = 放行门 → 在 run 内建单（不再是 APM 自己建）。
+    驳回侧没边是 `continue` 的合法形态：驳回后下游全部失活、run 照常收敛（不中止）。
 
     ⚠️ `Node` 只有 `in_edges`/`upstreams`，**没有 `out_edges`**，所以要从 `dag.edges` 反查。
-    这条断言真正的价值在**防止误加边**：为了"看起来完整"补一条
-    `approved == false → halt` 之类，会把"人否决"错当成"中断"——halt 一旦执行会把其余
-    PENDING 节点全部 SKIPPED（CLAUDE.md §3.1），语义完全不同。
+    这条断言真正的价值在**防止误加驳回边**：补一条 `approved == false → halt` 之类，
+    会把"人否决"错当成"中断"——halt 一旦执行会把其余 PENDING 节点全部 SKIPPED
+    （CLAUDE.md §3.1），语义完全不同。
     """
-    dag = load().dag
-    assert [e for e in dag.edges if e.source == GATE] == []
+    out = [e for e in load().dag.edges if e.source == GATE]
+    assert [(e.target, e.when) for e in out] == [
+        (TICKET_NODE, f"$.nodes.{GATE}.output.approved == true")
+    ]
+
+
+def test_ticket_node_is_declared_with_the_guards_that_keep_it_honest() -> None:
+    """建单节点必须：`on_failure: abort`、`require` 里带幂等键、且不写 `agent`。
+
+    - `on_failure: continue` 会把失败变成 negative_evidence **并标 DONE** —— 建单失败
+      会"看着成功"。加载期也拦（`core/dag.py._check_node_kinds`），这里再锁一道。
+    - `source_ref`（问题单号）是幂等判据，必须在 `require` 里 → 工单没号时 fail-fast，
+      而不是建一张无法去重的单。
+    - 它不走 runner，写 `agent:` 只会被静默忽略。
+    """
+    node = load().dag.nodes[TICKET_NODE]
+    assert node.is_ticket
+    assert node.on_failure == "abort"
+    assert node.agent is None
+    assert set(node.require) >= {"source_ref", "bug_report"}
 
 
 def test_plan_uses_multi_option_analyst_with_matching_param_name() -> None:
@@ -230,11 +269,16 @@ async def test_approve_converges_to_done_and_does_not_re_park() -> None:
     await ex.approve(GATE, approved=True, by="lead-engineer")
     assert await ex.run() == "done"
     assert ex.get_status(GATE) == DONE
+    assert ex.get_status(TICKET_NODE) == DONE  # 升级的落点：门放行后**在 run 内建单**
     assert ex.pending_approvals() == []
     assert ex.halt_triggered() is False
     assert ex.rejected_abort_node() is None
     for nid in ("triage", "logs", "locate", "rca", "plan"):
         assert ex.get_status(nid) == DONE, nid
+    # 节点输出就是 APM 回读时拿的东西
+    out = ex.node_states[TICKET_NODE]["output"]
+    assert out["ticket_number"] == "INC-TEST-0001"
+    assert out["source_ref"] == INPUTS["bug_report"]["number"]
 
 
 async def test_reject_does_not_abort_run_and_leaves_no_pending_gate() -> None:
@@ -252,6 +296,7 @@ async def test_reject_does_not_abort_run_and_leaves_no_pending_gate() -> None:
     await ex.approve(GATE, approved=False, by="lead-engineer", comment="方案不对")
     assert await ex.run() == "done"
     assert ex.get_status(GATE) == REJECTED
+    assert ex.get_status(TICKET_NODE) == SKIPPED  # 驳回不建单
     assert ex.pending_approvals() == []
     assert ex.rejected_abort_node() is None  # continue → 不中止
     assert ex.halt_triggered() is False
@@ -277,7 +322,7 @@ async def test_locate_not_found_halts_before_plan_and_gate() -> None:
     assert ex.get_status("halt") == DONE
     assert ex.halt_triggered() is True
     assert ex.pending_approvals() == []
-    for nid in ("rca", "plan", GATE):
+    for nid in ("rca", "plan", GATE, TICKET_NODE):
         assert ex.get_status(nid) == SKIPPED, nid
 
 
@@ -294,6 +339,7 @@ async def test_rca_insufficient_halts_before_plan() -> None:
     assert ex.halt_triggered() is True
     assert ex.get_status("plan") == SKIPPED
     assert ex.get_status(GATE) == SKIPPED
+    assert ex.get_status(TICKET_NODE) == SKIPPED
 
 
 # ── 行为：入参预检 ──────────────────────────────────────────────────────────

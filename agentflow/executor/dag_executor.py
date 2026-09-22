@@ -47,6 +47,13 @@ log = logging.getLogger("agentflow.executor")
 # 节点 runner：接收 (node, resolved_params) 返回输出
 NodeRunner = Callable[[Node, dict], Awaitable[Any]]
 
+#: 建单端口（`kind: ticket` 节点用）：`(tenant_id, 已解析的 params) -> 工单行`。
+#:
+#: **只声明形状、不 import 实现**——`TicketStore` 住在 `api/`（它实为 Repository 却放在
+#: 那一层，是已知的层债），executor 反向 import 它会把整个 web 栈拖进 Worker。
+#: 与 `NodeRunner` 同一手法：组合根（`api/app.py` / `worker.py`）负责把实现注进来。
+TicketCreator = Callable[[str, dict], Awaitable[dict]]
+
 # §8.4.3 副作用节点清单（外部世界可感知、重复执行会造成重复副作用）：
 # committer（建 PR）、infra-remediator（scale/restart）。这两类 agent 的节点
 # 执行前先查同 run+node+幂等键 的成功记录，命中则复用（§8.4.2），crash 重放不重复。
@@ -261,6 +268,7 @@ class DAGExecutor:
         store: StateStore,
         node_runner: NodeRunner | None = None,
         inputs: dict | None = None,
+        ticket_creator: TicketCreator | None = None,
     ) -> None:
         self.run_id = run_id
         self.tenant_id = tenant_id
@@ -268,6 +276,8 @@ class DAGExecutor:
         self.store = store
         self.inputs = inputs or {}
         self.node_runner = node_runner or self._default_runner
+        #: `kind: ticket` 节点的建单实现；None = 未接线，该节点 fail-closed 报错
+        self.ticket_creator = ticket_creator
         self.node_states: dict[str, dict] = {
             nid: {"status": PENDING, "output": None} for nid in dag.nodes
         }
@@ -630,6 +640,22 @@ class DAGExecutor:
             output=output,
         )
 
+    async def _create_ticket(self, node: Node, params: dict) -> dict:
+        """``kind: ticket`` 的节点动作：在租户库里建一张工单。
+
+        **幂等口径在接口侧**（`TicketStore.create_once` 按 ``source_ref`` 查重），不在这里
+        —— 引擎的 `external_operation_id` 只活在 attempt 账本里，管得住"同 run 重放"，
+        管不住"同一条数据被两个 run 各建一张"。见 `TicketCreator` 的说明。
+
+        未接线时 **fail-closed**：宁可这条 run 失败，也不要"什么都没建却报成功"。
+        """
+        if self.ticket_creator is None:
+            raise RuntimeError(
+                f"建单节点 {node.id} 需要 ticket_creator，但组合根没有接线"
+                "（单库模式由 api/app.py 注入租户的 ticket store；Router 模式经 ticket_resolver）"
+            )
+        return await self.ticket_creator(self.tenant_id, params)
+
     async def _run_with_retry(
         self, node: Node, params: dict, external_operation_id: str | None = None
     ) -> Any:
@@ -644,6 +670,12 @@ class DAGExecutor:
         """
 
         async def invoke() -> Any:
+            # 建单节点**不走 runner**（不调 LLM），但**走这条 invoke** —— 于是
+            # 入参预检、retry、timeout、on_failure 全套都在。
+            # 刻意**不学 halt** 在调度处（`_exec_node_inner`）短路：halt 的语义是
+            # "不重试、不做幂等"，而建单是真副作用，恰恰最需要这些。
+            if node.is_ticket:
+                return await self._create_ticket(node, params)
             # runner 约定为 async；兼容同步 runner（脚本化/mock 场景）
             result = self.node_runner(node, params)
             if asyncio.iscoroutine(result):
@@ -893,6 +925,7 @@ class DAGExecutor:
         store: StateStore,
         node_runner: NodeRunner | None = None,
         inputs: dict | None = None,
+        ticket_creator: TicketCreator | None = None,
     ) -> DAGExecutor:
         """从 StateStore 的节点级 checkpoint 重建执行器（§8.4 / §4.4 Resume）。
 
@@ -900,7 +933,10 @@ class DAGExecutor:
         - waiting_approval 保留原状（审批通过后继续，不重复审批）；
         - 其余节点重置为 pending 重新执行。
         """
-        ex = cls(run_id, tenant_id, dag, store, node_runner=node_runner, inputs=inputs)
+        ex = cls(
+            run_id, tenant_id, dag, store,
+            node_runner=node_runner, inputs=inputs, ticket_creator=ticket_creator,
+        )
         cps = await store.get_nodes(run_id)
         for nid, cp in cps.items():
             st = dict(cp)

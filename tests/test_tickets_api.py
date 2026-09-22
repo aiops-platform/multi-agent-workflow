@@ -166,3 +166,129 @@ async def test_run_ticket_unknown_id_404(stores) -> None:
         resp = await client.post("/tickets/nope/run", json={})
 
     assert resp.status_code == 404
+
+
+# ──────────────────────────────────────────────────────────────────
+# 幂等建单（`create_once`）：`kind: ticket` 节点的落点
+# ──────────────────────────────────────────────────────────────────
+async def test_create_once_returns_the_existing_ticket_for_same_source_ref(tmp_path) -> None:
+    """同一 `source_ref` 建两次 → **只有一张**，第二次拿到的是同一张（`created=False`）。
+
+    这是「一条数据永远只有一张工单」这个不变量的落点。它比引擎的
+    `external_operation_id` 强：后者只活在 attempt 账本里，管得住"同 run 重放"，
+    管不住"同一条数据被两个 run / 两次手工重跑各建一张"。
+    """
+    ts = TicketStore(tmp_path / "t.db")
+    await ts.connect()
+    a, ca = await ts.create_once("otr", source_ref="PR-0001", title="t1", inputs={"x": 1})
+    b, cb = await ts.create_once("otr", source_ref="PR-0001", title="t1-again", inputs={"x": 2})
+    assert ca is True and cb is False
+    assert a["id"] == b["id"]
+    assert a["number"] == b["number"]          # 第二次没有另取号
+    assert b["title"] == "t1"                  # 也没有被覆盖
+    assert len(await ts.list("otr")) == 1
+
+
+async def test_create_once_is_race_safe(tmp_path) -> None:
+    """并发建同一条 → 仍只有一张（唯一索引 + DO NOTHING + 回读兜底）。"""
+    ts = TicketStore(tmp_path / "t.db")
+    await ts.connect()
+    results = await asyncio.gather(
+        *[ts.create_once("otr", source_ref="PR-0002", title="c", inputs={}) for _ in range(8)]
+    )
+    assert len({row["id"] for row, _ in results}) == 1
+    assert sum(1 for _, created in results if created) == 1
+    assert len(await ts.list("otr")) == 1
+
+
+async def test_create_once_is_scoped_per_tenant(tmp_path) -> None:
+    """同一个 `source_ref` 在两个租户下是**两张**单（`source_ref` 是租户内的号）。"""
+    ts = TicketStore(tmp_path / "t.db")
+    await ts.connect()
+    a, ca = await ts.create_once("otr", source_ref="PR-0003", title="a", inputs={})
+    b, cb = await ts.create_once("local", source_ref="PR-0003", title="b", inputs={})
+    assert ca is True and cb is True and a["id"] != b["id"]
+
+
+async def test_next_number_format_and_is_per_day(tmp_path) -> None:
+    """工单号 `INC-YYYYMMDD-NNNN`，同日自增、跨日归 1。"""
+    from datetime import UTC, datetime
+
+    ts = TicketStore(tmp_path / "t.db")
+    await ts.connect()
+    d1 = datetime(2026, 9, 21, tzinfo=UTC)
+    d2 = datetime(2026, 9, 22, tzinfo=UTC)
+    assert await ts.next_number(now=d1) == "INC-20260921-0001"
+    assert await ts.next_number(now=d1) == "INC-20260921-0002"
+    assert await ts.next_number(now=d2) == "INC-20260922-0001"
+
+
+async def test_legacy_db_without_source_ref_gets_the_column(tmp_path) -> None:
+    """**已开通的租户库**（`tickets` 表早就在、没有 `source_ref` 列）连上后要能补列。
+
+    不补的话 `CREATE UNIQUE INDEX` 会直接报 "no such column"，而
+    `CREATE TABLE IF NOT EXISTS` 对已存在的表什么也不做 —— 这是个只在**升级已有环境**时
+    才暴露的坑（本机的 otr / local 正是这种库）。
+    """
+    import sqlite3
+
+    path = tmp_path / "legacy.db"
+    c = sqlite3.connect(path)
+    c.execute(
+        """CREATE TABLE tickets (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, number TEXT,
+           title TEXT NOT NULL, service TEXT, namespace TEXT, severity TEXT,
+           status TEXT NOT NULL, inputs TEXT NOT NULL, run_ids TEXT NOT NULL,
+           created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"""
+    )
+    c.execute(
+        "INSERT INTO tickets VALUES ('old1','otr',NULL,'legacy',NULL,NULL,NULL,'new','{}','[]','t','t')"
+    )
+    c.commit()
+    c.close()
+
+    ts = TicketStore(path)
+    await ts.connect()  # 不抛
+    cols = {r[1] for r in sqlite3.connect(path).execute("PRAGMA table_info(tickets)")}
+    assert "source_ref" in cols
+    # 历史行（source_ref 为 NULL）不参与唯一约束，也不影响新单
+    assert len(await ts.list("otr")) == 1
+    await ts.create_once("otr", source_ref="PR-0009", title="new", inputs={})
+    assert len(await ts.list("otr")) == 2
+
+
+async def test_create_from_node_params_maps_bug_report_and_requires_source_ref(tmp_path) -> None:
+    """`kind: ticket` 节点的 params → 工单字段；缺 `source_ref` 直接报错。"""
+    from agentflow.api.ticket_store import create_from_node_params
+
+    ts = TicketStore(tmp_path / "t.db")
+    await ts.connect()
+    out = await create_from_node_params(
+        ts,
+        "otr",
+        {
+            "source_ref": "PR-0100",
+            "bug_report": {
+                "number": "PR-0100",
+                "short_description": "结账单打印无反应",
+                "severity": "high",
+                "cmdb_ci": {"name": "order-service", "namespace": "order"},
+            },
+            "window_start": "2026-09-21T07:00:00+00:00",
+            "window_end": "2026-09-21T08:00:00+00:00",
+            "rca": {"hypotheses": ["NPE"]},
+            "plan": {"summary": "补空值校验"},
+        },
+    )
+    assert out["created"] is True
+    assert out["ticket_number"].startswith("INC-")
+    row = await ts.get("otr", out["ticket_id"])
+    assert row["title"] == "结账单打印无反应"
+    assert row["service"] == "order-service"
+    assert row["namespace"] == "order"
+    assert row["severity"] == "high"
+    assert row["inputs"]["bug_report"]["number"] == "PR-0100"
+    assert row["inputs"]["diagnosis"]["plan"]["summary"] == "补空值校验"
+
+    # 缺 source_ref（幂等判据）→ 失败，而不是建一张无法去重的单
+    with pytest.raises(ValueError, match="source_ref"):
+        await create_from_node_params(ts, "otr", {"bug_report": {"number": "X"}})
