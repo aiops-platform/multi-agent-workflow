@@ -692,6 +692,10 @@ class TicketRequest(BaseModel):
     service: str | None = None
     namespace: str | None = None
     severity: str | None = None
+    # 这张单后续诊断跑哪条流程。**收 id，存名字**（见 `create_ticket`）——
+    # 库里那一列是 `workflow_name`，因为名字才是跨租户可移植的键（id 每库都不同）。
+    # 不传 = 不钉，发起时退回「库里最新一条」（`_workflow_for_ticket` 的第三档）。
+    workflow_id: str | None = None
 
 
 class TicketRunRequest(BaseModel):
@@ -811,11 +815,35 @@ async def create_ticket(
 
     走 ``cs.ticket``（租户库），与其它配置表一致 —— 早期用模块全局 ``ticket_store``，
     工单会落到共享库、不随租户隔离。
+
+    ``workflow_id`` 是**建单时把这张单钉到一条流程上**（发起诊断时 ``_workflow_for_ticket``
+    的第二档）。这里收 id、查回**名字**存进 ``tickets.workflow_name`` 列：
+
+    - **为什么收 id**：调用方（前端）手里只有 id，而 `workflows.name` **没有唯一约束** ——
+      收名字的话，重名时无法指定是哪一条，`get_by_name` 会静默取最新那条（与选中的可能
+      不是同一个）。收 id 则指哪条是哪条。
+    - **为什么存名字**：那是既有契约（``ticket_store._ticket_fields_from_params`` 里写明
+      理由）—— YAML 跨租户同一份，而 id 每个租户库都不同，名字才是可移植的键。
+      运行期 ``_workflow_for_ticket`` 正是按名字查回来的。
+    - **为什么此刻就校验**：查不到 → 404，**在建 ``tickets.create`` 之前**。
+      否则会留下一张"钉了个不存在的流程"的单，要等到点「发起诊断」才 409 ——
+      那时单已经建出来了，且界面上看不出它是一张废单。
     """
     br = req.bug_report or {}
     ci = br.get("cmdb_ci") or {}
-    tickets = (await _control_stores(ctx)).ticket
-    tid = await tickets.create(
+    cs = await _control_stores(ctx)
+
+    # 空串/空白一律当"没传"——沿用 `_ticket_fields_from_params` 那句同样的写法，
+    # 免得模板里留个空值就变成"钉了一个空名字"。
+    pinned = str(req.workflow_id or "").strip() or None
+    workflow_name = None
+    if pinned:
+        wf = await cs.workflow.get(pinned)
+        if wf is None:
+            raise HTTPException(status_code=404, detail="workflow 不存在")
+        workflow_name = wf["name"]
+
+    tid = await cs.ticket.create(
         ctx.tenant_id,
         title=req.title,
         inputs=_ticket_inputs(req),
@@ -823,8 +851,9 @@ async def create_ticket(
         service=req.service or ci.get("name"),
         namespace=req.namespace or ci.get("namespace"),
         severity=req.severity,
+        workflow_name=workflow_name,
     )
-    created = await tickets.get(ctx.tenant_id, tid)
+    created = await cs.ticket.get(ctx.tenant_id, tid)
     assert created is not None
     return created
 

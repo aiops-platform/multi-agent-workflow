@@ -3,7 +3,6 @@
 夹具同 test_runs_list_api.py，另需 monkeypatch app.ticket_store。
 """
 import asyncio
-import time
 
 import httpx
 import pytest
@@ -187,6 +186,82 @@ async def test_run_ticket_strips_diagnosis_from_run_inputs(stores) -> None:
 def _wf_yaml(name: str) -> str:
     """同一张图，只换流程名（`insert_if_absent` 的 name 与 YAML 里的 name 都对上）。"""
     return VALID_YAML.replace("simple-flow", name)
+
+
+# ======================================================================
+# 建单时钉住 workflow（`POST /tickets` 的 workflow_id）
+# ======================================================================
+async def test_create_ticket_pins_the_workflow_by_name(stores) -> None:
+    """建单传 `workflow_id` → 存进 `workflow_name` 列的是那条流程的**名字**，不是 id。
+
+    「收 id、存名字」是刻意的（见 `create_ticket` 的 docstring）：`workflows.name` 没有唯一
+    约束，收名字的话重名时指不准是哪一条；而列里**必须**存名字，因为运行期
+    `_workflow_for_ticket` 是按名字查回 id 的，且名字才是跨租户可移植的键。
+    """
+    async with _client() as client:
+        wid = (
+            await client.post(
+                "/workflows", json={"name": "pinned-flow", "yaml": _wf_yaml("pinned-flow")}
+            )
+        ).json()["id"]
+        t = await _create(client, workflow_id=wid)
+        assert t["workflow_name"] == "pinned-flow"
+        # 回读一遍：不能只是 201 响应里对了
+        assert (await client.get(f"/tickets/{t['id']}")).json()["workflow_name"] == "pinned-flow"
+
+
+async def test_create_ticket_404_when_workflow_id_unknown(stores) -> None:
+    """钉一个不存在的 workflow → 404，且**一张单都不建**。
+
+    校验必须发生在 `tickets.create` **之前**。放到之后的话，会留下一张"钉了个不存在的
+    流程"的废单，要等点「发起诊断」才 409 —— 那时单已经建出来了，而界面上**看不出**
+    它是一张废单（钉住的列不显示在列表里）。
+    """
+    async with _client() as client:
+        before = (await client.get("/tickets")).json()
+        resp = await client.post(
+            "/tickets",
+            json={"title": "钉了个不存在的", "bug_report": BUG_REPORT, "workflow_id": "查无此流程"},
+        )
+        assert resp.status_code == 404
+        assert (await client.get("/tickets")).json() == before
+
+
+async def test_create_ticket_without_workflow_leaves_it_unpinned(stores) -> None:
+    """不传 / 空串 / 空白串 → 一律当"没钉"（列 None），发起时退回「最新一条」兜底。
+
+    向后兼容：现有的 `POST /tickets` 调用方不传这个字段，行为必须一字不变。
+    空白串也要收进去 —— 模板里留个空值就变成"钉了一个空名字"、发起时 409，太脆。
+    """
+    async with _client() as client:
+        for over in ({}, {"workflow_id": ""}, {"workflow_id": "   "}):
+            t = await _create(client, **over)
+            assert t["workflow_name"] is None, f"body={over} 不该钉住任何东西"
+
+
+async def test_ticket_created_with_a_workflow_runs_that_one(stores) -> None:
+    """**本功能的验收用例**：建单选了哪条 → 点「发起诊断」就跑哪条。
+
+    "让 ticket 按选定的 workflow 执行"这句话的全部内容就是这条链：
+    前端选 id → 建单时查回名字钉上 → 运行期按名字查回 id。
+    任何一环断了（钉错、钉了 id、运行期没读它）这条都会红。
+    """
+    w = stores["workflow"]
+    # created_at 显式给：靠 save() 的 now 撞运气的话"谁更新"本身就不确定
+    await w.insert_if_absent(
+        "w-old", "old-flow", _wf_yaml("old-flow"), "2026-01-01T00:00:00+00:00"
+    )
+    await w.insert_if_absent(
+        "w-new", "new-flow", _wf_yaml("new-flow"), "2026-02-01T00:00:00+00:00"
+    )
+
+    async with _client() as client:
+        # 刻意选**旧的**那条 —— 兜底本来会跑 w-new，选中的是 w-old，
+        # 于是"跑了选中的"与"跑了最新的"在这条里可区分。
+        t = await _create(client, workflow_id="w-old")
+        assert t["workflow_name"] == "old-flow"
+        out = (await client.post(f"/tickets/{t['id']}/run", json={})).json()
+        assert out["workflow_id"] == "w-old"
 
 
 async def test_run_ticket_uses_the_pinned_workflow_not_the_newest(stores) -> None:
