@@ -372,11 +372,14 @@ async def test_executor_flushes_trace_and_usage_on_failure() -> None:
     store = InMemoryStateStore()
     wf = Workflow.load_yaml("name: t\nnodes:\n  n1: { agent: triage }\n")
     svc = RunService(store, node_runner=_FailingTraceRunner())
-    # inline 模式：节点失败会把异常抛到 create_run 外 —— 断言在**抛出之后**做，
-    # 这正是要证明的：失败已经发生，明细依然落了库。run_id 从库里取。
-    with pytest.raises(WorkflowNodeFailed):
-        await svc.create_run("local", wf, inputs={})
+    # inline 模式：`create_run` **吞掉** `WorkflowNodeFailed` 并把它落成 run 行的 `failed`
+    # （见 `RunService._run_and_persist`）—— 所以这里不 `pytest.raises`：失败已经发生，
+    # 明细依然落了库，而 run 行的状态就是"失败已发生"的证据。
+    # ⚠️ 曾经断言异常会抛出来：那让 approve 那条路径**在写状态之前**就中断，
+    # run 行卡在 `waiting_approval`（实测 run_4caefc4cd8）。
+    await svc.create_run("local", wf, inputs={})
     run_id = (await store.list_runs("local"))[0]["run_id"]
+    assert (await store.get_run(run_id))["status"] == "failed"  # ← 收尾真的写了状态
 
     nodes = await store.get_nodes(run_id)
     assert nodes["n1"]["status"] == "failed"      # 失败语义不变

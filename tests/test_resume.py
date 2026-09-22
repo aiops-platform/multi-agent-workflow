@@ -56,6 +56,84 @@ async def test_resume_after_approval_sqlite() -> None:
     assert calls["test"] == 1
 
 
+#: 门之后**必定 abort** 的图：`boom` 的 `require` 拿不到键 → 入参预检失败 →
+#: `on_failure: abort` → 抛 `WorkflowNodeFailed`。用来钉住"节点 abort 之后 run 行的状态"。
+GATE_THEN_ABORT_YAML = """
+name: gate-then-abort
+inputs: {}
+nodes:
+  approve:
+    kind: approval
+    approvers: ["lead"]
+    timeout: 3600
+    on_reject: continue
+  boom:
+    agent: triage
+    require: [must_have]
+    params: { bug: "$.inputs.bug_report" }
+    on_failure: abort
+edges:
+  - { from: approve, to: boom }
+"""
+
+
+#: 只有"必定 abort 的节点"的图（无门）—— 给 `create_run` 那条同步路径用。
+#: ⚠️ 不要用 `kind: halt` 代替门：halt 一执行就把其余 PENDING 全部 SKIPPED（§3.1），
+#: 那个 abort 节点压根不会跑，run 会是 `done` —— 测的就不是这件事了。
+ABORT_ONLY_YAML = """
+name: abort-only
+inputs: {}
+nodes:
+  boom:
+    agent: triage
+    require: [must_have]
+    params: { bug: "$.inputs.bug_report" }
+    on_failure: abort
+edges: []
+"""
+
+
+async def test_approve_marks_run_failed_when_a_later_node_aborts() -> None:
+    """审批后下游节点 abort → run 行必须是 `failed`，**不能停在 `waiting_approval`**。
+
+    回归（run_4caefc4cd8 实测）：`approve` 的收尾原先是
+    `outcome = await ex.run(); await store.update_run(run_id, status=outcome)` ——
+    `ex.run()` 抛 `WorkflowNodeFailed` 时下面那行**永远不执行**，于是"节点已 failed、
+    run 还写着等待审批"，而 `updated_at` 停在审批那一刻、**没有人会再来改它**：
+    页面上表现为这条 run 一直在等审批。四处 `ex.run()` 收尾里只有 `_run_background` 有兜底。
+    """
+    from agentflow.core.workflow import Workflow
+    from agentflow.service import RunService
+
+    wf = Workflow.load_yaml(GATE_THEN_ABORT_YAML)
+    store = await _setup_db()
+    svc = RunService(store)
+    summary = await svc.create_run("tenant-a", wf, {})
+    run_id = summary["run_id"]
+    assert (await store.get_run(run_id))["status"] == WAITING_APPROVAL
+
+    res = await svc.approve(run_id, "approve", approved=True, by="lead")
+
+    assert res["run_status"] == "failed"
+    assert (await store.get_run(run_id))["status"] == "failed"  # ← 回归点：不是 waiting_approval
+
+
+async def test_create_run_marks_run_failed_when_a_node_aborts() -> None:
+    """同一条收尾的另一处（`create_run`，同步变体）：节点 abort 也要落 `failed`。
+
+    与上一条共用一个 helper —— 分开写就会像这次一样漂移一半，而漂移的那一半**没有提示**。
+    """
+    from agentflow.core.workflow import Workflow
+    from agentflow.service import RunService
+
+    wf = Workflow.load_yaml(ABORT_ONLY_YAML)
+    store = await _setup_db()
+    svc = RunService(store)
+    summary = await svc.create_run("tenant-a", wf, {})
+
+    assert (await store.get_run(summary["run_id"]))["status"] == "failed"
+
+
 async def test_run_service_create_approve_resume() -> None:
     """RunService 端到端：create_run → approve → done。"""
     from agentflow.core.workflow import Workflow

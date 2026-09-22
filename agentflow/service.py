@@ -154,9 +154,8 @@ class RunService:
             ticket_creator=self.ticket_creator,
         )
         self._executors[run_id] = ex
-        outcome = await ex.run()
-        await store.update_run(run_id, status=outcome)
-        log.info("[%s] create_run -> %s", run_id, outcome)
+        outcome = await self._run_and_persist(run_id, ex, store)
+        log.info("[%s] create_run -> %s", run_id, outcome or "cancelled")
         return self._summary(run_id)
 
     async def start_run(
@@ -238,19 +237,37 @@ class RunService:
     # ------------------------------------------------------------------
     # inline 模式后台执行
     # ------------------------------------------------------------------
-    async def _run_background(self, run_id: str, ex: DAGExecutor, store: StateStore) -> None:
-        """后台执行 DAG 到终态/可释放点；结束后更新 run 状态。"""
+    async def _run_and_persist(
+        self, run_id: str, ex: DAGExecutor, store: StateStore
+    ) -> str | None:
+        """跑到底并把终态写回 run 行；返回 outcome。``None`` = 已按"取消"收尾，调用方别再写状态。
+
+        **四处共用**（`create_run` / `resume` / `approve` / `_run_background`）：这段收尾
+        分头写过一次，而漂移的那一半**没有任何提示** —— `approve` 原先直接
+        `outcome = await ex.run(); await store.update_run(...)`，节点 abort 抛
+        `WorkflowNodeFailed` 时下面那行永远不执行，于是 run 行**卡在 `waiting_approval`**：
+        实测 run_4caefc4cd8，`fix` 已 `failed` 而状态还写着"等待审批"，`updated_at` 停在
+        审批那一刻 —— 而且**没有人会再来改它**（页面上表现为一直在等审批）。
+
+        `worker.Worker._execute` 有等价的兜底，但它是独立进程的收尾（`CancelledError` 交给
+        `handle_command` 统一置 cancelled），语义不同，不并进来。
+        """
         try:
             outcome = await ex.run()
         except WorkflowNodeFailed as exc:
-            log.warning("[%s] 后台执行失败: %s", run_id, exc)
+            log.warning("[%s] 执行失败: %s", run_id, exc)
             outcome = "failed"
         except asyncio.CancelledError:
-            log.info("[%s] 后台任务被取消（stop_run）", run_id)
+            log.info("[%s] 执行被取消（stop_run / 调用方断开）", run_id)
             await self._mark_cancelled(run_id, ex, store)
-            return
+            return None
         await store.update_run(run_id, status=outcome)
-        log.info("[%s] 后台执行结束 -> %s", run_id, outcome)
+        return outcome
+
+    async def _run_background(self, run_id: str, ex: DAGExecutor, store: StateStore) -> None:
+        """后台执行 DAG 到终态/可释放点；结束后更新 run 状态。"""
+        outcome = await self._run_and_persist(run_id, ex, store)
+        log.info("[%s] 后台执行结束 -> %s", run_id, outcome or "cancelled")
 
     async def _mark_cancelled(
         self, run_id: str, ex: DAGExecutor, store: StateStore
@@ -345,8 +362,7 @@ class RunService:
             node_runner=self.node_runner, ticket_creator=self.ticket_creator,
         )
         self._executors[run_id] = ex
-        outcome = await ex.run()
-        await store.update_run(run_id, status=outcome)
+        await self._run_and_persist(run_id, ex, store)
         return self._summary(run_id)
 
     async def stop_run(self, run_id: str, tenant_id: str | None = None) -> None:
@@ -440,9 +456,8 @@ class RunService:
             )
             log.info("[%s] 审批 %s 完成，已发布 resume 命令", run_id, node_id)
             return {"approval": out, "run_status": "queued", **self._summary(run_id)}
-        outcome = await ex.run()
-        await store.update_run(run_id, status=outcome)
-        return {"approval": out, "run_status": outcome, **self._summary(run_id)}
+        outcome = await self._run_and_persist(run_id, ex, store)
+        return {"approval": out, "run_status": outcome or "cancelled", **self._summary(run_id)}
 
     # ------------------------------------------------------------------
     def _summary(self, run_id: str) -> dict:
