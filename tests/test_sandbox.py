@@ -49,15 +49,37 @@ async def test_exec_cmd_timeout() -> None:
 # ToolPolicy：§9.5 deny 优先 / 兜底 DENY
 # ======================================================================
 def test_policy_deny_precedence() -> None:
+    """§9.5 的四条判据：deny 优先 / allow / agent 未注册 / 兜底 DENY。
+
+    ⚠️ 本用例钉的是**意图语义**，不是运行期行为：`ToolPolicy` 目前**没有任何运行期
+    消费方**（真正生效的是 `scopes.build_permission_context`，它只生成 allow、不读这里），
+    所以这些断言**全绿也不代表租户 deny 规则生效了**。见 `docs/TODO.md` §23.3。
+    """
     p = ToolPolicy()
-    # team-alpha deny 了写动作
+    # ① deny 优先：team-alpha deny 了写动作
     assert p.decide(tool_name="scale_deployment", agent="infra-remediator", tenant_id="team-alpha") == "DENY"
-    # 诊断工具 allow
-    assert p.decide(tool_name="query_logs", agent="log-analyst", tenant_id="team-alpha") == "ALLOW"
-    # agent 未注册该工具 → DENY
-    assert p.decide(tool_name="query_logs", agent="tester", tenant_id="team-alpha") == "DENY"
-    # 未知工具 → DENY
+    # ② allow：本地诊断工具、且该 agent 已注册
+    assert p.decide(tool_name="search_knowledge", agent="root-cause", tenant_id="team-alpha") == "ALLOW"
+    # ③ agent 未注册该工具 → DENY
+    assert p.decide(tool_name="search_knowledge", agent="tester", tenant_id="team-alpha") == "DENY"
+    # ④ 未知工具 → DENY
     assert p.decide(tool_name="unknown_tool", agent="triage", tenant_id="team-alpha") == "DENY"
+
+
+def test_policy_denies_data_plane_tools_not_in_local_registry() -> None:
+    """数据面工具**已迁 MCP**，不在这里的注册表里 —— 因此被兜底判 DENY。
+
+    这条是**刻意钉住的设计决策**，不是缺陷：`policy.py` 的默认租户配置里已写明
+    「数据源与 CMDB 工具已迁 MCP（design-v5.6）——其放行由 MCP 侧 readOnlyHint +
+    allow_extra 承担，不在此处枚举」。本用例原先断言 `query_logs` → ALLOW，
+    那是批次 3 删除直连实现**之前**的事实，测试未同步（陈旧用例，见 `docs/TODO.md` §10）。
+
+    ⚠️ 它同时暴露一个真实边界：**`ToolPolicy` 对 MCP 工具一无所知** —— 即使它将来
+    接上运行期，也只管得住本地 registry 里的东西，MCP 侧的放行是另一条路径。
+    """
+    p = ToolPolicy()
+    for tool in ("query_logs", "query_metrics", "get_service_topology"):
+        assert p.decide(tool_name=tool, agent="log-analyst", tenant_id="team-alpha") == "DENY"
 
 
 def test_policy_allowed_tools() -> None:
@@ -137,7 +159,7 @@ class _FakeSandboxClient:
 async def test_build_toolkit_includes_l2_tools() -> None:
     from agentflow.agents.mcp import build_toolkit
 
-    tk = build_toolkit("fix-implementer", use_mock=True, sandbox_client=_FakeSandboxClient())
+    tk = build_toolkit("fix-implementer", sandbox_client=_FakeSandboxClient())
     schemas = await tk.get_tool_schemas()
     names = [s["function"]["name"] for s in schemas]
     assert "sandbox_run_python" in names
@@ -155,10 +177,14 @@ async def test_build_toolkit_includes_l2_tools() -> None:
 
 
 async def test_build_toolkit_l2_absent_without_executor() -> None:
-    """未接沙箱时 L2 工具不注入（避免 agent 拿到不可用的执行工具）。"""
+    """未接沙箱时 L2 工具不注入（避免 agent 拿到不可用的执行工具）。
+
+    判据是「**没有 `sandbox_client` 参数**」——不是 `use_mock`。那个参数随批次 3
+    删除直连实现一同消失（数据面改走 MCP），用例未同步而一直红（见 `docs/TODO.md` §10）。
+    """
     from agentflow.agents.mcp import build_toolkit
 
-    tk = build_toolkit("fix-implementer", use_mock=True)  # 无 sandbox_client
+    tk = build_toolkit("fix-implementer")  # 无 sandbox_client
     schemas = await tk.get_tool_schemas()
     names = [s["function"]["name"] for s in schemas]
     assert "sandbox_run_python" not in names

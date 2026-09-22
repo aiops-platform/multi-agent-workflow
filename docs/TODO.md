@@ -393,15 +393,13 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 
 ## 10. 清预置 lint / 测试债
 
-- `make lint` 目前有 ~37 个预置 ruff 错误（改动前后不变，非本次引入）
+- `make lint` 目前有 **73 个**预置 ruff 错误（改动前后不变，非本次引入）
 - `tests/test_sandbox.py` 5 个用例依赖本机 `~/.kube/config`（本机有 kube 时会因
   incluster 配置缺失而失败；CI 无 kube 时被 skip）
-- **`tests/test_sandbox.py` 有陈旧用例**：`build_toolkit() got an unexpected keyword
-  argument 'use_mock'` ——批 3 删掉该参数后测试未同步
 
 > **实测（2026-09-11）**：本机 `pytest tests/` = **6 failed / 281 passed / 4 errors**。
 > 4 errors 全为缺可选依赖（`fakeredis` / `kafka`，本机未 `make install`）；6 failed 为
-> kube 依赖 + 上述陈旧用例 + `test_agent_runner` 需真实 DeepSeek key。
+> kube 依赖 + 陈旧用例 + `test_agent_runner` 需真实 DeepSeek key。
 > **与本次改动无关**（`git stash` 前后结果完全一致）。
 > **后果：回归信号目前不可信**——这是本项最该先清的理由。
 >
@@ -412,8 +410,31 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 > 教训：把"测试红了"归因成"环境没配"之前，先确认**参数真的传进去了没有**——
 > 静默忽略的入参会让"环境缺失"看起来和"代码路径没走到"一模一样。
 >
-> **当前基线（2026-09-18）**：**3 failed / 397 passed / 4 errors**。
-> 3 failed 全是 `test_sandbox.py`（kube 依赖 + `use_mock` 陈旧用例），4 errors 同前。
+> **当前基线（2026-09-22）**：**0 failed / 503 passed / 0 errors**。✅ 回归信号**已可用**。
+> 清掉的 3 条全是**陈旧用例**（不是产品缺陷），见下方「已清」。
+
+### ✅ 已清：3 条陈旧用例（2026-09-22）
+
+**共同成因：测试断言的是「改动之前的事实」，而改动发生时没人回来改测试。**
+三条都不是产品缺陷 —— 但**红了很久没人管，导致回归信号整体不可信**（本项存在的理由）。
+
+1. `build_toolkit() got an unexpected keyword argument 'use_mock'` ×2（`test_build_toolkit_includes_l2_tools`
+   / `test_build_toolkit_l2_absent_without_executor`）。
+   `use_mock` 随批次 3 删除直连实现（数据面改走 MCP）一起消失，用例未同步。
+   判据改成「**没有 `sandbox_client` 参数**」——那才是 L2 工具真正的门控。
+2. `test_policy_deny_precedence` 断言 `query_logs` → `ALLOW`。
+   而 `query_logs` **已不在本地注册表**（同样迁了 MCP）→ 兜底 DENY。
+   这条更值得记：**它与 `sandbox/policy.py:35-36` 那段刻意的设计注释直接矛盾** ——
+   注释写着「数据源与 CMDB 工具已迁 MCP……不在此处枚举」，测试却在要求它被枚举。
+
+   **顺带暴露一个真实边界**（已写成 `test_policy_denies_data_plane_tools_not_in_local_registry`
+   钉住）：`ToolPolicy` **对 MCP 工具一无所知** —— 它只看本地 `TOOL_REGISTRY`。
+   将来即便接上运行期，也只管得住本地工具；MCP 侧的放行是另一条路径
+   （readOnlyHint + allow_extra）。这层盲区此前没有任何东西记着。
+
+   ⚠️ 与 §23.3 合起来看：`ToolPolicy` **至今零运行期消费方**，所以这几条断言
+   **全绿也不代表租户 deny 规则生效了**。用例的 docstring 已显式写明这一点 ——
+   让一个测试在死代码上通过而不标注，比它红着更危险。
 
 ---
 
