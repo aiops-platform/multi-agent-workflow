@@ -176,7 +176,8 @@ make lint      # ruff 检查
    - **要改 workflow**：`PUT /workflows/{wid}`（或 `POST /workflows` 新建），改完立即生效
      （已发起的 run 不受影响——它们用 snapshot 冻结）。
    - 原设计的 DAG 形态（节点类型 / when / join / 审批门禁）见 `design-v5.2.md` §8.1（**仓库上一级目录**，不在 `backend/docs/`——v5.6 §8 是「残余风险」不是这个）；
-     当前两条流程的节点结构见 `docs/design-v5.8.md` §4。
+     当前流程的节点结构见 `docs/design-v5.8.md` §4（种子里的三条：scenario1 / scenario2 /
+     problem-diagnose-fix，末者见 §4.15）。
    - **新租户的默认数据 = `agentflow/seed/`（种子，2026-09-18 起）**：租户库建好时，
      `TenantStoresRouter._build()` 会往**三张表**写默认数据，让新租户开箱可用——
      `workflows` + `mcp_servers` + `agent_configs`（agent↔server 绑定）。

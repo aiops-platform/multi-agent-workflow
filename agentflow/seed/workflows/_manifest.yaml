@@ -6,19 +6,30 @@
 # 顺序即语义：播种时按本表顺序给 `created_at` 递增（base + i*1ms），而
 # `GET /workflows` 是 ORDER BY created_at DESC、`POST /tickets/{tid}/run` 未指定
 # `workflow_id` 时取 `saved[0]` ⇒ **本表最后一条 = 新租户的默认流程**。
+# （这是**兜底**了：工单在建单时钉了 `next_workflow` 就按钉的走，见 `api/app.py`
+#  的 `_workflow_for_ticket` —— 只有没钉过的老工单与手建单才轮到这条顺序。）
 #
 # 每条 YAML 的 `name:` 字段由播种器从正文解析，不在本表重复（避免两处漂移）。
 source: agentflow-otr
 exported_at: "2026-09-18"
 note: |
-  两条 workflow 从参考租户 agentflow-otr 原样导出（与库内**逐字节相同**）。
+  前两条（scenario1 / scenario2）从参考租户 agentflow-otr 原样导出（与库内**逐字节相同**）。
   导出时已核对：
   · agent 名全部在内置注册表（DIAGNOSE_AGENTS ∪ FIX_AGENTS），不依赖任何自定义 agent；
   · YAML 正文不含 URL / 端口 / 本机路径等环境绑定，只有 name 标签与注释里提到服务名。
   ⚠️ scenario1 独有的 `remediate`（K8s 止血）分支目前**只产计划、不执行**——
      ActionExecutor 的接线在 agentflow 侧尚未打通（见 docs/TODO.md）。
      别以为新租户拿它能真止血。
+
+  第三条 `problem-diagnose-fix` **不是导出**，是在仓库里直接写的（由 scenario2 简化：
+  去掉整段诊断链，诊断结论走入参 `rca`）。注意它含 `remediate` 节点而 **scenario2 没有**
+  那个节点（`remediate` 是 scenario1 的分支）——所以上面那条"只产计划、不执行"的限制
+  对它同样成立。
 items:
   # 顺序 = created_at 递增。最后一条是默认。
   - { id: seed-scenario1-quotation-print-fail, file: scenario1-quotation-print-fail.yaml }
   - { id: seed-scenario2-bug-fix,             file: scenario2-bug-fix.yaml }
+  # ⚠️ 末条 = 新租户的默认流程 ⇒ 它成为 `POST /tickets/{tid}/run` 不带 workflow_id 时跑的
+  # 那条。代价：它 require 一份现成的 `rca`，手建工单点「发起」会在 plan 处 fail-fast
+  # （见该文件头）。要让 scenario2 继续当默认，把它挪到这条下面即可。
+  - { id: seed-problem-diagnose-fix,          file: problem-diagnose-fix.yaml }

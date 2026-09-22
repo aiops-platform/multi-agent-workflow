@@ -1,0 +1,222 @@
+# ===== Problem Center 修复工作流：诊断结论 → 计划 → 修复+止血 → 测试 → 审查 → 提交 → 工单回传 =====
+#
+# 由 bug-fix-scenario2 **简化**而来：诊断段
+# （triage / scope / logs / trace / metrics / infra / locate / know / rca + halt）**整段去掉**，
+# 只留修复段。诊断结论不再是图里的节点产出，而是**工单里带着的那一份**：
+# `inputs.bug_report.diagnosis.{rca, plan}` —— 升级建单时由上游 problem-log-diagnose 的
+# rca / plan 两个节点写进去（见 `ticket_store._ticket_fields_from_params`）。
+#
+# 代价写在这里，免得读图的人以为漏画了：**没有诊断就没有本流程**。`plan` 用
+# `require: [problem, rca, solution]` 把它设成硬前置——缺了就 fail-fast，而不是让
+# fix-planner 对着工单标题编一份"计划"出来。
+# ⚠️ 本流程同时是**新租户的默认流程**（seed 的 _manifest.yaml 末条 ⇒
+#    `POST /tickets/{tid}/run` 不带 workflow_id 时跑的就是它）。所以**手建**一张没有诊断
+#    的工单点「发起」，会看到「节点 plan 入参缺失/非法，未满足 require [...]」——
+#    **那是设计如此**（宁可红着说"缺诊断"，也不要绿着编一份方案）。
+#    升级建出来的单不带这个毛病：工单里就有诊断。
+#
+# 也不声明时间窗：window_start/end 是给「必填时间区间」的 MCP 取数工具用的，
+# 而本图**一个取数节点都没有**——没有工具会读它，声明了只是摆设。
+name: problem-diagnose-fix
+version: "1.0.0"
+description: "Problem Center 修复闭环：诊断结论（rca）→ 修复计划 → 计划门 → 代码修复 + K8s 止血 → 测试/审查 → 提交门 → PR → 工单回传"
+
+inputs:
+  bug_report:
+    type: object
+    required: true
+    description: >
+      工单（Ticket Inbox 形态：number / short_description / cmdb_ci{name,namespace}）。
+      **诊断结论在 `bug_report.diagnosis` 里**（`{rca, plan}`，升级建单时写入）——
+      `plan` / `approve-plan` / `ticket-done` / `recap` 四个节点都从这里取根因。
+  callback_url:
+    type: string
+    required: false
+    description: "原系统（ServiceNow 等）接收处置结果的回调地址；缺省则不投递"
+
+nodes:
+  # ===== 计划（人工门之前）=====
+  # 用 fix-planner，**不是**诊断侧的 remediation-planning-analyst：这里要的是能落地执行的
+  # 改动步骤（code_fix / infra_action / config_change + target），不是给人看的方案对比。
+  plan:
+    agent: fix-planner
+    description: "制定修复计划：产出改动步骤与影响范围（本节点只出计划，不动代码）"
+    # 三个入参都取自**工单里那份诊断**（升级建单时写进 `inputs.bug_report.diagnosis`：
+    # 上游 problem-log-diagnose 的 rca / plan 两个节点的产出）。
+    # 缺键时 params 静默解析成 None，agent 会转头编一份计划；`require` 把这件事变成
+    # 一次明确失败（NodeInputError → on_failure 生效），所以**三个键都要列进 require**。
+    # ⚠️ `problem` 里也含 `diagnosis`（工单本来就把诊断塞在 bug_report 里，那是为了工单页面
+    #    能显示它）。额外单列 rca / solution 是为了让**入参契约显式**——fix-planner 的提示词
+    #    按这三个键名点名，靠 dict 里"只有一个大对象"来猜是猜不准的。
+    require: [problem, rca, solution]
+    params:
+      problem: "$.inputs.bug_report"
+      rca: "$.inputs.bug_report.diagnosis.rca"
+      solution: "$.inputs.bug_report.diagnosis.plan"
+    on_failure: abort
+
+  # ===== 计划门（前置审批：plan 定稿 → 人工决策 → 才允许动手）=====
+  # 与 scenario1/2 同款、同一个理由：`plan → fix` 若直连，则 plan 一出 fix 立刻改代码，
+  # 而代码路上**其余检查全在动手之后** —— 没有任何决策点。
+  #
+  # 止血（remediate）也在本门下游：plan.steps 里 `type: infra_action` 的步骤，
+  # 审批人在**这张卡片上一起批过**，所以本图不再单设 approve-remediate。
+  # （scenario1 单设那道门，是因为它的 remediate 与 fix **并行**、不在计划门下游。）
+  #
+  # `on_reject: abort` —— 驳回计划 = 这次修复不做，**中止整条 run**。
+  # 本节点**没有** `approved == false → recap` 边，这是有意的：abort 下那条边永远
+  # 不可达，写了就是骗人（加载期也会直接报 WorkflowDAGError）。
+  # 驳回留痕在审批记录（approver + comment）与节点状态 REJECTED 里。
+  approve-plan:
+    kind: approval
+    description: "人工门：审核修复计划（仅记录，不执行修复）"
+    name: "审批修复计划"
+    params:
+      plan: "$.nodes.plan.output"
+      rca: "$.inputs.bug_report.diagnosis.rca"
+    approvers: ["lead-engineer"]
+    timeout: 7200
+    on_reject: abort
+
+  # ===== 修复：改代码 → 止血 → 验证 =====
+  # `service` 取自工单的 CMDB CI：工作区工具的 service 必须是**已 prepare 的仓库名**，
+  # 而这个 CI 名就是工作区准备的键（AGENTFLOW_REPO_MAP）。
+  #
+  # ⚠️ `require: [service]` 是防 docs/TODO.md §20 那个坑的第二道锁：service 解析成 None
+  # 时 ws_* 工具只校验"这个 service 备过工作区没有"，而工作区默认**全量**准备 ——
+  # agent 猜一个名字照样改得动，猜错了静默通过（实测 run_c9eb2fe68d：locate 明说
+  # found=false，fix 自己挑了一个仓库去改）。本图没有 locate 节点，工单的 CI 就是
+  # 唯一的服务来源，所以缺了直接失败。
+  #
+  # 不传 `repo_url`（scenario2 传了）：那是 code-locator 的产物，本图没有定位节点；
+  # 而 fix-implementer 的工具（ws_list_files/read_file/write_file/git）**没有一个读它**
+  # ——留着只会多一个恒为 None 的字段。
+  fix:
+    agent: fix-implementer
+    description: "代码修复：在工作区内改代码并提交到本 run 的隔离分支"
+    require: [service]
+    params:
+      plan: "$.nodes.plan.output"
+      service: "$.inputs.bug_report.cmdb_ci.name"
+    retry: 1
+
+  # 止血（K8s）。排在 `fix` 之后、`test` 之前：test 要同时看代码改动与止血结果
+  # （scenario1 的 test 也吃 remediate 输出）。
+  #
+  # `on_failure: continue` —— 止血失败不该吞掉"代码已修好"这条主线：它变成负证据进
+  # test / recap，让下游知道"线上还没止血"。fix 是 abort，两者刻意不同。
+  #
+  # ⚠️ 标量 `service` 与列表 `services` 同时传是刻意的（与 problem-log-diagnose 的 logs
+  # 节点同因）：标量是 require 的锚点 —— 列表形态缺元素时 `_usable([{...}])` 仍为 True，
+  # 抓不住；列表才是 agent 看的候选集形态，且 `evidence_source` 如实标 ticket_cmdb_ci
+  # （工单给的服务不能写成上游推断）。
+  remediate:
+    agent: infra-remediator
+    description: "K8s 止血：产出扩缩容/重启/改配额的动作计划"
+    require: [service]
+    params:
+      plan: "$.nodes.plan.output"
+      service: "$.inputs.bug_report.cmdb_ci.name"
+      services:
+        - service: "$.inputs.bug_report.cmdb_ci.name"
+          confidence: high
+          evidence_source: ticket_cmdb_ci
+      namespace: "$.inputs.bug_report.cmdb_ci.namespace"
+    on_failure: continue
+
+  test:
+    agent: tester
+    description: "跑测试：在工作区执行该服务登记的测试命令"
+    require: [service]
+    params:
+      fix: "$.nodes.fix.output"
+      remediate: "$.nodes.remediate.output"
+      plan: "$.nodes.plan.output"
+      service: "$.inputs.bug_report.cmdb_ci.name"
+    retry: 1
+
+  review:
+    agent: reviewer
+    description: "代码评审：审阅 diff 与测试结果，判断是否放行提交"
+    params:
+      diff: "$.nodes.fix.output.diff"
+      service: "$.inputs.bug_report.cmdb_ci.name"
+
+  # ===== 提交门（前置审批）=====
+  # 压在不可逆动作（推分支 + 开 PR）之前，人看到的是"diff + 测试证据"。
+  approve-commit:
+    kind: approval
+    description: "人工门：审核 diff + 测试证据，通过后才提交 PR"
+    name: "审批代码提交"
+    params:
+      diff: "$.nodes.fix.output.diff"
+      test: "$.nodes.test.output"
+    approvers: ["lead-engineer"]
+    timeout: 7200
+    # 驳回沿 `approved == false → recap` 边路由（图里有显式去处），不中止 run。
+    # 必须显式写 `continue`：默认是 `abort`，那会把"人否决"报成 run failed。
+    on_reject: continue
+
+  commit:
+    agent: committer
+    description: "提交：把工作区改动推到 PR"
+    require: [service]
+    params:
+      diff: "$.nodes.fix.output.diff"
+      test: "$.nodes.test.output"
+      service: "$.inputs.bug_report.cmdb_ci.name"
+
+  # ===== 回传原系统（工单闭环）=====
+  # ⚠️ 位置决定覆盖范围：它**只在成功路径上**（commit 之后）。test / review / 审批驳回
+  # 那几条边直接到 recap，不经过这里 —— 那些情况工单不会被回传。要让"修复没走完"也回传，
+  # 得把它挪到 recap 之前的分叉点，或另加并行边（与 scenario1/2 同款、同取舍）。
+  #
+  # on_failure 用 abort：回传失败必须让 run 失败。工单闭环是对外承诺，静默吞掉等于
+  # "界面看着成功、原系统那边什么都没收到"（`delivered` 由 VERDICT_FIELDS 判红兜一层）。
+  ticket-done:
+    agent: ticket-done
+    description: "把 run 的处置结果回传原系统，更新工单状态"
+    params:
+      ticket: "$.inputs.bug_report"
+      callback_url: "$.inputs.callback_url"
+      rca: "$.inputs.bug_report.diagnosis.rca"
+      fix: "$.nodes.fix.output"
+      # commit 的整个输出：有 pr_url ⇒ 已提交；null ⇒ 这条路径没走到提交。
+      commit: "$.nodes.commit.output"
+    on_failure: abort
+
+  recap:
+    agent: postmortem
+    description: "复盘：汇总根因、处置与后续事项"
+    params:
+      rca: "$.inputs.bug_report.diagnosis.rca"
+      fix: "$.nodes.fix.output"
+      remediate: "$.nodes.remediate.output"
+      # 传 commit 的**整个输出**，不传某个字段：有 `pr_url` ⇒ 已提交；`null` ⇒ 这条
+      # 路径根本没走到提交（被审批驳回）——两种含义在下游都读得出来。
+      commit: "$.nodes.commit.output"
+
+edges:
+  # 计划门：plan **不直达** fix —— 中间必须有人工决策点（见 approve-plan 上的说明）。
+  - { from: plan, to: approve-plan }
+  - { from: approve-plan, to: fix, when: "$.nodes.approve-plan.output.approved == true" }
+
+  # 修复 → 止血 → 测试 → 审查（全线性；本图没有并行分支，故不需要 join/required_edges）
+  - { from: fix, to: remediate }
+  - { from: remediate, to: test }
+  - { from: test, to: review, when: "$.nodes.test.output.passed == true" }
+  # ⚠️ 这里**没有**「测试没过 → recap」的边：`tester.passed == false` 与
+  # `reviewer.approved == false` 由 executor 的 VERDICT_FIELDS 判成**节点失败**、整条 run
+  # 判 failed，那两条边因此**永远不可达**（失败节点的出边恒失活），留着就是"看着还有条
+  # 退路、实际走不到"。代价：测试/审查不通过时没有复盘 —— 与 scenario1/2 同款同因。
+
+  # 审查 → 提交门
+  - { from: review, to: approve-commit, when: "$.nodes.review.output.approved == true" }
+
+  # 提交门：通过 → 提交；驳回 → 直接复盘（不中止 run）
+  - { from: approve-commit, to: commit, when: "$.nodes.approve-commit.output.approved == true" }
+  - { from: approve-commit, to: recap, when: "$.nodes.approve-commit.output.approved == false" }
+
+  # 提交之后先回传原系统、再进复盘 —— 复盘要能提到工单是否已闭环
+  - { from: commit, to: ticket-done }
+  - { from: ticket-done, to: recap }

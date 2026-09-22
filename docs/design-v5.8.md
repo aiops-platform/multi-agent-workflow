@@ -1426,6 +1426,39 @@ locate → halt (found == false)
 
 `docs/TODO.md` §25（`ws_git` 允许 `push`）的前提随之变动，见该节的「前提变动」注。
 
+### 4.15 补记（2026-09-22）：新增 `problem-diagnose-fix` —— 修复段从诊断流程里拆出来单跑
+
+§4.14 把修复段从 `problem-log-diagnose` 删掉之后，Problem Center 的修复段就没有载体了。
+新流程把它接回来，但**不自带诊断链**——由 `bug-fix-scenario2` 简化而来，
+只留修复段，诊断结论走**入参**。落点：`agentflow/seed/workflows/problem-diagnose-fix.yaml`
+（种子，`_manifest.yaml` 末条）+ `tests/test_problem_diagnose_fix_workflow.py`。
+
+```
+plan → 计划门 → fix → remediate → test → review → 提交门 → commit → ticket-done → recap
+```
+
+**三个决定，都不显然，写在这里**：
+
+1. **诊断是入参 `rca`，不是节点**。诊断链（triage/scope/logs/trace/metrics/infra/locate/
+   know/rca + halt）整段不在图里。代价是这条流程**离开诊断就跑不了**：`plan` 用
+   `require: [rca]` 把它设成硬前置，缺了立刻失败——而不是让 fix-planner 对着工单标题
+   **编一份计划**（params 引用失配只会解析成 None，不报错，run 照样绿）。
+   > 之所以能这么拆：`problem-log-diagnose` 的 `create-ticket` 已经把诊断结论写进工单
+   > （`inputs.diagnosis`，"拿到工单的人不必回平台翻诊断"），诊断与修复之间本就有桥。
+2. **`remediate` 线性排在 `fix` 之后，不单设 `approve-remediate`**。判据是**它有没有被
+   计划门覆盖**：本图里 `remediate` 在 `approve-plan` 下游，而 `plan.steps` 里
+   `type: infra_action` 的步骤审批人**一起批过**了。scenario1 单设那道门，是因为它的
+   `remediate` 与 `fix` **并行**、不在计划门下游——同样的节点在不同拓扑下需要不同的门。
+3. **它是新租户的默认流程**（manifest 末条 ⇒ `POST /tickets/{tid}/run` 不带 `workflow_id`
+   时跑的就是它）。已知代价：Ticket Inbox 手建工单没有 `rca`，点「发起」会在 `plan` 处
+   `require` 失败。这是取舍不是缺陷（宁可红着说"缺诊断"，也不要绿着编一份方案）；
+   要让 `bug-fix-scenario2` 继续当默认，把 manifest 里两条换个位置即可。
+
+**两处沿用了既有判据、没另起一套**：`fix` / `remediate` / `test` / `commit` 都
+`require: [service]` 且取自工单的 CMDB CI —— 本图**没有 `locate` 节点**，工单 CI 是唯一的
+服务来源，缺了必须失败（`docs/TODO.md` §20：工作区默认全量准备，service 猜错静默通过）；
+`ticket-done` 仍只挂在 `commit` 之后（成功路径），所以测试没过 / 审批驳回那几条路**不回传工单**。
+
 ---
 
 ## 5. 编排层：动态编排 🟡 未实施（设计稿）
@@ -2349,6 +2382,7 @@ agent 如实填 delivered:false    →  VERDICT_FIELDS 判节点 FAILED
 | **v5.7** | 2026-09-16 | **CMDB 业务域分层 + 诊断链「定位问题服务」**（基线 = v5.6）：① **CMDB 本体**（`aiops-mcp-servers` `e6c7a34`）删 `cross_journey_hub` / 加 `domain`（净 12 类节点）、边 11 → 13 且加 `layer` 分层约束（business 层禁 app—app）、`app.kind`、`refs` → `app_codebase` 边、业务层加 `description`/`keywords`，**对外契约零改动**；② **编排侧**新增 `service-scoper` agent 与 `scope` 节点（triage 之后、取数之前定位问题服务），`logs`/`trace`/`metrics`/`infra` 四节点改 `join: all` + `required_edges`，`rca` 加交叉核对，注册表 15 → 16；③ §4 置信度驱动取数广度、§5 工单 service 证据权重、§6 `trace.failing_service` 降格为证据；④ §8 业界调研（27 来源 / 125 主张）。未实施：意图分类路由、§3.6 的 (B) `clarification`、召回为空的兜底 |
 | **v5.7（补记）** | 2026-09-17 / 09-18 | 实施后另落地：`kind: halt` 中断原语（`scope.insufficient` / `rca.insufficient` / `locate.found == false` 三触发点共用，`outcome: completed\|halted`）；`scope` 输出补 `matched_domains`/`ambiguous`/`business_paths`/`in_domain`/`evidence_source` 五字段（同名跨域与伪归因两起实测）；修复链加审批决策点（`plan → approve-plan → …`）并让 `on_reject` 从死配置变成有消费方；新租户播种（`docs/TODO.md` §13） |
 | **v5.7（补记）** | 2026-09-21 | `problem-log-diagnose`（Problem Center「分析new」）收敛为「诊断输出」单门（`kind: approval` 终态节点、无出边），修复段整体删除；连带修掉"删段后工作区不再准备"导致整条诊断链在 halt 处中断的缺陷（`WORKSPACE_AGENTS` 加 `code-locator`） |
+| **v5.8（补记）** | 2026-09-22 | 新增种子流程 `problem-diagnose-fix`：修复段从诊断流程里拆出来单跑（诊断结论走入参 `rca`，不再自带诊断链），`remediate` 线性排在 `fix` 之后由计划门一并覆盖，并成为新租户的默认流程。见 §4.15 |
 | **v5.8** | 2026-09-21 | **三合一版**（本文档）：把 v5.6（系统基线）与 v5.7（其上的增量）合并为单一文档，**取代二者**；以 v5.6 结构为骨架、v5.7 内容归位（CMDB 本体 → §3.4、诊断链 → §4 新章、实施清单 → §3.4.7/§4.11–§4.14/§8、调研 → §10、开放问题 → §11）。头部与 §1 重写（三层关系、状态总览按事实更新：数据面/CMDB/诊断链 🟢、编排层 🟡），§1.4 补齐两轮合并的旧→新章节号对照。**正文结论未改**，只做归位、引用重编号，以及三处就地更正：`query_entity_graph` 边数 11 → 13、注册表 15 → 16、§5.4.2 那处悬空的"见 §8.1"改指 design-v5.2.md。新增 §9.10/§9.11 两条待办、§6.1 与 §5.3.2 两处实施后才暴露的边界张力。§13（工单回传闭环）见该章 |
 
 
