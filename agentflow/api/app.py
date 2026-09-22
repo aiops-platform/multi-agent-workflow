@@ -695,7 +695,10 @@ class TicketRequest(BaseModel):
 
 
 class TicketRunRequest(BaseModel):
-    """从工单发起一次 run。``workflow_id`` 不传则用库里第一个已保存流程。"""
+    """从工单发起一次 run。``workflow_id`` 不传就用**工单钉的那条**（建单时声明的
+    ``next_workflow``）；没钉过的老工单才退回「库里第一个已保存流程」。
+    见 ``_workflow_for_ticket``。
+    """
 
     workflow_id: str | None = None
 
@@ -729,6 +732,44 @@ def _run_inputs_from_ticket(ticket: dict) -> dict:
     if isinstance(bug, dict) and "diagnosis" in bug:
         inputs["bug_report"] = {k: v for k, v in bug.items() if k != "diagnosis"}
     return inputs
+
+
+async def _workflow_for_ticket(cs: Any, ticket: dict, req: TicketRunRequest | None) -> str:
+    """选这次 run 用哪条 workflow：**显式指定 > 工单钉的 > 库里最新一条**。
+
+    - **显式指定**（body 的 `workflow_id`）：人工覆盖，最高优先。
+    - **工单钉的**：建单时 `create-ticket` 节点声明的 `next_workflow`
+      （见 `ticket_store._ticket_fields_from_params`），按 **name** 查回 id。
+      查不到 → **409，绝不退回默认** —— 静默跑一条不是他要的流程比跑不起来危险得多，
+      这次改动正是为了消掉"推一条新流程，在途工单的目标就悄悄换了"。
+      ⚠️ 钉的是**名字契约、不是内容契约**：往同名行 `PUT` 一份新 YAML 就能换掉内容。
+    - **兜底**：`saved[0]`（`list()` 首条 = 最新），只服务没钉过的老工单与手建单。
+
+    空表仍 400（改动前也是这个分支报的）。
+    """
+    explicit = (req.workflow_id if req else None) or None
+    if explicit:
+        return explicit
+
+    pinned = (ticket.get("workflow_name") or "").strip()
+    if pinned:
+        wf = await cs.workflow.get_by_name(pinned)
+        if wf is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"工单指定的 workflow「{pinned}」不在库里（被删或改名了）——"
+                    "不换一张单就没法发起诊断"
+                ),
+            )
+        return wf["id"]
+
+    saved = await cs.workflow.list()
+    if not saved:
+        raise HTTPException(
+            status_code=400, detail="库里没有已保存的 workflow，无法发起诊断"
+        )
+    return saved[0]["id"]
 
 
 @app.post("/tickets", status_code=201)
@@ -849,6 +890,7 @@ async def run_ticket(
 
     工单的 inputs 原样下发，**只有 `bug_report.diagnosis` 例外**——那是上一次 run 的产物，
     回流会喂给模型（见 ``_run_inputs_from_ticket``）。
+    用哪条 workflow 由 ``_workflow_for_ticket`` 定：**工单钉的优先于"最新一条"**。
     """
     cs = await _control_stores(ctx)
     tickets = cs.ticket
@@ -856,15 +898,7 @@ async def run_ticket(
     if ticket is None:
         raise HTTPException(status_code=404, detail="ticket 不存在")
 
-    workflow_id = (req.workflow_id if req else None) or None
-    if workflow_id is None:
-        # 未指定则用第一个已保存流程 —— 让「发起诊断」按钮无需先选流程
-        saved = await cs.workflow.list()
-        if not saved:
-            raise HTTPException(
-                status_code=400, detail="库里没有已保存的 workflow，无法发起诊断"
-            )
-        workflow_id = saved[0]["id"]
+    workflow_id = await _workflow_for_ticket(cs, ticket, req)
 
     wf_row = await cs.workflow.get(workflow_id)
     if wf_row is None:

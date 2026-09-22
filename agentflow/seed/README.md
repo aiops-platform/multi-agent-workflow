@@ -25,6 +25,8 @@
 - **`workflows/_manifest.yaml` 的最后一条 = 新租户的默认流程**。因为
   `POST /tickets/{tid}/run` 不指定 `workflow_id` 时取 `saved[0]`，而 `list()` 按
   `created_at DESC`；播种时按 manifest 顺序给 `created_at` 递增，顺序因此是确定的。
+  这是**兜底**：工单在建单时钉了 `next_workflow` 就以钉的为准（`api/app.py` 的
+  `_workflow_for_ticket`），只有没钉过的老工单和手工建的工单才轮到这条顺序。
 - **workflow 的 YAML 正文逐字节保留，不要加头注释**——那段文本会原样进 `workflows.yaml`
   列，并在 UI 的 YAML 编辑框里显示给终端用户。
 - **`agents/` 与 `dataplane.yaml` 的 `bindings` 是两个来源，别混**：

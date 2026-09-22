@@ -25,6 +25,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import yaml
+
 HERE = Path(__file__).resolve().parent
 WORKFLOW_YAML = HERE / "problem-log-diagnose.workflow.yaml"
 WORKFLOW_NAME = "problem-log-diagnose"
@@ -64,10 +66,51 @@ class Api:
             raise SystemExit(f"✗ {method} {path} → 连不上 {self.base}（{exc.reason}）") from exc
 
 
+def _pinned_next_workflow(yaml_text: str) -> str | None:
+    """图里建单节点（`kind: ticket`）钉的「后续诊断跑哪条」流程名，没有则 None。
+
+    **从 YAML 本身读**，不在这儿抄一份常量：抄一份就是两处真源，改了 YAML 忘了改脚本
+    恰恰会静默放过（这个 preflight 的全部意义就是防这个）。
+    """
+    doc = yaml.safe_load(yaml_text) or {}
+    for node in (doc.get("nodes") or {}).values():
+        if isinstance(node, dict) and node.get("kind") == "ticket":
+            pinned = (node.get("params") or {}).get("next_workflow")
+            if pinned:
+                return str(pinned)
+    return None
+
+
+def check_next_workflow(api: Api, yaml_text: str) -> None:
+    """推送前确认建单节点钉的那条流程**已经在该租户库里** —— fail-closed。
+
+    为什么必须在推的时候就查：`next_workflow` 在库里找不到时，建出来的工单**发起诊断会
+    409**（刻意不退回默认）。而那一刻离推图已经很久，症状指向完全不同的地方
+    （"工单点不动"，看不出是"少推了一条流程"）。
+    """
+    pinned = _pinned_next_workflow(yaml_text)
+    if not pinned:
+        print("  · 建单节点没有钉 next_workflow（建出的工单发起诊断走「最新一条」兜底）")
+        return
+    names = {w.get("name") for w in api("GET", "/workflows")}
+    if pinned not in names:
+        raise SystemExit(
+            f"✗ 这张图的建单节点钉了 workflow「{pinned}」，但租户库 {api.tenant} 里没有它 ——\n"
+            f"  推上去以后，那些工单发起诊断会 409（刻意不退回默认）。\n"
+            f"  先把它推上去（种子里的 agentflow/seed/workflows/problem-diagnose-fix.yaml），\n"
+            f"  或改掉 YAML 里 create-ticket 的 next_workflow。\n"
+            f"  当前库里有：{sorted(n for n in names if n)}"
+        )
+    print(f"  ✓ 目标流程 {pinned} 已在库里")
+
+
 def seed_workflow(api: Api) -> str:
     yaml_text = WORKFLOW_YAML.read_text(encoding="utf-8")
     # 先验后存：preview 会跑 workfow 的静态校验（环 / join / params 引用），失败即退出
     api("POST", "/workflows/preview", {"yaml": yaml_text})
+
+    # 再验一条**图外**的依赖：建单节点钉的目标流程必须已在库里（否则建出的单永远 409）
+    check_next_workflow(api, yaml_text)
 
     existing = next(
         (w for w in api("GET", "/workflows") if w.get("name") == WORKFLOW_NAME), None

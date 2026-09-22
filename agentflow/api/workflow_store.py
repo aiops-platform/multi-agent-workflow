@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +15,8 @@ from typing import Any
 import aiosqlite
 
 from ..config import postgres_dsn
+
+log = logging.getLogger("agentflow.api.workflow_store")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS workflows (
@@ -106,6 +109,37 @@ class WorkflowStore:
             return None
         return {"id": row["id"], "name": row["name"], "yaml": row["yaml"]}
 
+    async def get_by_name(self, name: str) -> dict[str, Any] | None:
+        """按 **name** 查（工单钉的「后续诊断跑哪条」用）。没有 → None。
+
+        **重名取最新**：`name` 没有唯一约束，而 `POST /workflows` / `PUT /workflows/{wid}`
+        也**没有**重名 pre-check（同一份 YAML 反复推就会攒出同名行），所以"最新那条"是唯一
+        说得通的选择——迭代流程的人推的最后一次就是他要的那份。与 `run_ticket` 里
+        `saved[0]` 是同一套约定。
+
+        次级排序 `id DESC` **不是装饰**：`created_at` 是 ISO 微秒串，同批写入会撞车
+        （播种本身就是 1ms 递增），撞车时没有二级键就又是掷骰子。命中多行时告警 —— 重名
+        是配置问题，不该静默吞掉。
+
+        返回形状与 :meth:`get` 一致（含 yaml）：调用方拿到就得用，不该再查一次。
+        """
+        await self.connect()
+        cur = await self._c.execute(
+            "SELECT id, name, yaml FROM workflows WHERE name=? "
+            "ORDER BY created_at DESC, id DESC",
+            (name,),
+        )
+        rows = await cur.fetchall()
+        if not rows:
+            return None
+        if len(rows) > 1:
+            log.warning(
+                "workflow 重名：name=%s 命中 %d 条（%s），按 created_at 取最新的 %s",
+                name, len(rows), ", ".join(r["id"] for r in rows), rows[0]["id"],
+            )
+        r = rows[0]
+        return {"id": r["id"], "name": r["name"], "yaml": r["yaml"]}
+
     async def update(self, wid: str, name: str, yaml_text: str) -> bool:
         """更新 name/yaml，返回是否命中。"""
         await self.connect()
@@ -127,8 +161,11 @@ class WorkflowStore:
 # PostgreSQL 后端（state_store=postgres 时由 build_workflow_store 选择）
 # ----------------------------------------------------------------------
 # 列 schema 与 sqlite WorkflowStore 完全一致（文本列、时间戳存 ISO TEXT），
-# 方法面 / 返回形状两端相同，供 API 层无感切换。name 无 UNIQUE 约束（与 sqlite
-# 一致：重名在应用层 pre-check，不做 DB 唯一约束），故无需跨库归一化异常。
+# 方法面 / 返回形状两端相同，供 API 层无感切换。name 无 UNIQUE 约束，且**并没有**
+# 重名 pre-check——`POST /workflows`（api/app.py）与 `PUT /workflows/{wid}` 都不查
+# （"重名在应用层 pre-check"那句是从 `mcp_store`/`agent_store` 抄来的，那两个才有：
+# 见 app.py 的 "name 已存在（MCP server 名需唯一）"）。所以重名真会发生，按 name 查
+# 一律**取最新**（见 `get_by_name`），故也无需跨库归一化异常。
 _PG_SCHEMA = """
 CREATE TABLE IF NOT EXISTS workflows (
     id         TEXT PRIMARY KEY,
@@ -214,6 +251,25 @@ class PgWorkflowStore:
         if row is None:
             return None
         return {"id": row["id"], "name": row["name"], "yaml": row["yaml"]}
+
+    async def get_by_name(self, name: str) -> dict[str, Any] | None:
+        """见 SQLite 侧同名方法的说明（重名取最新，语义逐字相同）。"""
+        await self.connect()
+        cur = await self._c.execute(
+            "SELECT id, name, yaml FROM workflows WHERE name=%s "
+            "ORDER BY created_at DESC, id DESC",
+            (name,),
+        )
+        rows = await cur.fetchall()
+        if not rows:
+            return None
+        if len(rows) > 1:
+            log.warning(
+                "workflow 重名：name=%s 命中 %d 条（%s），按 created_at 取最新的 %s",
+                name, len(rows), ", ".join(r["id"] for r in rows), rows[0]["id"],
+            )
+        r = rows[0]
+        return {"id": r["id"], "name": r["name"], "yaml": r["yaml"]}
 
     async def update(self, wid: str, name: str, yaml_text: str) -> bool:
         """更新 name/yaml，返回是否命中。"""

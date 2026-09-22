@@ -79,6 +79,8 @@ def load_workflow_seeds() -> list[dict[str, str]]:
     顺序为什么是语义：``POST /tickets/{tid}/run`` 未指定 `workflow_id` 时取 ``saved[0]``
     （`api/app.py`），而 ``list()`` 是 ``ORDER BY created_at DESC`` 无二级排序——
     播种时按序给 ``created_at`` 递增（见 :func:`seed_defaults`）才能让"谁当默认"是确定的。
+    这是**兜底**：工单建单时钉了 `next_workflow` 的按钉的走（`_workflow_for_ticket`），
+    只有没钉过的老工单与手建单才轮到这条顺序。
     """
     raw = _read(f"{_WORKFLOW_DIR}/{_WORKFLOW_MANIFEST}")
     if raw is None:
@@ -257,6 +259,7 @@ async def seed_defaults(
             for i, item in enumerate(load_workflow_seeds()):
                 # created_at 递增 1ms：保证 list() 的顺序 == manifest 顺序，
                 # 于是 manifest 最后一条 = saved[0] = 新租户的默认流程（确定，不是掷骰子）。
+                # （没钉 next_workflow 的工单才用它；钉了的按钉的走。）
                 ts = (base + timedelta(milliseconds=i)).isoformat()
                 if await workflow_store.insert_if_absent(
                     item["id"], item["name"], item["yaml"], ts

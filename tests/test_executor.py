@@ -1211,3 +1211,34 @@ def test_bad_ticket_node_is_rejected_at_load(yaml_text: str, needle: str) -> Non
     assert needle in str(ei.value)
     # 冻结快照路径照常能加载（同一份 YAML，strict=False）
     assert Workflow.load_yaml(yaml_text, strict=False).dag is not None
+
+
+def test_ticket_next_workflow_must_not_be_an_upstream_reference() -> None:
+    """`next_workflow` 写成 `$.nodes.X`（= 让上游，最后一环是**模型**，挑流程）也要拦。
+
+    单独写而不是并进上面那张参数表：这里**必须有个真的上游节点**，否则会先被
+    `check_params_refs` 以"引用非上游"拦掉 —— 那条 `needle` 对不上，测的就不是这条规则了。
+    两者都拦得住是好事，但得知道拦住的是哪一条。
+
+    ⚠️ 同上：只在 `strict=True`（编写路径）拦。解析完字面量与引用都是普通字符串，
+    运行期分辨不出来，所以这是唯一能拦的地方。
+    """
+    from agentflow.core.dag import WorkflowDAGError
+
+    yaml_text = """
+name: pin-by-model
+nodes:
+  triage: { agent: triage }
+  t:
+    kind: ticket
+    on_failure: abort
+    require: [source_ref]
+    params:
+      source_ref: "$.inputs.ref"
+      next_workflow: "$.nodes.triage.output.next_workflow"
+edges:
+  - { from: triage, to: t }
+"""
+    with pytest.raises(WorkflowDAGError, match="next_workflow"):
+        Workflow.load_yaml(yaml_text)
+    assert Workflow.load_yaml(yaml_text, strict=False).dag is not None

@@ -176,6 +176,75 @@ async def test_run_ticket_strips_diagnosis_from_run_inputs(stores) -> None:
         assert run["inputs"]["bug_report"]["number"] == "INC0012345"
 
 
+def _wf_yaml(name: str) -> str:
+    """同一张图，只换流程名（`insert_if_absent` 的 name 与 YAML 里的 name 都对上）。"""
+    return VALID_YAML.replace("simple-flow", name)
+
+
+async def test_run_ticket_uses_the_pinned_workflow_not_the_newest(stores) -> None:
+    """工单钉了哪条就跑哪条 —— 这是「钉住」这件事的全部意义。
+
+    改之前只有一条隐式规则：请求不带 `workflow_id` 就取 `list()` 首条（= 最新）。
+    于是**推一条新流程，在途工单的目标就悄悄换了**（实测：`problem-diagnose-fix`
+    一推进 otr 库，所有工单的发起诊断都改了道，而页面上看不出来）。
+    """
+    w = stores["workflow"]
+    # created_at **显式给**：靠 save() 的 now 撞运气的话，"谁更新"本身就不确定，
+    # 这条测试会时红时绿（`list()` 只有 created_at 一个排序键）。
+    await w.insert_if_absent(
+        "w-old", "old-flow", _wf_yaml("old-flow"), "2026-01-01T00:00:00+00:00"
+    )
+    await w.insert_if_absent(
+        "w-new", "new-flow", _wf_yaml("new-flow"), "2026-02-01T00:00:00+00:00"
+    )
+    ticket_inputs = {"bug_report": BUG_REPORT}
+
+    async with _client() as client:
+        # ① 没钉（老工单 / 手工建的单）→ 仍走"最新那条"兜底，行为不变
+        plain = await _create(client)
+        out = (await client.post(f"/tickets/{plain['id']}/run", json={})).json()
+        assert out["workflow_id"] == "w-new"
+
+        # ② 钉了 old-flow → 跑 old-flow，**不是**最新的那条
+        # （`create` 返回 id 字符串；返回行的是 `create_once`）
+        pinned = await stores["ticket"].create(
+            "local", title="钉过的单", inputs=ticket_inputs, workflow_name="old-flow"
+        )
+        out = (await client.post(f"/tickets/{pinned}/run", json={})).json()
+        assert out["workflow_id"] == "w-old"
+
+        # ③ body 显式指定压过钉子（人工覆盖）
+        out = (
+            await client.post(f"/tickets/{pinned}/run", json={"workflow_id": "w-new"})
+        ).json()
+        assert out["workflow_id"] == "w-new"
+
+
+async def test_run_ticket_409_when_pinned_workflow_is_gone(stores) -> None:
+    """钉的流程在库里找不到（被删/改名）→ **409 且什么都不做**：不退回默认、不起 run。
+
+    刻意 fail-closed：静默跑一条不是他要的流程比跑不起来危险得多，而"退回了默认"在
+    页面上看不出来——只有 run 列表里的流程名对不上，那时已经跑完了。
+    """
+    async with _client() as client:
+        await client.post("/workflows", json={"name": "whatever", "yaml": VALID_YAML})
+        t = await stores["ticket"].create(
+            "local",
+            title="钉了个不存在的",
+            inputs={"bug_report": BUG_REPORT},
+            workflow_name="被删掉的流程",
+        )
+        resp = await client.post(f"/tickets/{t}/run", json={})
+        assert resp.status_code == 409
+        assert "被删掉的流程" in resp.json()["detail"]
+
+        # 409 必须发生在 start_run **之前**：run 没起、工单没动
+        assert (await client.get("/runs")).json() == []
+        after = (await client.get(f"/tickets/{t}")).json()
+        assert after["run_ids"] == []
+        assert after["status"] == "new"
+
+
 async def test_run_ticket_without_any_workflow_400(stores) -> None:
     async with _client() as client:
         t = await _create(client)
@@ -247,12 +316,14 @@ async def test_next_number_format_and_is_per_day(tmp_path) -> None:
     assert await ts.next_number(now=d2) == "INC-20260922-0001"
 
 
-async def test_legacy_db_without_source_ref_gets_the_column(tmp_path) -> None:
-    """**已开通的租户库**（`tickets` 表早就在、没有 `source_ref` 列）连上后要能补列。
+async def test_legacy_db_without_source_ref_gets_the_columns(tmp_path) -> None:
+    """**已开通的租户库**（`tickets` 表早就在、缺后加的列）连上后要能补列。
 
-    不补的话 `CREATE UNIQUE INDEX` 会直接报 "no such column"，而
-    `CREATE TABLE IF NOT EXISTS` 对已存在的表什么也不做 —— 这是个只在**升级已有环境**时
-    才暴露的坑（本机的 otr / local 正是这种库）。
+    缺 `source_ref`：`CREATE UNIQUE INDEX` 会直接报 "no such column"。
+    缺 `workflow_name`：读单时 `_COLS` 里带了它，SQL 直接报 no such column —— 老库整个
+    工单页面挂掉。
+    而 `CREATE TABLE IF NOT EXISTS` 对已存在的表什么也不做 —— 这是只在**升级已有环境**
+    时才暴露的坑（本机的 otr / local 正是这种库）。
     """
     import sqlite3
 
@@ -274,6 +345,7 @@ async def test_legacy_db_without_source_ref_gets_the_column(tmp_path) -> None:
     await ts.connect()  # 不抛
     cols = {r[1] for r in sqlite3.connect(path).execute("PRAGMA table_info(tickets)")}
     assert "source_ref" in cols
+    assert "workflow_name" in cols  # 后加的第二列，同样要补
     # 历史行（source_ref 为 NULL）不参与唯一约束，也不影响新单
     assert len(await ts.list("otr")) == 1
     await ts.create_once("otr", source_ref="PR-0009", title="new", inputs={})
@@ -298,6 +370,7 @@ async def test_create_from_node_params_maps_bug_report_and_requires_source_ref(t
         "window_end": "2026-09-21T08:00:00+00:00",
         "rca": {"hypotheses": ["NPE"]},
         "plan": {"summary": "补空值校验"},
+        "next_workflow": "problem-diagnose-fix",
     }
     out = await create_from_node_params(ts, "otr", params)
     assert out["created"] is True
@@ -314,6 +387,26 @@ async def test_create_from_node_params_maps_bug_report_and_requires_source_ref(t
     assert "diagnosis" not in row["inputs"]
     # 不能就地改调用方的 params（executor 交过来的那份是共用的形状）
     assert "diagnosis" not in params["bug_report"]
+
+    # `next_workflow` → 工单的 `workflow_name`**列**（发起诊断时按它选流程）。
+    # 它绝不能进 `inputs`：inputs 会被原样当成下一次 run 的 inputs 下发给 agent，
+    # 平台内部指针进去就变成"喂给模型的东西"（诊断那次已经踩过一次）。
+    assert row["workflow_name"] == "problem-diagnose-fix"
+    assert "workflow_name" not in row["inputs"]
+    assert "next_workflow" not in row["inputs"]["bug_report"]
+
+    # 没声明 → 列为 None（发起诊断时退回"最新一条"兜底）
+    out2 = await create_from_node_params(
+        ts, "otr", {"source_ref": "PR-0101", "bug_report": {"number": "PR-0101"}}
+    )
+    assert (await ts.get("otr", out2["ticket_id"]))["workflow_name"] is None
+    # 空白串也当没声明（模板里留空不该变成"钉了一个空名字"→ 发起诊断 409）
+    out3 = await create_from_node_params(
+        ts,
+        "otr",
+        {"source_ref": "PR-0102", "bug_report": {"number": "PR-0102"}, "next_workflow": "  "},
+    )
+    assert (await ts.get("otr", out3["ticket_id"]))["workflow_name"] is None
 
     # 缺 source_ref（幂等判据）→ 失败，而不是建一张无法去重的单
     with pytest.raises(ValueError, match="source_ref"):

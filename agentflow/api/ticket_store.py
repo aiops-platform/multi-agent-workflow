@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     run_ids    TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    source_ref TEXT
+    source_ref TEXT,
+    workflow_name TEXT
 );
 """
 
@@ -75,12 +76,12 @@ TICKET_FAILED = "failed"
 #: 免得改动前面 12 个位置参数的对应关系（那是最容易静默错位的地方）。
 _COLS = (
     "id, tenant_id, number, title, service, namespace, severity,"
-    " status, inputs, run_ids, created_at, updated_at, source_ref"
+    " status, inputs, run_ids, created_at, updated_at, source_ref, workflow_name"
 )
 
 #: `_COLS` 的占位符（sqlite 用 `?`、PG 用 `%s`）；两处 INSERT 共用，防手抄错个数。
-_PLACEHOLDERS_SQLITE = ",".join(["?"] * 13)
-_PLACEHOLDERS_PG = ",".join(["%s"] * 13)
+_PLACEHOLDERS_SQLITE = ",".join(["?"] * 14)
+_PLACEHOLDERS_PG = ",".join(["%s"] * 14)
 
 
 def _row_to_ticket(row: Any) -> dict[str, Any]:
@@ -112,7 +113,7 @@ class TicketStore:
         await self._conn.commit()
 
     async def _ensure_columns(self) -> None:
-        """给**已存在**的 tickets 表补 `source_ref` 列。
+        """给**已存在**的 tickets 表补后加的列（`source_ref`、`workflow_name`）。
 
         `CREATE TABLE IF NOT EXISTS` 对已建好的表**什么也不做** —— 所以已经开通的租户库
         （otr / local…）不会自动拿到新列，而 `CREATE UNIQUE INDEX` 会直接报
@@ -122,6 +123,8 @@ class TicketStore:
         cols = {r["name"] for r in await cur.fetchall()}
         if "source_ref" not in cols:
             await self._c.execute("ALTER TABLE tickets ADD COLUMN source_ref TEXT")
+        if "workflow_name" not in cols:
+            await self._c.execute("ALTER TABLE tickets ADD COLUMN workflow_name TEXT")
 
     @property
     def _c(self) -> aiosqlite.Connection:
@@ -145,6 +148,7 @@ class TicketStore:
         severity: str | None = None,
         status: str = TICKET_NEW,
         source_ref: str | None = None,
+        workflow_name: str | None = None,
     ) -> str:
         """建工单，返回 id（12 位 hex）。
 
@@ -158,7 +162,7 @@ class TicketStore:
             (
                 tid, tenant_id, number, title, service, namespace, severity,
                 status, json.dumps(inputs, ensure_ascii=False), "[]", now, now,
-                source_ref,
+                source_ref, workflow_name,
             ),
         )
         await self._c.commit()
@@ -185,6 +189,7 @@ class TicketStore:
         namespace: str | None = None,
         severity: str | None = None,
         status: str = TICKET_NEW,
+        workflow_name: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """**按 `source_ref` 查重后建单**：已有 → 返回那一张（`created=False`）；否则新建（`True`）。
 
@@ -211,7 +216,7 @@ class TicketStore:
             (
                 tid, tenant_id, number, title, service, namespace, severity,
                 status, json.dumps(inputs, ensure_ascii=False), "[]", now, now,
-                source_ref,
+                source_ref, workflow_name,
             ),
         )
         await self._c.commit()
@@ -308,7 +313,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     run_ids    TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    source_ref TEXT
+    source_ref TEXT,
+    workflow_name TEXT
 );
 """
 
@@ -342,6 +348,9 @@ class PgTicketStore:
         await self._conn.execute(_PG_SCHEMA)
         # 旧库补列，必须早于建索引（与 SQLite 侧同因）；PG 原生支持 IF NOT EXISTS
         await self._conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS source_ref TEXT")
+        await self._conn.execute(
+            "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS workflow_name TEXT"
+        )
         await self._conn.execute(_PG_SCHEMA_INDEXES)
         await self._conn.commit()
 
@@ -367,6 +376,7 @@ class PgTicketStore:
         severity: str | None = None,
         status: str = TICKET_NEW,
         source_ref: str | None = None,
+        workflow_name: str | None = None,
     ) -> str:
         await self.connect()
         tid = uuid.uuid4().hex[:12]
@@ -376,7 +386,7 @@ class PgTicketStore:
             (
                 tid, tenant_id, number, title, service, namespace, severity,
                 status, json.dumps(inputs, ensure_ascii=False), "[]", now, now,
-                source_ref,
+                source_ref, workflow_name,
             ),
         )
         await self._c.commit()
@@ -403,6 +413,7 @@ class PgTicketStore:
         namespace: str | None = None,
         severity: str | None = None,
         status: str = TICKET_NEW,
+        workflow_name: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """见 SQLite 侧同名方法的说明（语义逐字相同）。"""
         await self.connect()
@@ -421,7 +432,7 @@ class PgTicketStore:
             (
                 tid, tenant_id, number, title, service, namespace, severity,
                 status, json.dumps(inputs, ensure_ascii=False), "[]", now, now,
-                source_ref,
+                source_ref, workflow_name,
             ),
         )
         await self._c.commit()
@@ -547,6 +558,11 @@ def _ticket_fields_from_params(params: dict) -> dict[str, Any]:
     for k in ("window_start", "window_end"):
         if params.get(k):
             inputs[k] = params[k]
+    # 后续诊断跑哪条 workflow：**存名字，不存 id**。YAML 是跨租户同一份，而 id 每个租户库
+    # 都不一样（种子 `seed-*` vs 新建的 12 位 hex）——名字是唯一可移植的键。发起诊断时由
+    # `POST /tickets/{tid}/run` 按名字查回 id（查不到即 409，见 api/app.py 的
+    # `_workflow_for_ticket`）。空串/None 一律当"没声明" → 那边退回老规矩（取最新一条）。
+    next_workflow = str(params.get("next_workflow") or "").strip() or None
     return {
         "title": str(bug.get("short_description") or params.get("title") or "").strip()[:200]
         or "未命名工单",
@@ -554,6 +570,7 @@ def _ticket_fields_from_params(params: dict) -> dict[str, Any]:
         "service": bug.get("service") or ci.get("name"),
         "namespace": params.get("namespace") or ci.get("namespace"),
         "severity": params.get("severity") or bug.get("severity"),
+        "workflow_name": next_workflow,
     }
 
 

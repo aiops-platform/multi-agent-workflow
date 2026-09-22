@@ -327,6 +327,28 @@ async def test_workflow_default_is_the_last_manifest_entry() -> None:
     assert (await w.list())[0]["id"] == entries[-1]["id"]
 
 
+async def test_get_by_name_takes_the_newest_when_names_collide() -> None:
+    """按 name 查（工单钉「后续诊断跑哪条」用它）：**重名取最新**，未命中返回 None。
+
+    重名是可能的：`POST /workflows` / `PUT /workflows/{wid}` 都没有重名 pre-check
+    （那句"应用层 pre-check"只对 mcp_servers / agent_configs 成立），同一份 YAML
+    反复推就会攒出同名行。"最新那条"是唯一说得通的选择——迭代流程的人推的最后一次
+    就是他要的那份。
+
+    时间戳**显式给**（`insert_if_absent`），不靠 `save()` 的 now 撞运气：这条测试的
+    全部意义就是钉住"撞车时按 created_at 分胜负"，随机的 now 会让它时红时绿。
+    """
+    w, _m, _a = await _stores()
+    assert await w.get_by_name("没有这条") is None
+
+    await w.insert_if_absent("w-old", "同一名字", "name: 旧\nnodes: {}\nedges: []\n", "2026-01-01T00:00:00+00:00")
+    assert (await w.get_by_name("同一名字"))["id"] == "w-old"
+    await w.insert_if_absent("w-new", "同一名字", "name: 新\nnodes: {}\nedges: []\n", "2026-02-01T00:00:00+00:00")
+    assert (await w.get_by_name("同一名字"))["id"] == "w-new"
+    # 返回形状与 get() 一致（含 yaml）：调用方拿到就得用，不该再查一次
+    assert (await w.get_by_name("同一名字"))["yaml"].startswith("name: 新")
+
+
 async def test_insert_if_absent_never_overwrites() -> None:
     """直接钉 store 层的冲突分支：同 id / 同 name 再插一次 → False 且内容不变。
 

@@ -293,6 +293,17 @@ class DAG:
                 raise WorkflowDAGError(
                     f"建单节点 {nid} 不该声明 agent（它不调 LLM）：当前 agent={node.agent!r}"
                 )
+            # ③ `next_workflow`（建出的工单后续跑哪条流程）**只收字面量**。
+            #    `$.` 引用意味着"由上游输出决定"——而上游输出的最后一环是**模型**，
+            #    等于让 LLM 挑一条流程去跑（同 §13.4 "让模型决定地址"那一类）。
+            #    解析完两者都是普通字符串，**运行期分辨不出来**，只能在加载期拦。
+            nxt = (node.params or {}).get("next_workflow")
+            if nxt is not None and (not isinstance(nxt, str) or nxt.strip().startswith("$.")):
+                raise WorkflowDAGError(
+                    f"建单节点 {nid} 的 next_workflow 必须是**字面量流程名**"
+                    f"（如 problem-diagnose-fix），当前是 {nxt!r} —— "
+                    f"引用会让模型/上游输入决定跑哪条流程"
+                )
 
     def _check_on_reject_consistency(self) -> None:
         """``on_reject: abort`` 的审批节点**不得有驳回出边**（§8.1 / CLAUDE.md 约束 4.1）。

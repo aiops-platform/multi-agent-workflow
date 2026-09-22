@@ -189,6 +189,27 @@ def test_ticket_node_is_declared_with_the_guards_that_keep_it_honest() -> None:
     assert set(node.require) >= {"source_ref", "bug_report"}
 
 
+def test_ticket_node_pins_the_follow_up_workflow_to_a_real_seed() -> None:
+    """建单节点钉的「后续诊断跑哪条」必须是**字面量**，且**真的是一条种子流程**。
+
+    为什么两个字面量都要钉：
+
+    - **字面量**：写成 `$.` 引用等于让上游（最后一环是模型）挑一条流程去跑；解析完两者
+      都是普通字符串、运行期分辨不出来，所以加载期就拦（`core/dag.py._check_node_kinds`）。
+    - **是种子**：这个名字在发起诊断时要按 name 查回 id（`api/app.py._workflow_for_ticket`），
+      查不到是 **409（不退回默认）**。而"这条流程在不在库里"取决于**推图之前**有没有先推
+      目标流程——本地两个库恰好都有，所以本地测不出来。把它钉在种子上，等于断言
+      "新租户建库后这条 pin 一定解析得到"。
+      （`problem-diagnose-fix` 这个名字本身由 `test_problem_diagnose_fix_workflow.py` 钉住。）
+    """
+    from agentflow.seed import load_workflow_seeds
+
+    pinned = (load().dag.nodes[TICKET_NODE].params or {}).get("next_workflow")
+    assert pinned == "problem-diagnose-fix"
+    assert not pinned.startswith("$.")
+    assert pinned in {s["name"] for s in load_workflow_seeds()}
+
+
 def test_plan_uses_multi_option_analyst_with_matching_param_name() -> None:
     """plan 用 remediation-planning-analyst 才有互斥多方案（fix-planner 只出单计划）。
 
