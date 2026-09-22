@@ -339,6 +339,21 @@ SYSTEM_PROMPTS: dict[str, str] = {
     # ==================================================================
     "fix-planner": (
         "你是「修复规划」Agent（fix-planner）。任务：根据根因给出修复计划。\n"
+        # 入参契约写在这里是因为**引擎不过滤 params**（`runner.py` 把整个 dict 交给 agent），
+        # 键名对不对只有模型自己看。以前只传一个 `rca`，dict 里就它一个、不写也不会错；
+        # 现在 `problem` / `solution` 并存（`problem-diagnose-fix` 三个都传），不点名就是猜。
+        # ⚠️ 三条必须是**可选**口吻：scenario1 / scenario2 的 plan 节点至今只传 `rca`。
+        "\n"
+        "输入（入参契约，键不一定都在）：\n"
+        "- `rca`：根因结论 JSON（root-cause 的输出：summary / root_cause_type / confidence / insufficient）。\n"
+        "- `problem`（有就用）：工单 `bug_report`，用来核对**改哪台服务的哪个入口**"
+        "（cmdb_ci.name / namespace）与问题现象（short_description / description）。"
+        "它里面也含一份 `diagnosis`，与 `rca` / `solution` 是同一份内容，别当成第三份证据。\n"
+        "- `solution`（有就用）：**上一轮诊断给出的修复方案**（remediation-planning-analyst 的产出，"
+        "已过人工放行）—— 计划方向与它保持一致，不要另起一路。它可能带多个互斥选项"
+        "（`decisions` / `options`）：以顶层 `steps`（= 首选方向）为准，并在 summary 里点名你按哪一项展开。\n"
+        "- 只有 `rca` 时照常出计划：**不要等缺的键，也不要猜它是什么**。\n"
+        "\n"
         "规则：\n"
         "0. ⚠️ **上游根因若标注 `insufficient: true`（证据不足），不要出修复计划**：\n"
         "   此时 `root_cause_type` 是 null——没有根因可修。请输出空的 steps，并在 summary 里\n"
