@@ -28,11 +28,12 @@
 
 ## ⚠️ 它**不**覆盖什么（别以为跑完就全同步了）
 
-- **agent 定义**：`agentflow/seed/agents/*.yaml`（如 `ticket-done`）走的是
-  `agent_configs` 表，有自己的一套（`PUT /agent-configs/{name}`）。
-- **MCP server 与 agent↔server 绑定**：`agentflow/seed/dataplane.yaml`。
+**数据面**：MCP server 注册（`seed/dataplane.yaml`）、agent↔server 绑定、
+自定义 agent 定义（`seed/agents/*.yaml`，如 `ticket-done`）—— 那是
+`scripts/push_seed_agents.py`（`make sync-agents TENANT=…`）的活。
 
-那两样只在**空表**时播种，改了对已开通租户同样无效。
+两边都只在**空表**时播种，改了对已开通租户同样无效；**两条命令合起来**才是完整的
+「把 seed 推到已开通租户」。
 """
 from __future__ import annotations
 
@@ -153,9 +154,10 @@ def main() -> int:
     names = [i["name"] for i in seeds]
     print(
         f"\n✓ {len(seeds)} 条全部就位：{', '.join(names)}\n"
-        "\n⚠️ 本脚本**只同步 workflow**。agent 定义（`seed/agents/*.yaml` → `agent_configs`）"
-        "\n   与 MCP server / 绑定（`seed/dataplane.yaml`）各自有自己的一套，"
-        "\n   同样只在空表时播种 —— 见脚本头部的说明。"
+        "\n⚠️ 本脚本**只同步 workflow**。数据面（MCP server 注册 + agent 绑定 +"
+        "\n   自定义 agent）走：\n"
+        f"     make sync-agents TENANT={args.tenant}\n"
+        "   两条合起来才是完整的「把 seed 推到已开通租户」。"
     )
     return 0
 

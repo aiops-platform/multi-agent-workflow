@@ -240,8 +240,23 @@ make lint      # ruff 检查
      它按**名字**配对逐条推（命中 PUT 保 id、未命中 POST），推完**回读逐字节校验**，
      不一致就非零退出。**为什么需要这条**：seed 是「空表才播、绝不覆盖」，
      所以 `git pull` 对**已开通租户毫无效果、也没有任何提示**（§6.0 开头那条）。
-     ⚠️ 它**只同步 workflow** —— agent 定义（`seed/agents/*.yaml` → `agent_configs`）
-     与 MCP 绑定（`seed/dataplane.yaml`）各有各的路，脚本头部写明了。
+     它**只同步 workflow** —— 数据面走下面那条。
+
+   - ⭐ **数据面（MCP server 注册 + agent 绑定 + 自定义 agent）同理，走 `sync-agents`：**
+
+     ```bash
+     make sync-agents TENANT=otr             # 先 --dry-run 也行：DRY=1
+     ```
+
+     **语义是「并集，只加不删」**——租户自己加的 server 绑定会被保留（实测 otr 的
+     `code-locator` 多绑了一个 `git-server`，脚本原样留着）。自定义 agent 则**缺行才建**，
+     已有行不碰（prompt 是本地可改的）。
+     ⚠️ **它挡的那类缺陷最隐蔽**：绑定缺行 ⇒ `mcp_server_ids` 为 NULL ⇒ 该 agent
+     **零工具**（`GET /agents` 的 `tool_count` 直接看得出来），而它的提示词照旧点名要调
+     MCP 工具——模型于是把工具调用写成**纯文本**，最终表现为「agent 未输出合法 JSON」，
+     **中间没有任何一步会报"绑定缺失"**。实测 2026-09-22（`run_62f21fa82f`）：otr 缺 4 行，
+     `service-scoper` 零工具 → `scope` 节点失败 → `on_failure: abort` **整条 run 中止**。
+     判据一句话：**agent 的工具来自绑定，而绑定不在代码里。**
    - 原设计的 DAG 形态（节点类型 / when / join / 审批门禁）见 `design-v5.2.md` §8.1（**仓库上一级目录**，不在 `backend/docs/`——v5.6 §8 是「残余风险」不是这个）；
      当前流程的节点结构见 `docs/design-v5.8.md` §4（种子里的三条：scenario1 / scenario2 /
      problem-diagnose-fix，末者见 §4.15）。

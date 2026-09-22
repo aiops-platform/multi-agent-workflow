@@ -1,4 +1,4 @@
-.PHONY: install test lint api doctor sandbox-image sync-workflows
+.PHONY: install test lint api doctor sandbox-image sync-workflows sync-agents
 
 # 变量：此前几个目标各自硬编码 ./venv/bin/...，而 `doctor` 用了没定义的 $(PY)
 # —— 展开成空，于是它去执行脚本文件本身（`Permission denied`）。**这个目标从加进来
@@ -55,7 +55,22 @@ sandbox-image:
 #   make sync-workflows TENANT=otr
 #   make sync-workflows TENANT=otr DRY=1
 #
-# ⚠️ 只同步 workflow；agent 定义与 MCP 绑定另有自己的一套（见脚本头部说明）。
+# ⚠️ 只同步 workflow；数据面（MCP server + agent 绑定）走下面的 `sync-agents`。
 sync-workflows:
 	@test -n "$(TENANT)" || { echo "用法：make sync-workflows TENANT=<租户id>"; exit 1; }
 	$(PY) scripts/push_seed_workflows.py --tenant $(TENANT) $(if $(DRY),--dry-run,)
+
+# 把 seed 的**数据面**推到**已开通租户**：MCP server 注册 + agent 绑定 + 自定义 agent。
+#
+# 为什么需要这条：与 workflow 同一个坑（上面那条），但**后果更隐蔽**。绑定缺行 ⇒
+# `mcp_server_ids` 为 NULL ⇒ 该 agent **零工具**，而它的提示词照旧点名要调 MCP 工具
+# —— 模型于是把工具调用写成纯文本，最终表现为「agent 未输出合法 JSON」，
+# **中间没有任何一步会报"绑定缺失"**。实测代价见脚本头部（`run_62f21fa82f`）。
+#
+#   make sync-agents TENANT=otr
+#   make sync-agents TENANT=otr DRY=1
+#
+# 语义：**并集，只加不删**（租户自己加的 server 绑定会被保留）。
+sync-agents:
+	@test -n "$(TENANT)" || { echo "用法：make sync-agents TENANT=<租户id>"; exit 1; }
+	$(PY) scripts/push_seed_agents.py --tenant $(TENANT) $(if $(DRY),--dry-run,)

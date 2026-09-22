@@ -589,9 +589,23 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 
 1. ~~`provision` 时播种 workflow~~ —— ✅ 见上（播种源已定：仓库 seed 目录）
 2. **只剩"数据面绑定"之外的：** ← 见下一节，已随本次一起做了
-3. **补一个「同步」动作**：改完 workflow 后一条命令推给目标租户，而不是手工 `PUT`。
-   **这条仍然待办**——种子只解决"新租户初始"，**已存在租户的 workflow 更新仍需手工 `PUT`**
-   （这正是"改 seed 对已存在租户无效"的另一面）。
+3. ~~**补一个「同步」动作**：改完 seed 后一条命令推给目标租户，而不是手工 `PUT`。~~
+   ✅ **已实施（2026-09-22）**，两条命令各管一半：
+
+   ```bash
+   make sync-workflows TENANT=otr    # seed/workflows/*.yaml
+   make sync-agents    TENANT=otr    # seed/dataplane.yaml + seed/agents/*.yaml
+   ```
+
+   都是"按 name 配对 → 推 → 回读校验"、不一致非零退出，`DRY=1` 可空跑。
+   `sync-agents` 是**并集语义（只加不删）**，见脚本头部。
+
+   **为什么数据面那一半非补不可**（`sync-agents` 的来历）：种子只解决"新租户初始"，
+   而已开通租户缺绑定时**完全静默** —— 绑定缺行 ⇒ `mcp_server_ids` 为 NULL ⇒ 该 agent
+   **零工具**，而它的提示词照旧点名要调 MCP 工具，于是模型把工具调用写成纯文本，
+   最终报的是「agent 未输出合法 JSON」。实测 `run_62f21fa82f`：otr 缺 4 行绑定，
+   `service-scoper` 零工具 → `scope` 节点失败 → `abort` **整条 run 中止**。
+   判据：**agent 的工具来自绑定，而绑定不在代码里。**
 
 <details><summary>原始记录（选播种源之前的讨论，保留备查）</summary>
 

@@ -6,15 +6,25 @@
 > **新租户的库刚建好、目标表为空**时被写入一次。
 >
 > **改了这里的文件，对已经存在（已播种过）的租户没有任何效果。**
-> 要改已开通租户，走 `PUT /workflows/{wid}`（或 agent / mcp-server 的对应端点）。
+> 要推到已开通租户，走这两条命令（**不是**手搓 curl —— 漏推一条不会报错）：
+>
+> ```bash
+> make sync-workflows TENANT=otr    # seed/workflows/*.yaml
+> make sync-agents    TENANT=otr    # seed/dataplane.yaml + seed/agents/*.yaml
+> ```
+>
+> 两者都支持 `DRY=1` 先空跑，推完**回读校验**、不一致就非零退出。
+> 只想改一条时也可以走端点：`PUT /workflows/{wid}` / `PUT /agent-configs/{name}`。
+>
+> ⚠️ `sync-agents` 是**并集语义（只加不删）**：租户自己加的绑定会被保留。
 
 ## 里面有什么
 
-| 文件 | 播到哪张表 | 触发条件 |
-|---|---|---|
-| `workflows/_manifest.yaml` + `*.yaml` | 租户库 `workflows` | 该表为空 |
-| `dataplane.yaml` | 租户库 `mcp_servers` + `agent_configs`（**内置 agent 的绑定**） | 各自表为空 |
-| `agents/*.yaml` | 租户库 `agent_configs`（**自定义 agent 的完整定义**） | 同上（与绑定同一张表、同一道空表守卫） |
+| 文件 | 播到哪张表 | 触发条件（新租户） | 推给**已开通**租户 |
+|---|---|---|---|
+| `workflows/_manifest.yaml` + `*.yaml` | 租户库 `workflows` | 该表为空 | `make sync-workflows` |
+| `dataplane.yaml` | 租户库 `mcp_servers` + `agent_configs`（**内置 agent 的绑定**） | 各自表为空 | `make sync-agents` |
+| `agents/*.yaml` | 租户库 `agent_configs`（**自定义 agent 的完整定义**） | 同上（与绑定同一张表、同一道空表守卫） | `make sync-agents` |
 
 播种发生在 `TenantStoresRouter._build()`——即**任何导致某个租户库被打开**的路径
 （`tenantctl provision` / `migrate`、API 启动、Worker 装配…），所以覆盖是全的。
