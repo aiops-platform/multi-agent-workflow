@@ -542,3 +542,87 @@ async def test_worker_without_lock_still_runs() -> None:
     await w.wait_run(run_id)
     assert calls["n"] == 1
     assert (await store.get_run(run_id))["status"] == "done"
+
+
+# ======================================================================
+# 暂停按租约分流：僵尸 run 的出路
+# ======================================================================
+async def test_pause_forces_paused_when_no_executor() -> None:
+    """**明确没有执行者** → 直接置 paused（不再发命令）。
+
+    僵尸 run 既不能被 trigger（CAS 只从 queued 接）也不能被 resume（只从
+    paused/waiting_approval 接）—— 发命令也没人接。不把它挪到 `paused` 就永远卡着。
+    """
+    from agentflow.lock.memory import InMemoryLock
+
+    store = InMemoryStateStore()
+    queue = InMemoryQueue()
+    svc = RunService(store, queue=queue, lock=InMemoryLock())
+    wf = Workflow.load_yaml(SIMPLE_YAML)
+    run_id = (await svc.start_run("t1", wf, {}))["run_id"]
+    await store.update_run(run_id, status="running")      # 模拟卡住的 run
+
+    assert await svc.executor_alive(run_id) is False, "没 worker 持租约"
+    out = await svc.pause_run(run_id, tenant_id="t1")
+
+    assert out == {"forced": True}
+    assert (await store.get_run(run_id))["status"] == "paused"
+
+
+async def test_pause_stays_graceful_when_executor_alive() -> None:
+    """**有执行者** → 走原语义（发波间暂停命令，让当前节点跑完）。"""
+    from agentflow.lock import run_exec_lease_key
+    from agentflow.lock.memory import InMemoryLock
+
+    store = InMemoryStateStore()
+    queue = InMemoryQueue()
+    lock = InMemoryLock()
+    svc = RunService(store, queue=queue, lock=lock)
+    wf = Workflow.load_yaml(SIMPLE_YAML)
+    run_id = (await svc.start_run("t1", wf, {}))["run_id"]
+    await store.update_run(run_id, status="running")
+    await lock.acquire(run_exec_lease_key(run_id), ttl=60)   # 模拟 worker 在跑
+
+    out = await svc.pause_run(run_id, tenant_id="t1")
+
+    assert out == {"forced": False}
+    assert (await store.get_run(run_id))["status"] == "running", "有执行者时不该直接改状态"
+
+
+async def test_executor_alive_is_unknown_without_lock() -> None:
+    """没接线 lock → **未知（None）**，不是 False。
+
+    未知**不允许**被当成"没有"：redis 抖一下就把真在跑的 run 判成僵尸、强制暂停它，
+    接着点恢复 —— 就有了两个执行器。宁可说"不知道"。
+    """
+    store = InMemoryStateStore()
+    svc = RunService(store, queue=InMemoryQueue())        # 不传 lock
+    wf = Workflow.load_yaml(SIMPLE_YAML)
+    run_id = (await svc.start_run("t1", wf, {}))["run_id"]
+    await store.update_run(run_id, status="running")
+
+    assert await svc.executor_alive(run_id) is None
+    # 未知走**保守**那条：不强制改状态
+    out = await svc.pause_run(run_id, tenant_id="t1")
+    assert out == {"forced": False}
+    assert (await store.get_run(run_id))["status"] == "running"
+
+
+async def test_executor_alive_unknown_when_lock_errors() -> None:
+    """查询本身失败（redis 抖了）→ 同样归为**未知**，不归为 False。"""
+
+    from agentflow.lock.memory import InMemoryLock
+
+    class _FlakyLock(InMemoryLock):
+        """只有"查租约"这一步坏掉 —— 配额锁照常（否则 start_run 就走不到这里）。"""
+
+        async def is_locked(self, key):
+            raise RuntimeError("redis connection reset")
+
+    store = InMemoryStateStore()
+    svc = RunService(store, queue=InMemoryQueue(), lock=_FlakyLock())
+    wf = Workflow.load_yaml(SIMPLE_YAML)
+    run_id = (await svc.start_run("t1", wf, {}))["run_id"]
+    await store.update_run(run_id, status="running")
+
+    assert await svc.executor_alive(run_id) is None

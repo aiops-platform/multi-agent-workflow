@@ -29,6 +29,7 @@ from .core.dag import FAILED, TERMINAL
 from .core.workflow import Workflow
 from .executor.dag_executor import DAGExecutor, NodeRunner, WorkflowNodeFailed
 from .executor.resume import resume_executor
+from .lock import run_exec_lease_key
 from .queue.base import Queue, topic_command, topic_trigger
 from .statestore.base import StateStore
 from .statestore.router import store_resolver
@@ -265,19 +266,60 @@ class RunService:
     # ------------------------------------------------------------------
     # 生命周期命令（pause / resume / stop）
     # ------------------------------------------------------------------
-    async def pause_run(self, run_id: str, tenant_id: str | None = None) -> None:
-        """暂停：queue 模式发布命令；inline 对进程内 executor 请求波间暂停。"""
+    async def executor_alive(self, run_id: str) -> bool | None:
+        """这条 run **还有执行者吗**？``True`` / ``False`` / **``None`` = 未知**。
+
+        判据是执行租约（`lock/__init__.py`）：Worker 执行期间持它并续期，
+        进程一死续期就停、TTL 到期键消失。**只有它能把"死透了的 run"和"真在跑的
+        run"分开** —— 两者在 `runs.status` 上都是同一个词 `running`。
+
+        ⚠️ **三态而不是两态**，这是刻意的：
+        - 没接线 lock（`self.lock is None`）→ 未知
+        - 查询本身失败（redis 抖了）→ 未知
+
+        未知**不允许**被当成"没有"。把它当成 `False`，就等于在 redis 抖一下的时候
+        把一条真在跑的 run 判成僵尸 —— 而强制暂停它，接着点恢复，就会造出**两个
+        执行器**。宁可说"不知道"。
+        """
+        if self.lock is None:
+            return None
+        try:
+            return await self.lock.is_locked(run_exec_lease_key(run_id))
+        except Exception as exc:  # noqa: BLE001 - 查不到 ≠ 没有
+            log.warning("[%s] 查执行租约失败（%s）—— 存活状态按**未知**处理", run_id, exc)
+            return None
+
+    async def pause_run(self, run_id: str, tenant_id: str | None = None) -> dict:
+        """暂停。两条路：
+
+        - **有执行者**（租约在）：走原来的语义 —— 发命令 / 请进程内 executor
+          在**当前节点跑完**后暂停，checkpoint 完整。
+        - **明确没有执行者**（租约不在）：那条 run 已经不会自己动了，发命令没人接。
+          直接 CAS ``running → paused``。**这是僵尸 run 的唯一出路** ——
+          它既不能被 trigger 也不能被 resume，不把它挪到 `paused` 就永远卡着。
+        - **未知**：走有执行者那条路（保守）。理由同上：未知不等于没有。
+        """
         store, run, tenant = await self._run_context(run_id, tenant_id)
+        if run.get("status") == "running" and await self.executor_alive(run_id) is False:
+            if await store.cas_update_run_status(run_id, "running", "paused"):
+                log.info(
+                    "[%s] 暂停：无执行者 → 直接置 paused（僵尸 run 的手工出路；"
+                    "接着 resume 即可从 checkpoint 续跑）", run_id,
+                )
+                return {"forced": True}
+            # CAS 失败 = 这一刻状态被推进了（比如刚跑完）→ 落到下面的常规路径
+            log.info("[%s] 暂停：CAS 失败（状态刚被推进），改走常规路径", run_id)
         if self.queue is not None:
             await self.queue.publish(
                 topic_command(tenant),
                 key=run_id,
                 message={"type": "pause", "run_id": run_id, "tenant_id": tenant},
             )
-            return
+            return {"forced": False}
         ex = self._executors.get(run_id)
         if ex is not None:
             ex.request_pause()
+        return {"forced": False}
 
     async def resume_run(self, run_id: str, tenant_id: str | None = None) -> dict:
         """断点续跑（§4.4）：从 checkpoint + 原 snapshot 重建并继续执行。"""

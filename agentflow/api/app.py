@@ -1194,6 +1194,12 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
         "total_tokens": total_tokens,
         "total_cost": total_cost,
         "nodes": nodes,
+        #: 这条 run **还有执行者吗**：True / False / **None = 未知**（见 `RunService.executor_alive`）。
+        #:
+        #: 僵尸 run 与正在跑的 run 在 `status` 上是**同一个词** `running` —— 只有它能分开。
+        #: ⚠️ 三态是刻意的：没接线 lock 或查询失败都是 None，**未知不等于没有**
+        #: （把未知当 False 会在 redis 抖一下时把真在跑的 run 判成僵尸）。
+        "executor_alive": await service.executor_alive(run_id),
         "pending_approvals": pending,
         #: 该 run 的**全部**审批（含已处理的），给「审批」页签用。
         #:
@@ -1288,13 +1294,19 @@ async def reject(
 
 @app.post("/runs/{run_id}/pause")
 async def pause_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context)) -> dict:
-    """暂停 run（§8.6）：当前节点跑完即暂停，checkpoint 保留；``/resume`` 恢复。"""
+    """暂停 run（§8.6）：当前节点跑完即暂停，checkpoint 保留；``/resume`` 恢复。
+
+    ``forced=true`` 表示走的是**另一条路**：那条 run **明确没有执行者**（执行租约不在），
+    发命令没人接 —— 于是直接置 ``paused``。**这是僵尸 run 的唯一出路**（它既不能被
+    trigger 也不能被 resume），接着 ``/resume`` 即可从 checkpoint 续跑。
+    """
     await _run_for_tenant(run_id, ctx)
     try:
-        await _service().pause_run(run_id, tenant_id=ctx.tenant_id)
+        out = await _service().pause_run(run_id, tenant_id=ctx.tenant_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"ok": True, "run_id": run_id, "status": "pausing"}
+    return {"ok": True, "run_id": run_id, "status": "pausing",
+            "forced": bool((out or {}).get("forced"))}
 
 
 @app.post("/runs/{run_id}/resume")
