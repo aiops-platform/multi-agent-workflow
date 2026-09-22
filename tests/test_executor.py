@@ -1245,6 +1245,7 @@ edges:
 
 
 # ======================================================================
+# ======================================================================
 # 产物守卫：声称改了文件，而本节点一次成功的写都没有（ARTIFACT_FIELDS）
 # ======================================================================
 #
@@ -1424,3 +1425,116 @@ async def test_artifact_guard_ignores_on_failure_continue() -> None:
     with pytest.raises(WorkflowNodeFailed):
         await ex.run()
     assert ex.get_status("fix") == "failed"
+# ======================================================================
+# kind: closed —— 收尾节点（确定性、不调 LLM），**且不触发全局跳过**
+#
+# 它与 halt 是**两个** kind，不能合并：halt 一执行，其余 PENDING 全被 SKIPPED；
+# 而 closed 后面**还可以有节点**（这两张图里是 recap）。判据都挂在 is_halt 上，
+# 所以 closed 天然不参与那两处（`halt_triggered()` 与 `_ready_nodes` 的独占块）。
+# ======================================================================
+CLOSED_YAML = """
+name: closed-demo
+version: "1.0.0"
+inputs:
+  bug: { type: object, required: true }
+nodes:
+  work:
+    agent: work
+  ticket-closed:
+    kind: closed
+    params:
+      reason: "本流程不回传原系统"
+  recap:
+    agent: recap
+    params: { s: "$.nodes.work.output.summary" }
+edges:
+  - { from: work, to: ticket-closed }
+  - { from: ticket-closed, to: recap }
+"""
+
+
+async def test_closed_node_is_deterministic_and_does_not_skip_what_follows() -> None:
+    """收尾节点：DONE、**不调 runner**、**不触发全局跳过**。
+
+    后半句是它与 halt 的分界，也正是这条与
+    `test_halt_skips_everything_remaining_even_with_unconditional_edges` 互为对照的地方：
+    那边 halt 一执行下游全 SKIPPED，这边 `recap` 必须照跑。
+    """
+    wf = Workflow.load_yaml(CLOSED_YAML)
+    runner, calls = make_runner()
+    ex = DAGExecutor(
+        "run_cl", "tenant-a", wf.dag, InMemoryStateStore(),
+        node_runner=runner, inputs={"bug": {}},
+    )
+    assert await ex.run() == "done"
+
+    assert ex.get_status("ticket-closed") == DONE
+    # 不调 LLM —— 判据是 runner 一次都没被调到它身上（同 halt / ticket 那两组）
+    assert set(calls) == {"work", "recap"}
+    # **没有全局跳过**：后面的 recap 照常跑完
+    assert ex.get_status("recap") == DONE
+    assert ex.halt_triggered() is False
+    # 产出形状：显式的 closed 标记 + 图里写的那句静态理由
+    out = ex.node_states["ticket-closed"]["output"]
+    assert out["closed"] is True
+    assert out["reason"] == "本流程不回传原系统"
+
+
+async def test_closed_node_ignores_a_dollar_reference_reason() -> None:
+    """`reason` 只认**字面量**：写成 `$.` 引用时退回默认句，而不是由上游（可能是模型）决定。
+
+    与 halt 的教训不同 —— halt 的 reason **必须**从触发它的那条边上搬（每次不同），
+    而这里是一句**静态**的话，写在图里才对。
+    """
+    wf = Workflow.load_yaml(
+        CLOSED_YAML.replace('reason: "本流程不回传原系统"', 'reason: "$.nodes.work.output.summary"')
+    )
+    runner, _ = make_runner()
+    ex = DAGExecutor(
+        "run_cl2", "tenant-a", wf.dag, InMemoryStateStore(), node_runner=runner, inputs={}
+    )
+    assert await ex.run() == "done"
+    assert ex.node_states["ticket-closed"]["output"]["reason"] == "工单处理流程到此结束"
+
+
+@pytest.mark.parametrize(
+    ("yaml_text", "needle"),
+    [
+        # 未知 kind 会静默降级成普通 agent 节点（去调 runner）——白名单要拦住
+        (CLOSED_YAML.replace("kind: closed", "kind: closedd"), "kind"),
+        # 收尾节点不调 LLM，写 agent 只会被静默忽略
+        (
+            CLOSED_YAML.replace("    kind: closed", "    kind: closed\n    agent: tester"),
+            "agent",
+        ),
+    ],
+)
+def test_bad_closed_node_is_rejected_at_load(yaml_text: str, needle: str) -> None:
+    from agentflow.core.dag import WorkflowDAGError
+
+    with pytest.raises(WorkflowDAGError, match=needle):
+        Workflow.load_yaml(yaml_text)
+
+
+def test_scenario_workflows_end_with_closed_not_ticket_done() -> None:
+    """两张场景图的收尾是 `closed`，**不再有 `agent: ticket-done`**。
+
+    它们跑的多是手工建的工单 —— 原系统里没有对应物，送去投递必然 404
+    → `delivered: false` → 节点判红 → `on_failure: abort` 中止整条 run。
+    **那不是投递坏了，是我们不该把一张没有上游的单送去投递口。**
+
+    `problem-diagnose-fix` **保留** `ticket-done`（APM 主路径的回传走它），故只断言这两张。
+    """
+    from agentflow.seed import load_workflow_seeds
+
+    dags = {s["name"]: Workflow.load_yaml(s["yaml"]).dag for s in load_workflow_seeds()}
+    for name in ("order-service-quotation-print-fail", "bug-fix-scenario2"):
+        dag = dags[name]
+        assert dag.nodes["ticket-closed"].is_closed
+        assert not [n for n in dag.nodes.values() if n.agent == "ticket-done"], name
+        # 位置不变：commit → ticket-closed → recap
+        assert [e.target for e in dag.edges if e.source == "commit"] == ["ticket-closed"]
+        assert [e.target for e in dag.edges if e.source == "ticket-closed"] == ["recap"]
+
+    # 保留项：APM 主路径那条图仍靠 ticket-done 回传
+    assert dags["problem-diagnose-fix"].nodes["ticket-done"].agent == "ticket-done"

@@ -392,6 +392,29 @@ class DAGExecutor:
             "missing": missing,
         }
 
+    def _closed_output(self, node: Node) -> dict:
+        """``kind: closed`` 节点的产出：**这张工单的处理流程到此结束**。
+
+        与 :meth:`_halt_output` 的差别，正是这两个 kind 的分界：
+
+        - halt 的 ``reason`` 必须**从触发它的那条边上搬**（每次不同，且不该由图的作者逐个
+          维护 —— 加一个触发点就得回来改一次 params，那是同一个脆弱面）。
+        - 这里的 ``reason`` 是**一句静态的话**（"本流程不回传原系统"这类），所以直接写在
+          图里、原样带出去即可。**不写成 ``$.`` 引用**：那样就成了"由上游决定这句话"，
+          而上游最后一环往往是模型 —— 让模型去描述"结束了吗"没有意义。
+
+        产出带 ``closed: true``，让下游（以及看节点输出的人）能一眼认出这是收尾节点
+        而不是一个碰巧没干活的普通节点。
+        """
+        reason = node.params.get("reason") if isinstance(node.params, dict) else None
+        if not isinstance(reason, str) or reason.strip().startswith("$."):
+            reason = ""
+        return {
+            "closed": True,
+            "node": node.id,
+            "reason": reason.strip() or "工单处理流程到此结束",
+        }
+
     def halt_triggered(self) -> bool:
         """本条 run 有没有**真的执行过** halt 节点 → 判定为「中断」。
 
@@ -866,6 +889,15 @@ class DAGExecutor:
                 # 上游输出**的搬运，没有需要模型判断的地方。花一次 LLM 调用做这件事既慢
                 # 又可能不听话，而"中断"恰恰是最不该出岔子的那条路。
                 output = self._halt_output(node)
+            elif node.is_closed:
+                # 收尾节点，与 halt 同样是**确定性**的（不调 LLM、无副作用）。
+                #
+                # ⚠️ 但**与 halt 有一处关键不同**：它**不触发全局跳过** —— `halt` 一执行，
+                # 其余 PENDING 全被 `_process_skips` 标 SKIPPED；而 `closed` 后面还能有节点
+                # （这条流程里是 `recap`）。
+                # 这一条不需要在这里写任何分支就成立：全局跳过的判据是 `halt_triggered()`，
+                # 它只看 `is_halt`；`_ready_nodes` 的独占块同理。**别把它并进那两处**。
+                output = self._closed_output(node)
             else:
                 output = await self._run_with_retry(
                     node, params, external_operation_id=self._external_operation_id(node, ctx)

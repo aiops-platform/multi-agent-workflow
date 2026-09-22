@@ -942,6 +942,10 @@ locate → halt (found == false)
   negative_evidence 并**把节点标 DONE**，建单失败会"看着成功"。
 - ⚠️ **`kind` 白名单也是这次加的**（`agent|approval|halt|ticket`，只在 `strict=True`）：
   此前未知 kind 会**静默降级成普通 agent 节点**去调 runner，打错一个字母也不报错。
+  （2026-09-22 白名单加了第五个：**`closed`** —— 收尾节点，见 `core/dag.py` 的
+  `Node.is_closed`。确定性、不调 LLM；与 `halt` 的关键差别是**不触发全局跳过**
+  （它后面还能接 `recap`），也**不参与 run 的 outcome**（走到它就是正常跑完，
+  而不是 halt 那种"证据不足、需要补充信息"）。）
 - ⚠️ **已有租户库要补列**：`CREATE TABLE IF NOT EXISTS` 对已存在的表什么也不做，所以
   `source_ref` 靠连接时的一次受保护 `ALTER TABLE` 补上（SQLite 问 PRAGMA，PG 用
   `ADD COLUMN IF NOT EXISTS`）——**且必须早于建唯一索引**，否则旧库直接报 "no such column"。

@@ -27,7 +27,9 @@ inputs:
     description: "服务→仓库映射；不提供则由 CMDB 查询"
   # 原系统接收处置结果的回调地址。
   # **required: false** —— 不是每次调用方都提供，且写死地址会让 workflow 绑死在一个环境上。
-  # 缺省时 ticket-done 只组装载荷、并在输出里如实标注「未投递」（见该节点上的说明）。
+  # ⚠️ **本流程已不再消费它**（2026-09-22）：末尾的收尾节点是 `ticket-closed`，
+  # 不回传原系统（见该节点上的说明）。只有 `problem-diagnose-fix` 还在用 `callback_url`。
+  # 留着这个声明是为了**向后兼容已有的在途工单**（它们的 inputs 里带着它）。
   callback_url:
     type: string
     required: false
@@ -328,35 +330,24 @@ nodes:
       service: "$.nodes.locate.output.service"
       # 幂等：external_operation_id = PR number
 
-  # ===== 回传原系统（工单闭环）=====
-  # 提交之后、复盘之前：把这次处置的结果回传给**原系统**（ServiceNow 一类），
-  # 让工单在那边也走到终态 —— 否则活干完了、工单还挂在「处理中」。
+  # ===== 收尾：工单处理流程到此结束 =====
+  # 提交之后、复盘之前，给这条流程一个**显式的终点**：走到这里就代表这张工单的
+  # 处理流程走完了。给人看，也给图一个明确的收尾点。
   #
-  # **已接上投递能力（2026-09-21）**：agent 绑了 aiops-datasource 的
-  # `returnApmTicketStatus`（见 seed/agents/ticket-done.yaml 的 mcp_server_ids），
-  # `delivered` 取工具的真实返回 —— 投不出去就是 false，节点判红（VERDICT_FIELDS）。
+  # **本流程不回传原系统**（2026-09-22 起）：此前这里挂的是 `ticket-done`（调
+  # `returnApmTicketStatus` 把工单号 POST 给 APM）。而本流程跑的多是**手工建的工单**
+  # —— 原系统里根本没有这张单，投过去必然 404 → `delivered: false` → 节点判红
+  # → `on_failure: abort` 把整条 run 中止。**那不是投递坏了，是我们不该把一张没有
+  # 上游的单送去投递口。** 需要回传的那条路走 `problem-diagnose-fix`，它保留 `ticket-done`。
   #
-  # ⚠️ **绑定存在但工具不在**（server 没起 / 工具被改名）时，agent 会退回"没有工具"
-  # 而 prompt 说的是"你能投递" —— 于是它可能**编一个** delivered: true 出来。
-  # 改绑定的名字前先确认工具名逐字一致。
-  #
-  # on_failure 用默认的 abort（与 commit 一致）：回传失败必须让 run 失败。
-  # 工单闭环是对外承诺，静默吞掉等于「界面看着成功、原系统那边什么都没收到」。
-  #
-  # ⚠️ 位置决定覆盖范围：它**只在成功路径上**（commit 之后）。
-  # test / review / 审批驳回那几条边直接到 recap，不经过这里 —— 那些情况工单不会被回传。
-  # 要让「修复没走完」也回传，得把它挪到 recap 之前的分叉点，或另加并行边。
-  ticket-done:
-    agent: ticket-done
-    description: "把 run 的处置结果回传原系统，更新工单状态"
+  # kind: closed 与 halt 同为**确定性**节点（不调 LLM），但**不触发全局跳过** ——
+  # 它后面还有 `recap`。见 core/dag.py 的 Node.is_closed。
+  ticket-closed:
+    kind: closed
+    description: "工单处理流程到此结束（本流程不回传原系统）"
     params:
-      ticket: "$.inputs.bug_report"
-      callback_url: "$.inputs.callback_url"
-      rca: "$.nodes.rca.output"
-      fix: "$.nodes.fix.output"
-      # commit 的整个输出：有 pr_url ⇒ 已提交；null ⇒ 这条路径没走到提交。
-      commit: "$.nodes.commit.output"
-    on_failure: abort
+      # **字面量**，不是 `$.` 引用：这是一句静态的话，不该由上游（最后一环往往是模型）决定。
+      reason: "本流程不回传原系统 —— 手工单 / 无上游对应物"
 
   recap:
     agent: postmortem
@@ -431,8 +422,8 @@ edges:
   - { from: approve-commit, to: commit, when: "$.nodes.approve-commit.output.approved == true" }
   - { from: approve-commit, to: recap, when: "$.nodes.approve-commit.output.approved == false" }
   # 提交之后先回传原系统、再进复盘 —— 复盘要能提到工单是否已闭环
-  - { from: commit, to: ticket-done }
-  - { from: ticket-done, to: recap }
+  - { from: commit, to: ticket-closed }
+  - { from: ticket-closed, to: recap }
   # 定位失败 → 直接到终点（halt）。此时上面四条边全 INACTIVE，
   # 取数节点 SKIPPED 级联到 rca/plan/fix…，只花到 scope 为止的代价。
   - { from: scope, to: halt, when: "$.nodes.scope.output.insufficient == true" }

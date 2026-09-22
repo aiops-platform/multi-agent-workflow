@@ -89,7 +89,17 @@ class Node:
     #: （后者分不清"中断"与"正常跳过"——如 ``test.passed == false`` 跳过 review/commit）。
     #:
     #: 它是**确定性**的：不调 LLM，只把入参里的"为什么停、缺什么"如实带出去。
-    kind: str = "agent"  # agent | approval | halt | ticket
+    #:
+    #: ``closed`` —— **工单处理流程的终点标记**（2026-09-22 加）。走到它就代表
+    #: "这张工单的处理流程到此结束"，给人看，也给图一个显式的收尾点。
+    #:
+    #: **它像 `halt` 的地方**：同样确定性、不调 LLM。
+    #: **它刻意不像 `halt` 的地方**：**不触发全局跳过** —— `halt` 一触发其余 PENDING 全
+    #: SKIPPED，而 `closed` 后面**还可以有节点**（如 `recap`）。两者判据都挂在 `is_halt`
+    #: 上（`halt_triggered()` / `_ready_nodes` 的独占块），所以 `closed` 天然不参与。
+    #: 也**不参与 run 的 outcome** —— 走到它就是正常跑完（`completed`），
+    #: 而不是 `halt` 那种「证据不足、需要补充信息」。
+    kind: str = "agent"  # agent | approval | halt | ticket | closed
     agent: str | None = None  # agent 节点对应的职能智能体
     in_edges: list[Edge] = field(default_factory=list)
     when: str | None = None  # 便捷写法：单上游时的边条件
@@ -132,6 +142,18 @@ class Node:
         on_failure），而不是像 halt 那样在调度处前置短路。见 `executor/dag_executor.py`。
         """
         return self.kind == "ticket"
+
+    @property
+    def is_closed(self) -> bool:
+        """收尾节点。执行它 = **这张工单的处理流程到此结束**（不调 LLM、无副作用）。
+
+        判据用 **kind** 而不是"节点名叫 ticket-closed"——名字是图作者的自由，
+        而 kind 随 snapshot 冻结、可复现（同 `halt_triggered()` 的理由）。
+
+        在 executor 里与 `halt` 并肩走确定性分支，但**不触发全局跳过**：
+        它后面还可以有节点（如 `recap`）。见 `executor/dag_executor.py` 的 `_closed_output`。
+        """
+        return self.kind == "closed"
 
     @property
     def upstreams(self) -> list[str]:
@@ -272,11 +294,16 @@ class DAG:
         （`executor/resume.py` 有血泪注释）。拿新规则判已跑过的 run = 让历史 run
         永久读不出来——这正是 `_check_on_reject_consistency` 那次踩过的坑。
         """
-        allowed = {"agent", "approval", "halt", "ticket"}
+        allowed = {"agent", "approval", "halt", "ticket", "closed"}
         for nid, node in self.nodes.items():
             if node.kind not in allowed:
                 raise WorkflowDAGError(
                     f"节点 {nid} 的 kind={node.kind!r} 不是合法取值（可用：{sorted(allowed)}）"
+                )
+            # `closed` 与 `ticket` 同一类：**都不调 LLM**，写 `agent:` 只会被静默忽略。
+            if node.is_closed and node.agent:
+                raise WorkflowDAGError(
+                    f"收尾节点 {nid} 不该声明 agent（它不调 LLM）：当前 agent={node.agent!r}"
                 )
             if not node.is_ticket:
                 continue

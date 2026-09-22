@@ -99,6 +99,26 @@ make lint      # ruff 检查
      `GET /runs/{id}` 另给 `outcome: completed|halted` + `halted_at` + `halt`（**现算不落库**）。
    - halt 节点**不经 runner**（不调 LLM、不重试、不做幂等）。
 
+3.1.1 **收尾语义（`kind: closed`）—— 像 halt，但**不**全局跳过**（2026-09-22 加）
+
+   `closed` 是**工单处理流程的终点标记**：走到它就代表这张工单的处理流程走完了。
+   与 `halt` 同为**确定性**节点（不经 runner、不调 LLM），两处必须分清：
+
+   |  | `halt` | `closed` |
+   |---|---|---|
+   | 触发后其余 PENDING | **全 SKIPPED** | **照常跑**（后面还能接 `recap`） |
+   | run 的 `outcome` | `halted` → 前端显示**「需要补充信息」** | `completed`（不参与 outcome） |
+
+   - **别把 `closed` 并进 `halt_triggered()` 或 `_ready_nodes` 的独占块** ——
+     那两处判据都是 `is_halt`，`closed` 天然不参与。并进去就变成"走完就跳过后续"，
+     而它后面按设计还有节点。
+   - **`reason` 收字面量、不收 `$.` 引用**：这是一句静态的话（"本流程不回传原系统"），
+     写成引用等于让上游（最后一环往往是模型）决定它 —— 与 halt 的教训**方向相反**，
+     halt 的 reason 才必须从触发边上搬（每次不同）。
+   - **加它的场景**：流程跑到末尾、但**没有可回传的上游系统**（如手工建的工单）。
+     此前那种图挂 `ticket-done`，投递必然 404 → 节点判红 → `on_failure: abort` 中止整条 run。
+     **判据：不是投递坏了，是不该把一张没有上游的单送去投递口。**
+
 3.2 **「跑完了」≠「通过了」：结论字段判失败**（`VERDICT_FIELDS`，`executor/dag_executor.py`）
 
    ```python
