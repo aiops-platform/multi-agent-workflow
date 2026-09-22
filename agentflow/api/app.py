@@ -48,7 +48,7 @@ from .agent_store import (
 from .auth import TenantContext, get_tenant_context
 from .management_store import build_management_store
 from .mcp_store import MCPStore, build_mcp_store
-from .ticket_store import TICKET_NEW, TICKET_RUNNING, TicketStore, build_ticket_store
+from .ticket_store import TICKET_RUNNING, build_ticket_store
 from .workflow_store import WorkflowStore, build_workflow_store
 
 log = logging.getLogger("agentflow.api")
@@ -78,7 +78,12 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="agentflow 控制面", version="0.1.0", lifespan=lifespan)
 service: RunService | None = None
 sweeper: ApprovalSweeper | None = None
-worker: Worker | None = None  # run_mode=queue + memory 队列时的进程内 Worker
+# ⚠️ 类型是 `WorkerPool` 不是 `Worker`——真正赋进去的是 WorkerPool（见下方 lifespan），
+# 而 `Worker` 这个名字在本文件里**从来没被 import 过**（只 import 了 WorkerPool）。
+# 注解写错不报错的原因：本模块有 `from __future__ import annotations`，注解是惰性字符串，
+# 运行期不求值。代价是任何 `typing.get_type_hints()` 都会在这里炸，且读的人会以为
+# 存的是单个 Worker。（ruff F821 一直在报，被 73 个既有 lint 淹没了。）
+worker: WorkerPool | None = None  # run_mode=queue + memory 队列时的进程内 Worker
 _worker_task: asyncio.Task | None = None
 # 控制面配置存储（workflows/mcp_servers/agent_configs）：state_store=postgres 时落 PG，
 # 否则沿用本地 sqlite（构造不做 DB/I/O，惰性 connect；测试可 monkeypatch 模块全局）。
@@ -179,7 +184,9 @@ def _workflow_graph(wf: Workflow) -> dict:
 
 
 def _service() -> RunService:
-    global service
+    # 此处**刻意不写 `global service`**：本函数只读它，从不赋值，
+    # 而读模块级全局本来就不需要声明。原先那行是死的，且误导读者以为这里会写全局
+    # （真正赋值的是 `init()`，它那处 `global` 是必需的）。
     if service is None:
         # 生命周期：生产由 Worker/API 进程统一 connect；此处懒初始化
         raise RuntimeError("service 未初始化，先调用 init()")

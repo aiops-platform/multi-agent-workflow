@@ -393,7 +393,9 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 
 ## 10. 清预置 lint / 测试债
 
-- `make lint` 目前有 **73 个**预置 ruff 错误（改动前后不变，非本次引入）
+- `make lint` 目前有 **68 个**预置 ruff 错误（改动前后不变，非本次引入）。
+  ✅ `api/app.py` 已清空（2026-09-22，见下）—— **它此前那 4 个里有一个是 F821
+  「未定义名」，会淹没后续真正的 F821**，所以先清这个文件是有价值的。
 - `tests/test_sandbox.py` 5 个用例依赖本机 `~/.kube/config`（本机有 kube 时会因
   incluster 配置缺失而失败；CI 无 kube 时被 skip）
 
@@ -435,6 +437,22 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
    ⚠️ 与 §23.3 合起来看：`ToolPolicy` **至今零运行期消费方**，所以这几条断言
    **全绿也不代表租户 deny 规则生效了**。用例的 docstring 已显式写明这一点 ——
    让一个测试在死代码上通过而不标注，比它红着更危险。
+
+### ✅ 已清：`api/app.py` 的 4 个 lint（2026-09-22）
+
+其中**只有 1 个是真缺陷**，列出来是因为它示范了「lint 数不该拿来当"反正是风格问题"」：
+
+- **`F821 Undefined name 'Worker'`（真）**：`worker: Worker | None = None` 指向一个
+  **本文件从未 import 过的类型**，而真正赋进去的是 `WorkerPool`。
+  运行期不报错是因为文件头有 `from __future__ import annotations`（注解是惰性字符串）。
+  危害有两条，都不是"风格"：① 任何 `typing.get_type_hints()` 走到这里就炸；
+  ② **读的人会以为存的是单个 Worker**。
+  已用 `eval(注解, vars(module))` 复现旧注解 → `NameError: name 'Worker' is not defined`。
+- **`PLW0602`（真，但无害）**：`_service()` 里的 `global service` 是**死的** ——
+  该函数只读 `service`、从不赋值，而读模块全局本就不需要声明。
+  它误导读者以为这里会写全局（真正赋值的是 `init()`）。
+- **2 个 `F401`（纯风格）**：`TICKET_NEW` / `TicketStore` 导入后未使用。已确认
+  没有别处 `from api.app import` 这两个名字（re-export 假设不成立）才删。
 
 ---
 
