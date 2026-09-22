@@ -431,19 +431,7 @@ edges:
   - { from: approve-commit, to: commit, when: "$.nodes.approve-commit.output.approved == true" }
   - { from: approve-commit, to: recap, when: "$.nodes.approve-commit.output.approved == false" }
   # 提交之后先回传原系统、再进复盘 —— 复盘要能提到工单是否已闭环
-  # ── 回传分流：**手工单不走投递**（2026-09-22）─────────────────────────────
-  #
-  # 手工建的工单（Ticket Inbox 的表单）在原系统里**没有对应物**：`ticket-done` 把它的单号
-  # POST 到 APM，APM `find_by_ticket` 查不到 → 404 → MCP 归一成 `delivered: false`
-  # → `VERDICT_FIELDS` 判 False → 节点 FAILED → 整条 run 中止变红。
-  # **那不是投递坏了，是我们不该把一张没有上游的单送过去。**
-  #
-  # 用**负面测试**（`!= 'manual'`）而不是 `== 'workflow'`：将来多一种来源
-  # （servicenow / jira…）**默认回传** —— 判错的方向是响亮地红，而不是静默漏投。
-  - { from: commit, to: ticket-done, when: "$.inputs.origin != 'manual'" }
-  # 手工单直接去复盘。**这条不能省**：没有它，`ticket-done` 被 SKIPPED 会级联把 `recap`
-  # 也带成 SKIPPED，run 白少一环（`recap` 原先只有 `ticket-done → recap` 一条入边）。
-  - { from: commit, to: recap, when: "$.inputs.origin == 'manual'" }
+  - { from: commit, to: ticket-done }
   - { from: ticket-done, to: recap }
   # 定位失败 → 直接到终点（halt）。此时上面四条边全 INACTIVE，
   # 取数节点 SKIPPED 级联到 rca/plan/fix…，只花到 scope 为止的代价。

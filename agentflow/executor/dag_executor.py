@@ -420,9 +420,7 @@ class DAGExecutor:
         if src["status"] not in (DONE, REJECTED, REJECTED_CANCELED):
             return False  # 未执行 / SKIPPED（输出 None）→ INACTIVE
         if edge.when is not None:
-            # 也传 self.inputs：`when` 要能按**入参**分流（如工单来源 `$.inputs.origin`），
-            # 而不只是节点输出。见 core/expressions.py 的 `eval_condition`。
-            return bool(eval_condition(edge.when, self.node_states, self.inputs))
+            return bool(eval_condition(edge.when, self.node_states))
         return True
 
     def _sources_terminal(self, node: Node) -> bool:

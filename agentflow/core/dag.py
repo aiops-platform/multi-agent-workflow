@@ -258,38 +258,6 @@ class DAG:
         if strict:
             self._check_on_reject_consistency()
             self._check_node_kinds()
-            self._check_when_refs()
-
-    def _check_when_refs(self) -> None:
-        """所有 `when` 的引用必须以 `$.nodes.` 或 `$.inputs.` 开头。
-
-        值得单独守，是因为写错的代价是**静默**的：在 2026-09-22 支持 `$.inputs.*` 之前，
-        `$.inputs.x == 'y'` 会恒假（`!=` 恒真）且**不报任何错** —— 一条永远只走同一分支的
-        `when`，在页面上与"条件确实满足了"长得一模一样。
-
-        ⚠️ **只在 `strict=True` 时跑**：`strict=False` 是 resume 加载**冻结快照**的路径，
-        拿新规则判已跑过的 run 会让历史 run 永久读不出来（见 `Workflow.load_yaml` 的说明）。
-        """
-        from .expressions import INPUTS_REF_PREFIX, NODE_REF_PREFIX
-
-        allowed = (NODE_REF_PREFIX, INPUTS_REF_PREFIX)
-        for e in self.edges:
-            if not e.when:
-                continue
-            for op in ("!=", "=="):
-                if op in e.when:
-                    left = e.when.partition(op)[0].strip()
-                    break
-            else:
-                raise WorkflowDAGError(
-                    f"边 {e.source}->{e.target} 的 when 不是可求值的表达式"
-                    f"（仅支持 == / !=）：{e.when!r}"
-                )
-            if not left.startswith(allowed):
-                raise WorkflowDAGError(
-                    f"边 {e.source}->{e.target} 的 when 引用 {left!r} —— "
-                    f"引用必须以 {NODE_REF_PREFIX!r} 或 {INPUTS_REF_PREFIX!r} 开头"
-                )
 
     def _check_node_kinds(self) -> None:
         """节点 ``kind`` 的**白名单** + 建单节点的两条约束（§8.1）。
