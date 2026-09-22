@@ -132,6 +132,24 @@ services:
       # 可写白名单（§10.2）。工作区必须在内，否则 ws_write_file 会被拒
       # （报错文案是「路径不在可写白名单」——那是**正确**的拒绝，不是故障）
       SBX_WRITABLE: "/workspace:/tmp:${HOME}/agentflow-workspace"
+
+      # ⚠️ **compose 形态必须显式绑 0.0.0.0**，不能吃 exec 服务的 loopback 默认值。
+      #
+      # `a515ea1` 把 `create_server` 的默许绑定改成了 `127.0.0.1`，理由写在
+      # exec_service.py 的 docstring 里：「需要它的只有同 Pod 的 worker（走 127.0.0.1），
+      # 而 `kubectl port-forward` 打进的是 Pod 的 loopback」—— **那条推理只对 K8s 成立**。
+      #
+      # compose + podman(macOS) 下，宿主经 `ports:` 发布进来时落点是**容器的 eth0 IP**
+      # （实测 10.89.0.x），不是 loopback。于是绑 127.0.0.1 的服务收不到这条连接，
+      # 表现为宿主 **TCP 连得上、HTTP 被 RST**（`curl: (56) Recv failure: Connection reset`），
+      # 而容器自己的 healthcheck（容器内打 127.0.0.1）**照样是 healthy** —— 两处结论相反，
+      # 极具误导性。实测（2026-09-22）：同一个镜像，`SBX_HOST=0.0.0.0` 宿主通、
+      # 默认 loopback 不通，其余条件完全相同。
+      #
+      # 这**不是放宽安全边界**：容器在 podman VM 的 `backend_default` 桥内，
+      # 桥上只有本栈自己的 pg/kafka/redis/sandbox。K8s 形态不受影响 ——
+      # 那边走 sidecar 共享 netns，不经过端口发布（见 deploy/worker-deployment.yaml）。
+      SBX_HOST: "0.0.0.0"
     volumes:
       - ${HOME}/agentflow-workspace:${HOME}/agentflow-workspace
     healthcheck:
