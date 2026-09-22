@@ -246,3 +246,50 @@ async def test_workflow_store_builder_selects_postgres() -> None:
     store = build_workflow_store(_SettingsStub())
     assert isinstance(store, PgWorkflowStore)
     assert store._dsn.startswith("postgresql://")
+
+
+# ---- Lock 续期（租约用）---------------------------------------------------
+async def test_redis_lock_refresh_extends_ttl(fake_redis) -> None:
+    """续期真的把 TTL 推后 —— 租约靠它，不然只能把 TTL 设得很大（等于没有租约）。"""
+    lock = RedisLock("redis://x", client=fake_redis)
+    assert await lock.acquire("lease", ttl=5) is True
+    before = await fake_redis.pttl("lease")
+    assert await lock.refresh("lease", ttl=30) is True
+    after = await fake_redis.pttl("lease")
+    assert after > before, f"续期没生效: {before}ms → {after}ms"
+    # 续的必须是**请求的那个 TTL**，不是随便一个大数：TTL 设得过长 = 进程死了
+    # 很久才被发现，"僵尸"的判定就被推迟了。只断言 `after > before` 抓不到这个
+    # （变异验证时实测过：把 TTL 写成常量 999999999 照样通过）。
+    assert 25_000 <= after <= 30_000, f"续期后的 TTL 不是请求的 30s: {after}ms"
+    await lock.close()
+
+
+async def test_redis_lock_refresh_rejects_non_holder(fake_redis) -> None:
+    """**不是持有者就续不动** —— 这条是租约判据可信的前提。
+
+    不校验 token 的话，竞态里会**替接管者续期**：我的锁刚过期、别人抢到了、
+    我再去 PEXPIRE —— 于是一条本该被判定为僵尸的租约被续成"活着"，
+    而"僵尸判据"正是靠租约在不在来回答的。所以要原子（Lua）。
+    """
+    a = RedisLock("redis://x", client=fake_redis)
+    b = RedisLock("redis://x", client=fake_redis)
+    assert await a.acquire("lease", ttl=5) is True
+    await a.release("lease")
+    assert await b.acquire("lease", ttl=30) is True      # B 接管
+
+    assert await a.refresh("lease", ttl=30) is False, "A 已不持有，不该续得动"
+    assert await b.refresh("lease", ttl=30) is True, "B 是持有者，应当能续"
+    await a.close()
+    await b.close()
+
+
+async def test_memory_lock_refresh(fake_redis=None) -> None:
+    """内存实现的续期：锁还在就续；没有/已释放 → False。"""
+    from agentflow.lock.memory import InMemoryLock
+
+    lock = InMemoryLock()
+    assert await lock.refresh("nope") is False
+    assert await lock.acquire("k", ttl=30) is True
+    assert await lock.refresh("k", ttl=30) is True
+    await lock.release("k")
+    assert await lock.refresh("k") is False
