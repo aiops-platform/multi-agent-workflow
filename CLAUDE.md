@@ -19,7 +19,12 @@ make sync-agents    TENANT=<id>   # 同上，推数据面（MCP server + agent �
 > 外部件（postgres / kafka / 沙箱 / **gh CLI**），它们的共同点是**缺了不报错** ——
 > 只在某条 run 跑到某一步时表现为"结果不对"。`doctor` 把这些问题摆在装环境的时候，
 > 并给出可直接粘贴的修复命令（`--install` 能自动装 gh）。
-> 判据只有一份：它复用 `tenantctl._env_preflight`，与 provision 时看到的是同一套。
+> 判据只有一份：基础设施那几项复用 `tenantctl._env_preflight`，与 provision 时看到的是同一套。
+>
+> ⭐ **另查一条「工具版本基线」**（`toolchain.toml`）—— 与"在不在"正交。因为
+> **版本漂移是静默的**：`ruff>=0.5` 这个无上界约束让一次 `pip install` 换掉了 ruff，
+> `make lint` 凭空变红且**一直是红的**（实测）。"在不在"这类检查永远抓不到它。
+> 改了工具版本，要么升工具、要么改 `toolchain.toml` —— 别让它悄悄漂着。
 
 ## 每个 task 的收尾（硬性流程）
 

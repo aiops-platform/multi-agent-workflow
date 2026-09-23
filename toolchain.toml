@@ -1,0 +1,57 @@
+# 团队工具链基线 —— `make doctor` 会拿**实际版本**与这里比对。
+#
+# ## 为什么需要这个文件
+#
+# retro（2026-09-22 §7.2）：「开发的环境和使用工具，引用包或三方工具都应该建立
+# 全团队统一的基线，不要出现因为版本或者工具差异导致开发问题。」
+#
+# 而**版本差异是静默的**：`ruff>=0.5` 这个无上界约束，让一次 `pip install` 把 ruff
+# 换成 0.16.4 —— 它的默认规则集从 4 条族膨胀到 ≈788 条，`make lint` 凭空多出 19 个
+# 错误**并一直是红的**。全程没有任何提示，直到有人去查为什么它不绿。
+#
+# 这个文件把那件事变成**一次比对**。
+#
+# ## 格式
+#
+#   [tools.<名字>]
+#   cmd       = [...]         # 取版本的命令（stdout+stderr 里第一个 X.Y[.Z] 即为版本）
+#   required  = ">=X.Y"       # PEP 440 约束（用 packaging.SpecifierSet 判）
+#   optional  = true          # 缺失不算问题（有替代品，或非必需）
+#   note      = "..."         # 缺失/不匹配时给人看的补充说明
+#
+# ## 与 pyproject 的关系
+#
+# 这里**不是**依赖清单的副本 —— 依赖锁定是另一件事（retro §7.2 的 E1/E2/E3）。
+# 这里只管**工具**（CLI 可执行文件）的版本，因为它们的差异不体现在 pyproject 里。
+
+[tools.python]
+cmd = ["python3", "--version"]
+required = ">=3.12"
+note = "与 pyproject 的 requires-python 对齐"
+
+[tools.ruff]
+cmd = ["./venv/bin/ruff", "--version"]
+required = ">=0.16,<0.17"
+note = "上界是刻意的：0.16 的默认规则集比历史默认宽得多，跨小版本会静默改变 lint 结果。见 pyproject 的 [tool.ruff.lint] 注释"
+
+[tools.gh]
+cmd = ["gh", "--version"]
+required = ">=2.0"
+note = "缺它 → commit 节点失败 → 下游 ticket-done 根本不执行，工单闭环没有回音"
+
+[tools.jq]
+cmd = ["jq", "--version"]
+required = ">=1.6"
+note = ".claude/hooks/ 下三个 PreToolUse 检查全靠它解析 stdin。**缺了它们会静默失效**（脚本里是 `|| echo \"\"`，解析失败即当作'不是 git 命令'放行）——所以这项必须在体检时挡住"
+
+[tools.podman]
+cmd = ["podman", "--version"]
+required = ">=4.0"
+optional = true
+note = "容器 CLI（docker 亦可，故列入可选项）"
+
+[tools.node]
+cmd = ["node", "--version"]
+required = ">=22"
+optional = true
+note = "跑 understand-anything / codegraph 等代码索引工具时才需要，后端本身不依赖"

@@ -26,12 +26,32 @@
 
 ## 判据只有一份
 
-基础设施那几项复用 `agentflow.tenantctl._env_preflight`（provision 时用的是同一份），
-gh 那项复用 `gh_preflight`。这里只负责**呈现**与**安装**，不重新判定。
+**已有**的判据不在这里重写：
+
+- 基础设施那几项复用 `agentflow.tenantctl._env_preflight`（provision 时用的是同一份）
+- gh 那项复用 `gh_preflight`
+
+这里只负责**呈现**与**安装**。
+
+## 唯一的例外：工具**版本**基线
+
+`check_toolchain()` 是本脚本**自带**的判据，因为它查的问题与上面两者正交：
+
+| | 查什么 | 判据来源 |
+|---|---|---|
+| `_env_preflight` | 服务/CLI **在不在** | tenantctl（provision 的同一份） |
+| `gh_preflight` | 凭证**登没登** | tenantctl |
+| **`check_toolchain`** | 工具**版本对不对** | **`toolchain.toml`** |
+
+之所以必须单列：**版本漂移是静默的**。本仓实测 —— dev 依赖里 `ruff>=0.5` 无上界，
+一次 `pip install` 把它换成 0.16.4，默认规则集从 4 条族膨胀到 ≈788 条，
+于是 `make lint` 凭空多出 19 个错误**并且一直是红的**，没有任何提示。
+"在不在"这类检查永远抓不到这种问题，只有比对版本才抓得到。
 """
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -93,6 +113,75 @@ GH_CREDENTIAL_HELP = """  凭证无法自动配置，二选一：
           容器形态要把它挂进 worker 的 env（见 deploy/worker-deployment.yaml）"""
 
 
+def check_toolchain() -> list[str]:
+    """把**实际工具版本**与 `toolchain.toml` 的声明比对。返回问题列表。
+
+    ## 为什么值得单独一项
+
+    版本差异是**静默**的 —— 这是本仓反复踩的那族。最近一次实例：dev 依赖里
+    `ruff>=0.5` 这个无上界约束，让一次 `pip install` 把 ruff 换成 0.16.4，
+    而它的默认规则集从 4 条族膨胀到 ≈788 条 → `make lint` 凭空多出 19 个错误
+    **并一直是红的**。全程没有任何提示，直到有人去查它为什么不绿。
+
+    这里把那件事变成一次可比对的检查。
+
+    ## 判据的边界
+
+    - 只查**工具**（CLI 可执行文件）。依赖锁定是另一件事（retro §7.2 E1/E2/E3）。
+    - `toolchain.toml` 不在 → 静默返回（不阻塞），因为这个文件是**新增**的，
+      旧 checkout 上没有它不该被当成"环境坏了"。
+    - `optional = true` 的项缺失不算问题（有替代品或非必需），但**版本不满足**仍报。
+    """
+    import tomllib
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet
+
+    root = Path(__file__).resolve().parent.parent
+    cfg_path = root / "toolchain.toml"
+    if not cfg_path.exists():
+        return []
+    try:
+        tools = tomllib.loads(cfg_path.read_text(encoding="utf-8")).get("tools", {})
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return [f"toolchain.toml 读不出来（{exc}）—— 工具版本基线这次没有比对"]
+
+    problems: list[str] = []
+    for name, spec in tools.items():
+        cmd = spec.get("cmd") or []
+        required = spec.get("required") or ""
+        note = spec.get("note") or ""
+        optional = bool(spec.get("optional"))
+        if not cmd or not required:
+            continue
+
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+            raw = f"{r.stdout}\n{r.stderr}"
+        except (OSError, subprocess.SubprocessError):
+            if not optional:
+                problems.append(f"{name}：跑不起来（{' '.join(cmd)}）" + (f" —— {note}" if note else ""))
+            continue
+
+        m = re.search(r"\d+\.\d+(?:\.\d+)?", raw)
+        if not m:
+            problems.append(f"{name}：认不出版本号（原始输出：{raw.strip()[:80]!r}）")
+            continue
+        actual = m.group(0)
+
+        try:
+            ok = SpecifierSet(required).contains(actual)
+        except InvalidSpecifier:
+            problems.append(f"{name}：toolchain.toml 里的约束 {required!r} 不是合法 PEP 440")
+            continue
+
+        if not ok:
+            problems.append(
+                f"{name}：实际 {actual}，基线要求 {required}"
+                + (f" —— {note}" if note else "")
+                + "（要么升工具，要么改 toolchain.toml 的基线 —— **别让它悄悄漂着**）"
+            )
+    return problems
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="agentflow 环境体检 / 安装")
     ap.add_argument("--install", action="store_true", help="把能自动装的装上（gh CLI）")
@@ -113,6 +202,13 @@ def main() -> int:
     print(f"  run_mode       : {settings.run_mode}")
 
     problems = _env_preflight(settings)
+
+    # ③ 工具链版本基线（retro §7.2 E2 / §7.4 E4）。
+    #    与 _env_preflight 查的"服务在不在"正交：那查**有没有**，这查**版本对不对**。
+    #    版本漂移是静默的（本仓实测：ruff 被无上界约束换掉后 lint 无声变红），
+    #    所以它必须在"换机器先跑这个"里被挡住。
+    toolchain_problems = check_toolchain()
+    problems.extend(toolchain_problems)
 
     # ② DeepSeek key 不在 _env_preflight 里（它不阻塞"环境能否起来"，
     #    只决定 agent 是走真模型还是 ScriptedJsonModel）—— 但换机器时最常忘。
