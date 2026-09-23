@@ -15,8 +15,16 @@ install:
 test:
 	./venv/bin/pytest -q
 
+# 静态检查两件，都要过：
+#   ruff         —— 代码风格/常见缺陷
+#   lint-imports —— §11 分层契约（配置在 `.importlinter`）
+#
+# 为什么分层契约放这里而不是单独一个 target：§11 原文写着四条判据
+# 「**应当写成测试**，比约定可靠」—— 接进 lint 才算真的"写成了检查"；
+# 单独一个 `make lint-layers` 只会变成又一条没人跑的约定。
 lint:
 	./venv/bin/ruff check agentflow tests
+	./venv/bin/lint-imports
 
 # 跑一个带审批的完整流程（控制面 API）
 api:

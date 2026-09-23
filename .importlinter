@@ -1,0 +1,151 @@
+# §11 分层契约 —— 判据正文在 `docs/constraints/11-layering.md`
+#
+# ## 为什么有这份文件
+#
+# §11 原文写着：「**四条判据**（**应当写成测试，比约定可靠**）」——
+# 而它此前**一条都没写成测试**。于是那四条只是文档，而文档拦不住任何一次 import：
+# §11 自己记着「当前代码有**四处已知违反**」，且这四处从写下那天起没被拦过。
+#
+# 这份配置就是那四条判据的执行者。跑法：`make lint`（或 `./venv/bin/lint-imports`）。
+#
+# ## 两条自我约束（别把它写成一份"看着漂亮但红不起来"的契约）
+#
+# 1. **只写今天已成立的方向 + 明确列出的已知债。** 不写一份理想分层然后靠海量
+#    `ignore_imports` 掩盖现状 —— 那样契约永远绿，等于没有。
+# 2. **每条 `ignore_imports` 都必须带 TODO 指针。** 债要被看见，不是被藏起来；
+#    修掉之后那一行应当立刻删掉。
+#
+# ## 四条判据的现状（诚实版）
+#
+# | §11 判据 | 今天能强制吗 | 落在哪 |
+# |---|---|---|
+# | 1. `api/` 只 import service 与 fastapi | ❌ 否 —— `api/app.py` 实 import 11 个顶层包（§11 已记为最大违反） | 未强制，见 docs/TODO.md §14 |
+# | 2. `service/`、`repository/` 不得 import fastapi，也不得 import `api/` | ✅ 是 | 下面两条契约 |
+# | 3. Worker 必须经 service | ❌ 否 —— `worker.py` 直接调 executor + repository（§11 已记，且已造成 `_mark_cancelled` 重复实现） | 未强制，见 docs/TODO.md §14 |
+# | 4. Repository 不得依赖 service / api | 🟡 有已知债 | 契约 `no-reverse-dependency` + 显式 ignore |
+#
+# 判据 1 与 3 之所以不强制：今天强制它们 = 契约一加就红，然后必然被注释掉。
+# 它们要先靠 TODO §14 的整改把现状改对，再回来加契约。
+
+[importlinter]
+root_package = agentflow
+# 需要它才能把 fastapi / starlette 当作"违禁模块"来查
+include_external_packages = True
+
+# ======================================================================
+# 契约 1 —— core 是地基
+# ======================================================================
+# `core/` 只放 Workflow 模型与 DAG 语义，是被所有层依赖的最底层。
+# 一旦它开始 import 别的东西，分层就从根部塌了（且是环）。
+# 今天成立（core 只 import 自己），值得锁死。
+[importlinter:contract:core-is-foundation]
+name = core 是地基：不得依赖 agentflow 内任何其它子包
+type = forbidden
+source_modules =
+    agentflow.core
+forbidden_modules =
+    agentflow.agents
+    agentflow.api
+    agentflow.approval
+    agentflow.audit
+    agentflow.config
+    agentflow.datasource
+    agentflow.errors
+    agentflow.executor
+    agentflow.lock
+    agentflow.queue
+    agentflow.sandbox
+    agentflow.seed
+    agentflow.service
+    agentflow.statestore
+    agentflow.tenants
+    agentflow.worker
+    agentflow.workspace
+
+# ======================================================================
+# 契约 2 —— §11 判据 2 前半：只有 API 层能碰 web 栈
+# ======================================================================
+# §11 原文：「`service/` 与 `repository/` **不得** import fastapi」。
+#
+# ⚠️ §11 特意提醒：「**判层不能 grep 字符串** —— `datasource/*.py` 的 docstring 里
+# 就写着 "FastAPI"，而它零依赖。看 `import`，不看注释。」本契约查的正是 import，
+# 所以它不会被注释误伤 —— 这句话在契约存在之后才真正成立。
+#
+# 今天成立（全仓只有 api/auth.py 与 api/app.py 三行 import fastapi）。
+[importlinter:contract:no-fastapi-outside-api]
+name = §11-判据2：只有 agentflow.api 可以 import fastapi / starlette
+type = forbidden
+source_modules =
+    agentflow.agents
+    agentflow.approval
+    agentflow.audit
+    agentflow.config
+    agentflow.core
+    agentflow.datasource
+    agentflow.errors
+    agentflow.executor
+    agentflow.lock
+    agentflow.queue
+    agentflow.sandbox
+    agentflow.seed
+    agentflow.service
+    agentflow.statestore
+    agentflow.tenants
+    agentflow.worker
+    agentflow.workspace
+forbidden_modules =
+    fastapi
+    starlette
+
+# ======================================================================
+# 契约 3 —— §11 判据 2 后半 + 判据 4：不得反向依赖
+# ======================================================================
+# 覆盖两个方向：
+#   · Repository（statestore / workspace / audit / datasource / seed / lock / queue）
+#     不得依赖 API / Service             ← §11 判据 4
+#   · 执行引擎（executor / agents / sandbox / approval）与 core
+#     不得依赖 API / Service / Worker    ← 判据 2 后半 + 「不可跳层」
+#
+# **本契约正是 retro 的验收判据所在**：故意加一条 `executor → api` 的 import，
+# `make lint` 必须红。
+[importlinter:contract:no-reverse-dependency]
+name = §11-判据2/4：Repository 与执行引擎不得反向依赖 API / Service / Worker
+type = forbidden
+source_modules =
+    agentflow.statestore
+    agentflow.workspace
+    agentflow.audit
+    agentflow.datasource
+    agentflow.seed
+    agentflow.lock
+    agentflow.queue
+    agentflow.core
+    agentflow.executor
+    agentflow.agents
+    agentflow.sandbox
+    agentflow.approval
+forbidden_modules =
+    agentflow.api
+    agentflow.service
+    agentflow.worker
+ignore_imports =
+    # ⚠️ 已知债（docs/TODO.md §14）—— **修掉后请删掉下面全部 6 行**。
+    #
+    # §11 原文：「`api/*_store.py` ×5 是 Repository，却放在 API 层 →
+    # `statestore/router.py`（Repository）反向依赖 `api/`。今天零代价，但它锁死未来：
+    # 哪天某个 store 要 import `app.py` 的东西，**Worker 进程就会被拖上整个 web 栈**
+    # （FastAPI/starlette/uvicorn），且不会有任何提示。」
+    #
+    # 正解是把这 5 个 store 挪出 `api/`（例如 `agentflow/repository/`）。
+    # 那一天到来时，本清单应当变空 —— 它空着，才说明债还清了。
+    agentflow.statestore.router -> agentflow.api.agent_store
+    agentflow.statestore.router -> agentflow.api.management_store
+    agentflow.statestore.router -> agentflow.api.mcp_store
+    agentflow.statestore.router -> agentflow.api.ticket_store
+    agentflow.statestore.router -> agentflow.api.workflow_store
+    #
+    # ↓ 这一行是**本契约刚加上时抓出来的**，§11 正文此前没记：
+    # `tenants.py` 在 `async_bootstrap_tenants()` 里**函数内延迟 import**
+    # `encrypt_db_ref`。延迟 import 不改变依赖方向，只是把报错推迟到运行时 ——
+    # 所以它同样是反向依赖，同样该还。可见"写进文档"确实漏掉了它。
+    agentflow.tenants -> agentflow.api.management_store

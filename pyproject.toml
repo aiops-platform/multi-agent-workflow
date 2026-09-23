@@ -51,6 +51,10 @@ dev = [
     # 配合上面那个隐式 `select`，一次依赖刷新就能让 lint 门禁静默变红（已发生）。
     "ruff>=0.16,<0.17",
     "fakeredis>=2.23",
+    # §11 分层契约的**执行者**。§11 原文写着「四条判据**应当写成测试**，比约定可靠」，
+    # 但一条没写 —— 于是那四条至今只是文档，而文档拦不住任何一次 import。
+    # 配置在 `.importlinter`，接在 `make lint` 里。
+    "import-linter>=2.0",
 ]
 
 [tool.setuptools.packages.find]
