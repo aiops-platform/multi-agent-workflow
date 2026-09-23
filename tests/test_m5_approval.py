@@ -271,7 +271,7 @@ async def test_tool_policy_audit_flow() -> None:
 
     logs = await store.get_audit_logs(tenant_id="team-alpha")
     assert len(logs) == 3
-    assert {l["decision"] for l in logs} == {"ALLOW", "DENY"}
+    assert {rec["decision"] for rec in logs} == {"ALLOW", "DENY"}
 
 
 # ======================================================================
@@ -296,7 +296,6 @@ async def test_sweeper_one_bad_tenant_does_not_starve_the_rest(monkeypatch) -> N
     排在它后面的租户全部扫不到。而且**坏租户的位置决定谁受害**——排在最后时
     "恰好没人受影响"，看起来一切正常。没有任何报错指向真正的原因。
     """
-    store = InMemoryStateStore()
     good_a, good_c = SqliteStateStore(":memory:"), SqliteStateStore(":memory:")
     for s in (good_a, good_c):
         await s.connect()

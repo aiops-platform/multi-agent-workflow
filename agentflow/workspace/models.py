@@ -6,7 +6,7 @@ Run 创建时确定每个仓库的 ``base_sha`` 并冻结；整个 Run 期间不
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass

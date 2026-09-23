@@ -333,11 +333,11 @@ async def test_executor_flush_node_trace_derives_audit() -> None:
     assert [r["seq"] for r in traces] == [0, 1, 2]
 
     logs = await store.get_audit_logs(run_id=run_id)
-    decision = {l["tool_name"]: l["decision"] for l in logs}
+    decision = {rec["tool_name"]: rec["decision"] for rec in logs}
     assert decision.get("get_trace") == "ALLOW"
     assert decision.get("mcp__git-srv__commit_working") == "DENY"
-    assert all(l["actor"] == "triage" for l in logs)
-    assert all(l["input_masked"] is not None for l in logs)  # 输入脱敏后落审计
+    assert all(rec["actor"] == "triage" for rec in logs)
+    assert all(rec["input_masked"] is not None for rec in logs)  # 输入脱敏后落审计
 
 
 # ======================================================================

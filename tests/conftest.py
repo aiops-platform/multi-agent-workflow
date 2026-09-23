@@ -3,6 +3,11 @@ from __future__ import annotations
 
 import pytest
 
+# `DAG` 在此处导入而非文件中部：`agentflow.core.dag` 只依赖 stdlib 与 `core` 自身，
+# 经实测**不加载 `agentflow.config`**（`sys.modules` 对照），所以提上来不会提前
+# 触发 settings 单例初始化 —— 那正是下面 `_isolate_settings` 要防的事。
+from agentflow.core.dag import DAG
+
 
 @pytest.fixture(autouse=True)
 def _isolate_settings(monkeypatch):
@@ -32,9 +37,6 @@ def _isolate_settings(monkeypatch):
     monkeypatch.setattr(s, "state_db_path", __import__("pathlib").Path("data/agentflow.db"))
     monkeypatch.setattr(s, "postgres_dsn", "localhost:5432/agentflow?user=agentflow&password=agentflow")
 
-
-# 用系统 Python 全局已装的 agentscope==2.0.3，避免测试因缺依赖而挂（见 pyproject）
-from agentflow.core.dag import DAG
 
 SIMPLE_YAML = """
 name: simple

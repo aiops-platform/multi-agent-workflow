@@ -160,9 +160,11 @@ class SqliteStateStore(StateStore):
     async def update_run(self, run_id, *, status=None, **fields) -> None:
         cols, vals = [], []
         if status is not None:
-            cols.append("status=?"); vals.append(status)
+            cols.append("status=?")
+            vals.append(status)
         for k, v in fields.items():
-            cols.append(f"{k}=?"); vals.append(v)
+            cols.append(f"{k}=?")
+            vals.append(v)
         vals.append(run_id)
         await self._c.execute(
             f"UPDATE runs SET {', '.join(cols)}, updated_at=CURRENT_TIMESTAMP WHERE run_id=?",
@@ -392,10 +394,13 @@ class SqliteStateStore(StateStore):
         sql = "SELECT * FROM audit_logs WHERE 1=1"
         params: list = []
         if tenant_id:
-            sql += " AND tenant_id=?"; params.append(tenant_id)
+            sql += " AND tenant_id=?"
+            params.append(tenant_id)
         if run_id:
-            sql += " AND run_id=?"; params.append(run_id)
-        sql += " ORDER BY id DESC LIMIT ?"; params.append(limit)
+            sql += " AND run_id=?"
+            params.append(run_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
         cur = await self._c.execute(sql, params)
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
@@ -422,10 +427,13 @@ class SqliteStateStore(StateStore):
         sql = "SELECT * FROM node_traces WHERE run_id=?"
         params: list = [run_id]
         if node_id:
-            sql += " AND node_id=?"; params.append(node_id)
+            sql += " AND node_id=?"
+            params.append(node_id)
         if kind:
-            sql += " AND kind=?"; params.append(kind)
-        sql += " ORDER BY node_id, id LIMIT ?"; params.append(limit)
+            sql += " AND kind=?"
+            params.append(kind)
+        sql += " ORDER BY node_id, id LIMIT ?"
+        params.append(limit)
         cur = await self._c.execute(sql, params)
         rows = await cur.fetchall()
         out = []

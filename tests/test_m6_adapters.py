@@ -95,10 +95,6 @@ def _patch_kafka(monkeypatch, consumer_records: list | None = None):
     monkeypatch.setattr("kafka.KafkaConsumer", lambda *t, **kw: _FakeConsumer(*t, **kw))
     if consumer_records:
         # 预置消费记录
-        import kafka
-
-        orig = kafka.KafkaConsumer
-
         def factory(*topics, **kw):
             fc = _FakeConsumer(*topics, **kw)
             fc.records = consumer_records
