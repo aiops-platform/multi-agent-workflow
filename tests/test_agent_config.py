@@ -159,6 +159,30 @@ def test_remediation_plan_prompt_has_direction_contract() -> None:
     assert opt["steps"]["items"] is step, "选项的 steps 必须与顶层同一份 schema，防两处漂移"
 
 
+def test_remediation_plan_prompt_caps_output_size() -> None:
+    """规划 prompt 必须带篇幅限额，且**写明理由** —— 超限等于整份 JSON 作废。
+
+    实测 run_bc6418134f（2026-09-23）：plan 节点的 reasoning 写了 23,005 字符，
+    输出预算（``deepseek_max_tokens=8192``）耗尽后答案只写到 3,973 字符就在**句子中间**
+    被截断（结尾停在 ``…500→400 会改变其'``），下游却只看到「未输出合法 JSON（§7 输出契约未满足）」
+    —— 报错把排查指向"JSON 写坏了"，而真相是"没写完"。
+
+    与 reviewer 节点（TODO §32⑤，run_74a0db73ae / run_3f977237be）是**同一形态**，
+    当时三条对策里的第 3 条就是本条：把限额与理由一起写进 prompt（改内置即生效，
+    otr 没有该 agent 的 ``agent_configs`` 覆盖行）。
+    """
+    sp = SYSTEM_PROMPTS["remediation-planning-analyst"]
+    assert "控制篇幅" in sp
+    assert "不要贴代码" in sp
+    # 理由必须写明：只给数字、不说"超了会怎样"，模型不会当回事（照抄 reviewer 那条的写法）
+    assert "被截断" in sp
+    assert "整段 JSON 作废" in sp
+    # suggested_diff 是体积大户（schema 里「给人看、无执行语义」），必须单独限额
+    assert "≤ 15 行" in sp
+    # 自检清单里也要有一条，否则限额只是"建议"
+    assert "规则 9 的限额" in sp
+
+
 def test_resolve_custom_row_null_prompt_falls_back_to_canonical() -> None:
     """自定义行字段清空（NULL）→ 回退到 prompts.py 的 canonical 静态默认（非通用兜底提示）。"""
     rows = [
