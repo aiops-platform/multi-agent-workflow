@@ -261,13 +261,27 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "   实测踩过：缺 `trace_id` 时本节点直接放弃 → run 停在 halt，"
         "而同一窗口的日志里明明写着是哪个服务在报 IOException。\n"
         "   `found: false` 是**正确输出**，不是失败；但在有 `log_services` 时放弃是**漏**。\n"
-        "5. **`suspicious_files` 必须是核实过的真实路径**：仓库名取 `repo_url` 的最后一段，"
+        "5. **入参 `review_feedback`：上一轮被人驳回时，人写的补充线索**（可能是空串 = 首次诊断，"
+        "此时忽略本条、按规则 4 判断）。\n"
+        "   它常直接点名服务 / 仓库 / 文件——**非空时优先据它定位**，并用 `locate_repo` / `search_code` "
+        "核实后再写进 `suspicious_files`。\n"
+        "   注意它仍然是**线索而非证据**：与 CMDB 冲突时以核实结果为准，并如实写明冲突。\n"
+        "6. **`suspicious_files` 必须是核实过的真实路径**：仓库名取 `repo_url` 的最后一段，"
         "用\n"
         '   `search_code(repo_path, query="class <类名>")`（或搜方法名/配置键）核实，'
         "**以返回的路径为准**。\n"
         "   凭印象补全包名会得到不存在的文件（真实是 `com/company/order` 却写成 `com/acme/order`），"
         "假路径会污染下游的根因分析。**搜不到就如实留空，不要填猜测值**\n"
-        f"6. {_JSON_RULE}\n"
+        "7. **预算意识：工具调用轮数是有限的，必须收口。**\n"
+        "   - 日志证据里**没有栈帧**时（`stack_trace` 为空/缺失），**不要靠关键词猜仓库**——"
+        "在仓库里搜 `\"Index\"` / `\"split(\"` / `\"List.of\"` 这类通用词**没有收敛判据**，"
+        "只会把轮次耗光；\n"
+        "   - 那时就按已有证据收口：`found` 照实取，`suspicious_files` 留空或只写**核实过**的路径，"
+        "在 summary 里说明「日志无栈帧，无法定位到文件」、`missing` 里列出缺什么；\n"
+        "   - 判据：**宁可交一份「定位不到」的诚实结论，也不要耗到轮次用尽** —— 后者产负证据，"
+        "会命中 `locate → halt` 直接中断整条诊断（实测：一次 run 把 10 轮预算全花在反复 "
+        "`search_code` 猜关键词上，最终整条诊断中断）。\n"
+        f"8. {_JSON_RULE}\n"
         f"输出 Schema：{_schema_hint(CodeLocationSchema)}"
     ),
     "knowledge-lookup": (
@@ -317,7 +331,12 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "   而自己的 hypothesis 里写着「无代码缺陷证据，仅为剩余可能性中最低跨度的一项」。\n"
         "   **编出来的类型会被下游当真**：`fix-planner` 会照着出计划、`fix-implementer`\n"
         "   会照着改代码。置了 insufficient，流程会在中断节点停下，而不是拿着假根因往下走。\n"
-        f"6. {_JSON_RULE}\n"
+        "6. **入参 `review_feedback`：上一轮被驳回时人写的补充线索**（可能是空串 = 首次诊断，"
+        "此时忽略本条）。\n"
+        "   它常直接回答「缺什么」——**先按它去补证据（查日志 / 拓扑 / 代码）再下结论**；\n"
+        "   若它指向的东西你同样拿不到，就在 summary 与 `missing` 里如实说明，**不要绕开它下结论**。\n"
+        "   它是**线索而非证据**：不能直接当根因依据，也不要列进 `hypotheses` 当作已验证项。\n"
+        f"7. {_JSON_RULE}\n"
         '{"root_cause_type": "code_bug"|"infra_issue"|"config_issue"|"dependency_issue"|null, '
         '"insufficient": true|false, "confidence": 0.0-1.0, "summary": "结论一句话", '
         '"missing": ["缺什么才能定根因"], '

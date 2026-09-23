@@ -35,6 +35,13 @@ inputs:
     type: string
     required: true
     description: "日志窗口止（UTC ISO8601，由 last_seen_at/detected_at 推导，跨度 ≤24h）"
+  review_feedback:
+    type: string
+    required: false
+    description: >-
+      上一次「驳回」时人写的修改建议（APM `_build_analysis_inputs` **恒发**，首次诊断是空串，
+      不会是缺键）。用途：halt 中断（证据不足 / 取证失败）后带着人的补充线索重跑。
+      ⚠️ 别加进任何节点的 `require`：预检对空串判为「不可用」，会让首次诊断直接失败。
 
 nodes:
   # ── 症状分类（无工具，只读工单文本；不传时间窗——它没有数据工具）──────────────
@@ -80,6 +87,9 @@ nodes:
     params:
       bug: "$.inputs.bug_report.short_description"
       target_service: "$.inputs.bug_report.cmdb_ci.name"
+      # 人在上一次驳回时写的补充线索（可能为空串）——它常点名服务/仓库，定位时优先参考。
+      # **不能进 require**（见 inputs.review_feedback 的说明）。
+      review_feedback: "$.inputs.review_feedback"
     on_failure: continue
 
   # ── 根因（只吃日志证据）──────────────────────────────────────────────────────
@@ -101,6 +111,9 @@ nodes:
       infra: "本次未采集（log-only 流程）"
       start_time: "$.inputs.window_start"
       end_time: "$.inputs.window_end"
+      # 上一轮驳回时人写的补充线索（可能为空串 = 首次诊断）。上次若判过 insufficient，
+      # 这里往往就是"缺什么"的答案。同样**不能进 require**。
+      review_feedback: "$.inputs.review_feedback"
     on_failure: abort
 
   # ── 修复方案（诊断产物的一部分，**不再被执行**）──────────────────────────────

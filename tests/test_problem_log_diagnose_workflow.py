@@ -239,6 +239,26 @@ def test_rca_waits_for_all_evidence_sources() -> None:
     assert {e.source for e in rca.in_edges} == set(rca.required_edges)
 
 
+def test_review_feedback_is_wired_into_rca_and_locate_params() -> None:
+    """`review_feedback`（上一轮驳回时人写的线索）必须真的被 rca / locate 收到。
+
+    ⚠️ 这张测试是**唯一的网**：`check_params_refs` 只校验 `$.nodes.*`（`core/dag.py`），
+    `$.inputs.*` 的键名**没有任何校验** —— 打错成 `review_fedback` 会通过 `/workflows/preview`、
+    通过全部测试，运行时 `_walk` 失配静默返回 `None`（不抛异常），于是"带建议重跑"悄悄失效。
+    所以这里钉住引用串本身（它与 APM `_build_analysis_inputs` 发出的键名是同一份契约）。
+
+    另一半同样重要：**不能进 `require`** —— `_usable("")` 为假，而首次诊断该键就是空串：
+    `rca`（on_failure: abort）会整条 run 失败，`locate`（continue）会产负证据 `found: false`
+    → **正好命中 `locate → halt` 那条边**，把首次诊断变成必然中断。
+    """
+    wf = load()
+    assert "review_feedback" in (wf.inputs or {}), "inputs 声明块里要有它（虽然 required 无人读）"
+    for nid in ("rca", "locate"):
+        node = wf.dag.nodes[nid]
+        assert node.params.get("review_feedback") == "$.inputs.review_feedback", f"{nid} 的引用串"
+        assert "review_feedback" not in node.require, f"{nid} 不能 require 它（首次诊断是空串）"
+
+
 def test_gate_waits_for_rca_and_plan() -> None:
     """门必须等齐 rca 与 plan，且两条都是**直接**上游。
 

@@ -183,6 +183,29 @@ def test_remediation_plan_prompt_caps_output_size() -> None:
     assert "规则 9 的限额" in sp
 
 
+def test_code_locator_prompt_has_budget_convergence_rule() -> None:
+    """`code-locator` 必须带**收口判据** —— 否则会在没有栈帧时无限猜关键词、耗尽轮次。
+
+    实测 run_a7e825f855（2026-09-23）：`locate` 拿到的日志证据里**没有 `stack_trace`**，
+    于是它转为在仓库里搜 `"out of bounds"` / `"Index"` / `"split("` 这类通用词 ——
+    **猜测型搜索没有收敛判据**，正好把 `_DEFAULT_MAX_ITERS = 10` 用完
+    （trace 里 10 次 llm_call + 23 次 tool_call），最终
+    `AgentOutputError: Executed maximum iterations of reasoning-acting loop`（仅 79 字符，
+    **不是超长**）→ 负证据 `found: false` → 命中 `locate → halt` → **整条诊断中断**。
+
+    注意成因与 plan 那条（输出 token 截断）**完全不同**，别用同一个修法。
+    """
+    sp = SYSTEM_PROMPTS["code-locator"]
+    assert "预算意识" in sp
+    assert "必须收口" in sp
+    # 关键是点名"没有栈帧时不要猜关键词"这个具体陷阱
+    assert "没有栈帧" in sp
+    assert "不要靠关键词猜仓库" in sp
+    # 要写出后果，否则模型不会当回事（与 reviewer / plan 两条同一手法）
+    assert "轮次用尽" in sp
+    assert "halt" in sp
+
+
 def test_resolve_custom_row_null_prompt_falls_back_to_canonical() -> None:
     """自定义行字段清空（NULL）→ 回退到 prompts.py 的 canonical 静态默认（非通用兜底提示）。"""
     rows = [
