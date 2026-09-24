@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>三种代码理解方式实测对比 — 以 aiops-mcp-servers 为例</title>
+<style>
+  :root{
+    --ink:#1a1a1a; --muted:#6b7280; --line:#e5e7eb; --bg:#ffffff; --soft:#f9fafb;
+    --good:#047857; --goodbg:#ecfdf5; --bad:#b91c1c; --badbg:#fef2f2;
+    --warn:#b45309; --warnbg:#fffbeb; --accent:#1d4ed8; --accentbg:#eff6ff;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; padding:48px 24px 96px; background:var(--bg); color:var(--ink);
+    font:15px/1.75 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  main{max-width:1080px;margin:0 auto}
+  h1{font-size:30px;line-height:1.35;margin:0 0 8px;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:14px;margin:0 0 40px}
+  h2{font-size:21px;margin:56px 0 16px;padding-bottom:8px;border-bottom:2px solid var(--ink);letter-spacing:-.01em}
+  h3{font-size:16px;margin:32px 0 10px}
+  p{margin:12px 0}
+  code,kbd{font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+  pre{background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:14px 16px;overflow-x:auto;margin:14px 0}
+  pre code{background:none;border:none;padding:0;font-size:12.5px;line-height:1.7}
+  table{width:100%;border-collapse:collapse;margin:18px 0;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}
+  th{background:var(--soft);font-weight:600;white-space:nowrap}
+  td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .yes{color:var(--good);font-weight:600}
+  .no{color:var(--bad);font-weight:600}
+  .mid{color:var(--warn);font-weight:600}
+  .box{border:1px solid var(--line);border-left:4px solid var(--accent);background:var(--accentbg);
+    border-radius:6px;padding:14px 18px;margin:20px 0}
+  .box.warn{border-left-color:var(--warn);background:var(--warnbg)}
+  .box.bad{border-left-color:var(--bad);background:var(--badbg)}
+  .box.good{border-left-color:var(--good);background:var(--goodbg)}
+  .box p:first-child{margin-top:0} .box p:last-child{margin-bottom:0}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin:22px 0}
+  .kpi{border:1px solid var(--line);border-radius:8px;padding:14px 16px;background:var(--soft)}
+  .kpi .v{font-size:24px;font-weight:700;letter-spacing:-.02em;line-height:1.2}
+  .kpi .k{font-size:12px;color:var(--muted);margin-top:5px}
+  .kpi.win .v{color:var(--good)}
+  .kpi.lose .v{color:var(--bad)}
+  .pill{display:inline-block;font-size:11.5px;padding:2px 8px;border-radius:11px;border:1px solid;font-weight:600}
+  .pill.a{color:var(--accent);border-color:#bfdbfe;background:var(--accentbg)}
+  .pill.g{color:var(--good);border-color:#a7f3d0;background:var(--goodbg)}
+  .pill.r{color:var(--bad);border-color:#fecaca;background:var(--badbg)}
+  .pill.w{color:var(--warn);border-color:#fde68a;background:var(--warnbg)}
+  details{border:1px solid var(--line);border-radius:8px;padding:12px 16px;margin:14px 0;background:var(--soft)}
+  summary{cursor:pointer;font-weight:600;font-size:14px}
+  details[open] summary{margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+  ul,ol{margin:12px 0;padding-left:24px}
+  li{margin:6px 0}
+  .foot{margin-top:64px;padding-top:20px;border-top:1px solid var(--line);color:var(--muted);font-size:12.5px}
+  .bar{display:inline-block;height:9px;border-radius:2px;vertical-align:middle;margin-right:7px}
+  .bar.a{background:#93c5fd} .bar.b{background:#6ee7b7}
+  .small{font-size:12.5px;color:var(--muted)}
+  .nowrap{white-space:nowrap}
+  .hl{background:#fef9c3;padding:0 3px;border-radius:3px}
+</style>
+</head>
+<body>
+<main>
+
+<h1>三种代码理解方式实测对比</h1>
+<p class="sub">
+  靶子：<code>aiops-mcp-servers</code>（79 代码文件 / 约 12,000 行 / 无 CLAUDE.md 索引）<br>
+  对比：<b>grep 手搜</b>（基线） · <b>understand-anything</b>（LLM 知识图谱） · <b>codegraph</b>（tree-sitter 符号图）<br>
+  所有数字均为 2026-09-23 本机实测，复现命令见文末。
+</p>
+
+<div class="box">
+  <p><b>结论先行。</b>三种方式<strong>不是替代关系，是分工关系</strong>。实测判定：</p>
+  <ul>
+    <li><b>codegraph</b> 答对 <b>7/8</b>，成本 <b>0 token / 4.66 秒</b> —— 应当常态化使用，替代大部分「谁调用谁 / 定义在哪」的检索。</li>
+    <li><b>understand-anything</b> 答对 <b>6/8</b>，成本 <b>824,147 token / 14 个子代理 / 16.4 分钟</b> —— 成本差约 <span class="hl">200 倍</span>，但它有一样另外两家都没有的东西：<b>架构叙事</b>（分层 + 导览）。只在「给新人做导览」时值得跑一次。</li>
+    <li><b>grep</b> 永远不可替代：<b>字面常量、状态核查、跑服务探接口</b>只有它能做，且零成本零安装。</li>
+  </ul>
+  <p class="small" style="margin-top:12px">⚠️ 本结论的边界写在 <a href="#limits">§7 局限</a>，请连同结论一起读 —— 尤其是 n=1 与「题目由我出」这两条。</p>
+</div>
+
+<h2>1 · 问题：我们到底在花什么成本</h2>
+
+<p>先量化「理解代码」在本项目实际占多少。取 2026-09 一次跨四仓的完整会话（含压缩前），对全部工具调用做分类：</p>
+
+<div class="kpis">
+  <div class="kpi"><div class="v">1,187</div><div class="k">Bash 调用</div></div>
+  <div class="kpi"><div class="v">264</div><div class="k">Read 调用</div></div>
+  <div class="kpi"><div class="v">18</div><div class="k">子代理</div></div>
+  <div class="kpi"><div class="v">13.77M</div><div class="k">工具结果字符</div></div>
+</div>
+
+<p>把 2,507 条去重 Bash 按用途拆开（脚本分类，非人工抽样）：</p>
+
+<table>
+  <thead><tr><th>用途</th><th class="num">条数</th><th class="num">占比</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td><b>递归检索</b>（找调用方 / 定义）</td><td class="num">238</td><td class="num">9%</td><td><code>grep -r</code> / <code>rg</code> —— <b>codegraph 的主场</b></td></tr>
+    <tr><td><b>读某段代码</b></td><td class="num">446</td><td class="num">18%</td><td><code>sed -n</code> / <code>cat</code> / <code>head</code> —— <b>codegraph 的主场</b></td></tr>
+    <tr><td>find 找文件</td><td class="num">31</td><td class="num">1%</td><td>codegraph 的 <code>files</code> 可替代</td></tr>
+    <tr style="background:var(--accentbg)"><td colspan="1"><b>小计：为「找到 / 读懂代码」</b></td><td class="num"><b>715</b></td><td class="num"><b>≈29%</b></td><td class="small">保守口径</td></tr>
+    <tr><td>外呼验证（curl / podman / gh）</td><td class="num">696</td><td class="num">28%</td><td>三家都帮不上</td></tr>
+    <tr><td>git 查历史</td><td class="num">226</td><td class="num">9%</td><td>三家都帮不上</td></tr>
+    <tr><td>改完 <code>grep -c</code> 核对</td><td class="num">80</td><td class="num">3%</td><td>验证，非理解</td></tr>
+    <tr><td>写文件 / inline 探测脚本 / 其它</td><td class="num">789</td><td class="num">31%</td><td>—</td></tr>
+  </tbody>
+</table>
+
+<div class="box warn">
+  <p><b>关于 29% 这个数字。</b>表中 789 条「单文件精确定位」未逐条判定用途，若把其中偏检索的部分也算进去，<b>宽口径接近 50%</b>。<b>29% 是保守下界，不是精确值</b> —— 引用时请按区间理解。</p>
+</div>
+
+<h3>把「理解代码」拆成 7 类真实问题</h3>
+<p>上表是动词，下面是名词 —— 本次实测就是拿这 7 类去考三种方式。题目全部来自<b>该会话中真实搜过的东西</b>，不是我事后编的。</p>
+<table>
+  <thead><tr><th class="nowrap">#</th><th>问题类型</th><th>本次具体问题</th></tr></thead>
+  <tbody>
+    <tr><td class="nowrap">Q1</td><td>符号定义在哪 + 依赖谁</td><td><code>locate_repo</code> 定义在哪个文件、实现对谁有依赖</td></tr>
+    <tr><td class="nowrap">Q2</td><td>进程入口</td><td>从哪里启动、入口文件是哪个</td></tr>
+    <tr><td class="nowrap">Q3</td><td><b>端点 / 路由清单</b></td><td><code>/admin/*</code> 有哪些端点，逐一列出</td></tr>
+    <tr><td class="nowrap">Q4</td><td><b>字面常量映射</b></td><td><code>cpu_percent</code>/<code>disk_percent</code> 在哪里被定义或映射</td></tr>
+    <tr><td class="nowrap">Q5</td><td>符号定义在哪</td><td><code>get_trace</code> 定义在哪个文件</td></tr>
+    <tr><td class="nowrap">Q6</td><td>仓结构与多服务关系</td><td>一共几个 server、它们之间共享什么</td></tr>
+    <tr><td class="nowrap">Q7</td><td><b>能力清单与计数</b></td><td>一共暴露多少个 MCP 工具，分别在哪个文件</td></tr>
+    <tr><td class="nowrap">Q8</td><td><b>模块关系 / 影响面</b></td><td><code>cmdb</code>/<code>entity_graph</code>/<code>graph_query</code> 三者关系</td></tr>
+  </tbody>
+</table>
+<p class="small">加粗的 Q3/Q4/Q7/Q8 是事后看真正分出高下的四题：分水岭是「<b>摘要 vs 原文</b>」而非「结构 vs 非结构」—— Q3 我出题时以为是结构题，实际考的是字面常量。</p>
+
+<h2>2 · 三种方式是什么</h2>
+
+<table>
+  <thead><tr><th style="width:16%">方式</th><th style="width:28%">原理</th><th>在本次实测中的形态</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><span class="pill a">grep</span><br><b>基线</b></td>
+      <td>逐次正则匹配 + 读文件。无索引、无状态。</td>
+      <td>5 次 Bash 调用答完 8 题；输出是原文行。</td>
+    </tr>
+    <tr>
+      <td><span class="pill w">understand-anything</span><br>v2.7.5</td>
+      <td>7 阶段流水线：扫描 → 语义分批 → <b>每个批次派一个 LLM 子代理读文件并产出图节点/边</b> → 合并 → 验收 → 架构分层 → 生成导览。</td>
+      <td>14 个子代理、103 文件、产出 304 节点 / 537 边的<b>摘要图</b> + 10 个架构层 + 14 步导览。</td>
+    </tr>
+    <tr>
+      <td><span class="pill g">codegraph</span><br>v1.6.0</td>
+      <td>tree-sitter 解析 AST + SQLite(FTS5) 存储。节点 = 函数/类/变量/import，边 = 调用/导入/继承。MCP 工具与 CLI 同源。</td>
+      <td>一条命令 4.66 秒建完 1,185 节点 / 2,739 边。<code>explore</code> 附带<b>当次从盘上重读的 verbatim 原文</b>。</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="box good">
+<p><b>一个决定性差异：摘要 vs 原文。</b>understand-anything 把源码交给 LLM <b>总结</b>；codegraph 把源码<b>原样</b>给你，并在输出里明确声明：</p>
+<pre><code>The code below is the <b>verbatim, current on-disk source</b> … re-read from disk on this call
+and line-numbered, byte-for-byte identical to what the Read tool returns.
+It is <b>NOT a summary, outline, or stale cache</b>.</code></pre>
+<p>后面 Q3/Q4 的分差，根源全在这里 —— LLM 摘要天然丢字面常量（URL、配置键、映射表），而原文天然不丢。</p>
+</div>
+
+<h2>3 · 逐题实测对照</h2>
+
+<p>判定标准：答案必须给出与 grep 核实的<b>具体事实</b>（文件名 / 行号 / 调用关系）才计 ✅；「大意如此」不计。图答题时<b>明令禁止 grep 与读源码</b>，并要求逐题声明证据来自哪些节点。</p>
+
+<table>
+  <thead>
+    <tr><th class="nowrap">#</th><th style="width:30%">grep 核实的标准答案</th><th style="width:30%">understand-anything</th><th style="width:30%">codegraph</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="nowrap"><b>Q1</b></td>
+      <td>两层：<code>tools/datasource.py:294</code> 壳 + <code>backends/cmdb.py:202</code> 实现</td>
+      <td><span class="yes">✅</span> 两层都对，<b>还给出 <code>calls → entity_graph.get_graph</code> 依赖链</b></td>
+      <td><span class="yes">✅</span> 报「2 definitions」并附两边完整源码</td>
+    </tr>
+    <tr>
+      <td class="nowrap"><b>Q2</b></td>
+      <td><code>__main__.py</code> → <code>server.main()</code> → uvicorn</td>
+      <td><span class="yes">✅</span> 三个 <code>__main__</code> → <code>server.py:main</code>，带行号</td>
+      <td><span class="yes">✅</span> <code>query main</code> 列出三处 <code>main</code> 及签名</td>
+    </tr>
+    <tr>
+      <td class="nowrap"><b>Q3</b></td>
+      <td><b>8 条</b>显式 <code>Route</code>（<code>server.py:211–218</code>）</td>
+      <td><span class="no">❌</span> 只到前缀 / guard / 后端能力，<b>明说「逐条路径图中没有」</b></td>
+      <td><span class="yes">✅</span> <b>8 条字面路径全部给出</b>（随 verbatim 源码第 211–218 行）</td>
+    </tr>
+    <tr>
+      <td class="nowrap"><b>Q4</b></td>
+      <td><code>backends/prometheus.py:47,53</code> 映射表；<code>:83</code> 全清单</td>
+      <td><span class="yes">✅</span> 定位到 <code>build_query</code>；但 <code>disk_percent</code> <b>零命中</b>、无完整清单</td>
+      <td><span class="yes">✅</span> <b>映射表 + <code>available_metrics()</code> 全清单</b></td>
+    </tr>
+    <tr>
+      <td class="nowrap"><b>Q5</b></td>
+      <td><code>tools/datasource.py:206</code> + <code>backends/es.py:225</code></td>
+      <td><span class="yes">✅</span> 两层都对，带行号</td>
+      <td><span class="yes">✅</span> 两层都对，带完整签名</td>
+    </tr>
+    <tr>
+      <td class="nowrap"><b>Q6</b></td>
+      <td><b>3 个</b> server；依赖逐条相同；<b>不共享代码</b></td>
+      <td><span class="yes">✅</span> 3 个；<b>正确指出不共享源码</b>，只有 uv workspace 工程约定</td>
+      <td><span class="yes">✅</span> <code>files</code> 输出完整目录树（80 文件）</td>
+    </tr>
+    <tr>
+      <td class="nowrap"><b>Q7</b></td>
+      <td><b>9 + 1 = 10</b> 个工具</td>
+      <td><span class="mid">⚠️</span> 数出 9+1=10，<b>但图内节点互相打架</b>（<code>datasource.py</code> 节点自称「10 个只读工具」），自评置信度「低」</td>
+      <td><span class="mid">⚠️</span> <code>explore</code> 里能看到两个闭包定义（266 / 314 行），<b>但要自己数</b></td>
+    </tr>
+    <tr>
+      <td class="nowrap"><b>Q8</b></td>
+      <td><code>entity_graph</code> 数据层 ← <code>cmdb</code> 读 API / <code>graph_query</code> 纯函数</td>
+      <td><span class="yes">✅</span> 正确、带依赖边与职责，<b>还带出了 <code>cmdb_admin</code> 写路径</b></td>
+      <td><span class="yes">✅</span> <code>callers get_graph</code> 给出 <b>12 个调用方 + file:line</b></td>
+    </tr>
+    <tr style="background:var(--soft);font-weight:700">
+      <td colspan="3" style="text-align:right">合计</td>
+      <td><span class="mid">6 / 8</span> &nbsp;vs&nbsp; <span class="yes">7 / 8</span></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>两家共同的盲区：嵌套闭包不是一等符号</h3>
+<p>本仓 <code>tools/datasource.py</code> 的 9 个 MCP 工具<b>定义在 <code>_build_*</code> 工厂函数内部的闭包</b>里。两个索引器都没把它们当独立符号：</p>
+<ul>
+  <li>understand-anything：节点下沉到工厂函数，工具名不单独成节点 → Q7 计数只能靠 LLM 从摘要推断 → 出现矛盾</li>
+  <li>codegraph：<code>query query_logs</code> 只命中 <code>backends/es.py</code> 的实现，<b>不命中 <code>tools/</code> 内的闭包</b>；靠 <code>explore</code> 的 verbatim 源码才能看见</li>
+</ul>
+<p class="small">这是「Python 动态注册工具」这一类写法的普遍难点（装饰器注册、工厂闭包、运行时拼装），<b>不是任一工具的缺陷</b>。遇到这类代码，两者都退化为「给你原文，你自己看」。</p>
+
+<h2>4 · 成本：差 200 倍的那一项</h2>
+
+<div class="kpis">
+  <div class="kpi lose"><div class="v">824,147</div><div class="k">understand-anything token</div></div>
+  <div class="kpi win"><div class="v">0</div><div class="k">codegraph token</div></div>
+  <div class="kpi lose"><div class="v">16.4 分</div><div class="k">UA 挂钟（14 子代理）</div></div>
+  <div class="kpi win"><div class="v">4.66 秒</div><div class="k">codegraph 建索引</div></div>
+</div>
+
+<table>
+  <thead><tr><th>维度</th><th>grep</th><th>understand-anything</th><th>codegraph</th></tr></thead>
+  <tbody>
+    <tr><td>建索引成本</td><td class="num">0</td><td class="num"><span class="no">824,147 token</span><br><span class="small">14 子代理 / 16.4 分钟</span></td><td class="num"><span class="yes">0 token</span><br><span class="small">4.66 秒 / 0 子代理</span></td></tr>
+    <tr><td>图的规模</td><td class="small">无图</td><td class="num">304 节点 / 537 边</td><td class="num"><b>1,185 节点 / 2,739 边</b><br><span class="small">节点 ×3.9，边 ×5.1</span></td></tr>
+    <tr><td>产物体积</td><td class="num">—</td><td class="num">367 KB</td><td class="num">3.8 MB</td></tr>
+    <tr><td>内容形态</td><td>原文</td><td><b>LLM 摘要</b></td><td><b>verbatim 原文</b></td></tr>
+    <tr><td>增量更新</td><td>天然最新</td><td><span class="mid">有设计，<b>本轮未测</b></span></td><td><span class="yes">三层机制</span><br><span class="small">逐层实测结论见下方</span></td></tr>
+    <tr><td>运行依赖</td><td>无</td><td>Node ≥22 + pnpm</td><td>MIT，<b>289 MB 自包含二进制，零运行时依赖</b></td></tr>
+    <tr><td>许可</td><td>—</td><td class="small">（插件，未逐一核）</td><td>MIT</td></tr>
+  </tbody>
+</table>
+
+<div class="box bad">
+<p><b>824,147 token 是什么概念。</b>该仓全部代码约 12,000 行。按通用换算，这个 token 量约为<b>该仓全部代码行数的 2.3 倍</b>。也就是说，为了得到一份<b>比 codegraph 少 3.9 倍节点、且含矛盾</b>的图，付出的代价相当于把整个仓读了两遍多。</p>
+<p>而 codegraph 走的是<b>确定性解析</b>（tree-sitter），不调用任何 LLM —— 所以它的边际成本是 <b>0 token</b>。</p>
+</div>
+
+<h3>4.1 增量更新：codegraph 的三层机制（逐层实测）</h3>
+
+<p>「索引会不会过期」是选型时最该问的问题 —— 一份会过期的图比没有图更危险，因为它给出确信的错误答案。codegraph 用了三层来防这件事，逐层验证如下：</p>
+
+<table>
+  <thead><tr><th style="width:13%">层</th><th style="width:40%">机制</th><th>实测结论</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><b>① 文件监听<br>自动同步</b></td>
+      <td>由一个<b>后台守护进程（daemon）</b>承担：监听仓库内的 Unix socket <code>&lt;repo&gt;/.codegraph/daemon.sock</code>（<b>每仓一个</b>），用本地 socket <i>"share one background server across sessions"</i> —— 多个 agent 会话共享同一份索引与监听。<br>
+      监听走原生 OS 事件（macOS <b>FSEvents</b> / Linux inotify / Win ReadDirectoryChangesW），防抖默认 <b>2000 ms</b>（<code>CODEGRAPH_WATCH_DEBOUNCE_MS</code> 可调，钳 <code>[100 ms, 60 s]</code>）。<br>
+      <b>daemon 只由 <code>codegraph serve --mcp</code> 拉起</b> —— 实测跑了 init / query / sync / status / files 一串 CLI 后，<code>daemon</code> 仍报 <i>No daemon running</i>，直到起了 <code>serve</code> 才出现。可用 <code>--no-watch</code> 或 <code>CODEGRAPH_NO_DAEMON=1</code> 关闭。</td>
+      <td><span class="yes">✅ 已验证</span><br><span class="small">
+      daemon 起来后，<b>全程未跑 <code>sync</code></b>：<br>
+      · 造新符号 → 6 秒后查询<b>即命中</b>；删该文件 → 6 秒后<b>自动移除</b><br>
+      · <code>daemon.log</code> 记录 <code>Auto-synced 1 file(s) in 253ms</code> / <code>2ms</code><br>
+      · <code>serve</code> 进程退出后 daemon <b>继续存活</b>（exit 0 后仍运行 50 秒）<br>
+      · <b>停掉 daemon 期间改的文件，重启后自动补齐</b>：日志 <code>Caught up 1 file(s) changed since last run</code>，无需手动 sync</span></td>
+    </tr>
+    <tr>
+      <td><b>② Pending<br>横幅</b></td>
+      <td>防抖窗口内，若 MCP 工具响应会引用到<b>尚未同步的文件</b>，响应开头加 <code>⚠️</code> 横幅点名该文件、指示 agent 直接 <code>Read</code>。未被引用的待同步文件则以脚注给出。<code>codegraph status</code> 相应显示 <code>### Pending sync:</code> 段，列出文件与编辑时长。</td>
+      <td><span class="mid">⚠️ 未验证</span><br><span class="small">
+      文档有明确描述，但我<b>没能构造出触发所需的时序</b>（需正好卡在 2 秒防抖窗口内查询一个刚改动的文件）。<br>
+      <b>如实标注为未验证，不计入对比优势。</b></span></td>
+    </tr>
+    <tr>
+      <td><b>③ 手动 <code>sync</code></b></td>
+      <td>给 watcher 被禁用的场景（沙箱环境 / <code>--no-watch</code> / <code>CODEGRAPH_NO_DAEMON=1</code>），或脚本不进 agent 会话时做前置同步。带 <code>-q</code>，文档写明 <i>"for git hooks"</i>。</td>
+      <td><span class="yes">✅ 已验证</span><br><span class="small">
+      增文件 <b>241 ms / 3 节点</b>；删文件 <b>122 ms / 0 节点</b>。</span></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>4.2 daemon 的生命周期（「常驻」到底指什么）</h3>
+
+<table>
+  <thead><tr><th style="width:22%">问题</th><th>事实（<code>daemon.log</code> 与实测）</th></tr></thead>
+  <tbody>
+    <tr><td>它是什么</td><td>一个<b>按项目</b>的后台守护进程，监听仓库内的 Unix socket <code>.codegraph/daemon.sock</code>，供多个会话共享</td></tr>
+    <tr><td>谁拉起它</td><td><b>只有 <code>codegraph serve --mcp</code></b>。纯 CLI 命令<b>不会</b>拉起（已实测）</td></tr>
+    <tr><td>活多久</td><td><b>空闲 300000 ms（5 分钟）自动退出</b> —— 日志原文：<code>Idle timeout 300000ms</code></td></tr>
+    <tr><td>退出后怎么办</td><td>下次有客户端连上时<b>重新拉起</b>，并自动补齐缺位期间的改动</td></tr>
+    <tr><td>怎么关</td><td><code>CODEGRAPH_NO_DAEMON=1</code>（每个会话各自进程，不共享）</td></tr>
+  </tbody>
+</table>
+
+<p class="small">所以准确说法不是「MCP server 必须永远开着」，而是 <b>「需要一个活着的 daemon」</b>：agent 会话期间它在，会话结束 5 分钟后它退。这也是本报告 §6 推荐「常态用 codegraph」时必须一并落实的前提。</p>
+
+<div class="box warn">
+<p><b>一个实测出来的缺口：无 daemon 时，CLI 查询会静默返回过期结果。</b></p>
+<p>复现（daemon 已停、文件已改）：<code>codegraph query &lt;新符号&gt;</code> → <b><code>No results found</code></b> —— 文件明明存在。分两种情况：</p>
+<ul>
+  <li><code>codegraph status</code> <b>会警告</b>：实测输出 <code>Pending Changes: Added: 1 files</code> 并提示 <code>Run "codegraph sync" to update the index</code>。</li>
+  <li><code>query</code> / <code>node</code> / <code>callers</code> <b>不警告</b>，直接读库返回。</li>
+</ul>
+<p>README 说明第 ② 层 Pending 横幅是加在 <b>MCP 工具响应</b>上的 —— 那在 MCP 模式（daemon 活着）下应当覆盖此缺口。但<b>纯 CLI 用法没有这层保护</b>：<b>用 CLI 时，若不确定 daemon 是否活着，先跑一次 <code>status</code>。</b></p>
+</div>
+
+<h2>5 · 优势 / 劣势 / 代价</h2>
+
+<h3>grep <span class="pill a">基线 · 不可替代</span></h3>
+<table>
+  <thead><tr><th style="width:12%">维度</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><b>优势</b></td><td>
+      · <b>零成本、零安装、零维护</b> —— 没有任何前置动作<br>
+      · <b>永远最新</b>，不存在索引与代码不一致<br>
+      · <b>无盲区</b>：字面常量、配置键、注释、非代码文件，什么都能搜<br>
+      · <b>可精确到任意粒度</b>：正则、上下文行数、文件类型过滤
+    </td></tr>
+    <tr><td><b>劣势</b></td><td>
+      · 只能<b>逐次问</b>，每次都是冷启动<br>
+      · <b>跨文件关系要人肉拼接</b>（「谁调用 X」要 grep 名字 + 判断真假阳性 + 追 import）<br>
+      · <b>没有影响面分析</b>：改一个函数前想知道波及哪些测试，grep 答不了<br>
+      · 字面命中 ≠ 真命中（本次实测中我就被<b>注释里的 <code>ticket-done</code></b> 骗过一次，差点得出错结论）
+    </td></tr>
+    <tr><td><b>代价</b></td><td>时间与 token <b>随问题量线性增长</b>。本项目实测：<b>29%–50% 的 Bash 调用</b>花在这上面。</td></tr>
+  </tbody>
+</table>
+
+<h3>understand-anything <span class="pill w">有独特价值 · 但贵 200 倍</span></h3>
+<table>
+  <thead><tr><th style="width:12%">维度</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><b>优势</b></td><td>
+      · <b>唯一能产出「架构叙事」的一家</b>：10 个架构层（<code>server-entry</code> / <code>mcp-tools</code> / <code>backends</code> / <code>security</code> / <code>core</code> …）+ 14 步导览，每步带中文说明<br>
+      · 输出是<b>人话摘要</b>，适合新人快速建立心智模型，不需要读源码<br>
+      · 会做<b>跨批次的关系推断</b>（<code>tested_by</code>、<code>configures</code>、<code>deploys</code> 等语义边），这是纯语法解析做不到的<br>
+      · 自带校验阶段（本次 0 issues）
+    </td></tr>
+    <tr><td><b>劣势</b></td><td>
+      · <b>字面常量系统性丢失</b>：URL、配置键、映射表在摘要里没了 → Q3 直接答不出、Q4 清单缺失<br>
+      · <b>图内可能自相矛盾</b>：Q7 出现「<code>datasource.py</code> 节点自称 10 个只读工具」与其它节点/README 打架，且<b>没有任何机制发现这个矛盾</b><br>
+      · <b>没有 <code>callers</code>/<code>callees</code>/<code>impact</code> 这类查询工具</b> —— 图建好了但你不能直接问「谁调用 X」<br>
+      · 索引是<b>快照</b>，代码变了要重跑（增量机制存在但本轮未验证）
+    </td></tr>
+    <tr><td><b>代价</b></td><td>
+      <b>824,147 token / 14 个子代理 / 16.4 分钟</b>（该仓规模下）。需要 Node ≥22 + pnpm，首次要构建插件。<br>
+      <span class="small">注：若只答 8 题而不建图，单次图查询约 76,000 token —— 但那是建立在已付 824k 建图成本之上。</span>
+    </td></tr>
+  </tbody>
+</table>
+
+<h3>codegraph <span class="pill g">性价比最优</span></h3>
+<table>
+  <thead><tr><th style="width:12%">维度</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><b>优势</b></td><td>
+      · <b>0 token / 4.66 秒</b>建 1,185 节点 —— 确定性解析，不走 LLM<br>
+      · <b><code>callers</code> / <code>callees</code> / <code>impact</code></b> 直接回答「谁调用谁 / 改前影响面」，<b>正好打在 Bash 用量最大的那 29% 上</b><br>
+      · <code>explore</code> 给 <b>verbatim 原文</b>（当次从盘重读）→ <b>字面常量不丢</b>，Q3/Q4 因此完胜<br>
+      · <b>增量更新有三层机制</b>（文件监听自动同步 / Pending 横幅 / 手动 sync）：自动同步与手动 sync <b>均已实测成立</b>，且 <b>daemon 缺位期间的改动会在重启时自动补齐</b>（<code>Caught up N file(s) changed since last run</code>）—— 逐层结论见 <b>§4.1 / §4.2</b><br>
+      · MIT 许可、289 MB 自包含二进制、<b>零运行时依赖</b>；索引器自带 <code>.gitignore</code> 防止数据库入库
+    </td></tr>
+    <tr><td><b>劣势</b></td><td>
+      · <b>不给语义摘要</b>：它告诉你「<code>build_query</code> 在 36–78 行、被 5 个地方调用」，<b>不告诉你「这个模块干什么用的」</b> —— 后者仍需 LLM 或人<br>
+      · <b>没有架构分层 / 导览</b>，给不了「这个仓长什么样」的整体叙事<br>
+      · 同样<b>抓不到嵌套闭包</b>（与 understand-anything 同盲区）<br>
+      · 每个仓要单独 <code>init</code>，会在仓里留下 3.8 MB 索引目录<br>
+      · <b>自动同步依赖一个活着的 daemon</b>（只由 <code>serve --mcp</code> 拉起，空闲 5 分钟自动退）：纯 CLI 用法下不启监听，需手动 <code>sync</code>；且此时 <code>query</code>/<code>callers</code> <b>会静默返回过期结果</b>，只有 <code>status</code> 提示 <code>Pending Changes</code>（见 §4.2）<br>
+      · 默认收集匿名遥测（<code>codegraph telemetry off</code> 可关）—— 说明里承诺不含代码/路径/符号名
+    </td></tr>
+    <tr><td><b>代价</b></td><td>每仓 3.8 MB 索引 + 一次性 289 MB 二进制下载。<b>无 token 成本、无 LLM 成本。</b>命令实测约 1–2 秒/次。</td></tr>
+  </tbody>
+</table>
+
+<h2>6 · 什么状况下用哪个</h2>
+
+<table>
+  <thead><tr><th style="width:40%">你手头的问题</th><th style="width:20%">最推荐</th><th>为什么</th></tr></thead>
+  <tbody>
+    <tr><td><b>「谁调用 X」/「改这个函数会波及什么」</b></td><td><span class="pill g">codegraph</span><br><code>callers</code> / <code>callees</code> / <code>impact</code></td><td>grep 要人肉拼，UA 压根没这功能。实测 <code>callers get_graph</code> 一次给出 12 个调用方带 <code>file:line</code>。</td></tr>
+    <tr><td><b>「X 定义在哪 / 有几处定义」</b></td><td><span class="pill g">codegraph</span><br><code>node X</code></td><td>一次返回全部同名定义 + 源码 + 调用者。实测 <code>locate_repo</code> 两处一次给全。</td></tr>
+    <tr><td><b>字面常量</b>（URL、配置键、指标↔表达式映射、枚举清单）</td><td><span class="pill g">codegraph</span> <code>explore</code><br><span class="small">或直接 grep</span></td><td><b>必须是 verbatim 原文</b>。任何 LLM 摘要都会丢。Q3/Q4 的分差全部来自这里。</td></tr>
+    <tr><td><b>接手一个陌生大仓，想先建立整体印象</b></td><td><span class="pill g">codegraph</span> 建结构<br>→ 按需读源码</td><td>4.66 秒拿到完整符号图与目录树，比读文档快且不会过期。</td></tr>
+    <tr><td><b>要给团队 / 新人产出架构导览与分层图</b></td><td><span class="pill w">understand-anything</span></td><td><b>只有它能做</b>：10 层分层 + 14 步带说明的导览。一次性场景，非常规工具。</td></tr>
+    <tr><td><b>「这个模块是干什么的」（需要人话解释）</b></td><td><span class="pill w">understand-anything</span><br><span class="small">或直接读 docstring</span></td><td>codegraph 只给源码不给解释。<b>但注意</b>：本仓的模块 docstring 本身写得极好，直接读往往更快。</td></tr>
+    <tr><td><b>跑服务 / 探接口 / 查数据库 / 验证改动</b></td><td><span class="pill a">grep + curl</span></td><td>占实际工作量 28% + 9% + 3%，<b>两个索引器都帮不上</b>。</td></tr>
+    <tr><td><b>临时看一两个文件</b></td><td><span class="pill a">直接读</span></td><td>建索引的成本（3.8 MB + init）不划算。</td></tr>
+  </tbody>
+</table>
+
+<div class="box">
+<p><b>组合用法（推荐落地形态）。</b>不把它们当竞品，当<b>不同粒度</b>：</p>
+<ol>
+  <li><b>常态</b>：仓库 <code>codegraph init</code> 一次，<b>并把 MCP server 注册上</b>（否则自动同步不会启用，见 §4.2）→ 之后「找定义 / 找调用方 / 看影响面 / 取字面常量」全走 codegraph，grep 退到「它查不到的边角」。<br>
+  <span class="small">若暂不注册 MCP server、只用 CLI：每次查询前先跑一次 <code>codegraph status</code> —— 它会告诉你有没有 <code>Pending Changes</code>，而 <code>query</code>/<code>callers</code> 不会。</span></li>
+  <li><b>零散</b>：跑服务、探接口、验状态照旧走 bash + curl。</li>
+  <li><b>里程碑</b>：新人接手或需要对外讲架构时，<b>跑一次</b> understand-anything 出导览，用完即弃，不进 CICD、不做常规依赖。</li>
+</ol>
+</div>
+
+<h2 id="limits">7 · 这份结论的局限（请连同结论一起读）</h2>
+
+<table>
+  <thead><tr><th style="width:22%">局限</th><th>影响</th></tr></thead>
+  <tbody>
+    <tr><td><b>n = 1</b></td><td>只测了 1 个仓、1 种语言（Python）、1 个规模（12k 行）。<b>更大或混合语言的仓未必是这个结论</b> —— 官方 benchmark 声称大仓收益更大，我<b>没有验证</b>。</td></tr>
+    <tr><td><b>题目由我出</b></td><td>8 题取自一次真实会话，但<b>由我选择</b>，可能无意间偏向某方的强项。题目数太少，7/8 与 6/8 的差距<b>不具统计显著性</b>。</td></tr>
+    <tr><td><b>判分含主观性</b></td><td>Q4、Q7 的判定（「核心对清单缺」算 ✅ 还是 ⚠️）由我裁量。<b>换个人可能给出 6/8 与 6/8。</b></td></tr>
+    <tr><td><b>两边的增量机制都没测全</b></td><td>我以「快照会过期」质疑过 understand-anything，但<b>它的增量机制本轮完全没有验证</b>，这条质疑对它<b>未经证伪</b>。反过来，codegraph 三层里的第 ② 层（Pending 横幅）我<b>也没能验证到</b>。两家在这一维度上都<b>不完整</b> —— 不要只拿一边的缺口去抬高另一边。</td></tr>
+    <tr><td><b>daemon 的存活边界未穷举</b></td><td>codegraph 的「空闲 5 分钟退出、下次连上自动补齐」是我从<b>单次日志</b>读到的。<b>没测</b>：同时开多个项目、多个 agent 会话并发时的行为；daemon 被杀（非 SIGTERM）后索引的一致性；以及 5 分钟超时是否可配。</td></tr>
+    <tr><td><b>题目分类有误判</b></td><td>出题时把 Q3 归入「图应该最强的结构题」，实际它是<b>字面常量题</b>。真正的分水岭是「摘要 vs 原文」而非「结构 vs 非结构」，事后才看清。</td></tr>
+    <tr><td><b>会话分布未必代表长期</b></td><td>29%–50% 的检索占比来自一次跨四仓的会话，其中包含大量探索性工作。<b>常规开发日的比例可能低得多。</b></td></tr>
+    <tr><td><b>未测的第三方</b></td><td><code>serena</code>（已在本机 <code>external_plugins/</code>，同为 LSP 活索引）未纳入对比；<code>sourcegraph</code>、<code>lumen</code> 亦未测。</td></tr>
+  </tbody>
+</table>
+
+<h2>8 · 复现</h2>
+<details>
+<summary>展开全部实测命令（可原样重跑）</summary>
+<pre><code># ── 靶子 ──
+R=/Users/bo.gong/Documents/accenture/workspace/aiops-mcp-servers
+
+# ── understand-anything（824,147 token / 14 子代理 / 16.4 分钟）──
+#   /understand $R --language zh
+#   产出: $R/.understand-anything/knowledge-graph.json   (304 节点 / 537 边 / 367KB)
+
+# ── codegraph（0 token / 4.66 秒）──
+cd $R
+npx -y @colbymchenry/codegraph@1.6.0 init .          # 1,185 节点 / 2,739 边 / 3.8MB
+npx -y @colbymchenry/codegraph@1.6.0 status
+
+# 8 题的实际查询方式
+npx -y @colbymchenry/codegraph@1.6.0 node locate_repo
+npx -y @colbymchenry/codegraph@1.6.0 query main
+npx -y @colbymchenry/codegraph@1.6.0 explore "admin cmdb routes endpoint"   # Q3 的 8 条路径
+npx -y @colbymchenry/codegraph@1.6.0 explore "prometheus metric name mapping cpu_percent disk_percent"
+npx -y @colbymchenry/codegraph@1.6.0 callers get_graph                      # 12 个调用方
+npx -y @colbymchenry/codegraph@1.6.0 files
+
+# ── 增量更新：三层逐层验证 ──
+
+# 第 ① 层（自动同步）—— 必须先起 MCP server，否则监听不生效
+npx -y @colbymchenry/codegraph@1.6.0 serve --mcp --path . < /dev/null &
+npx -y @colbymchenry/codegraph@1.6.0 daemon        # 应出现 "pid NNNN v1.6.0 up Ns <路径>"
+# 造一个含新符号的文件，等 ~6 秒（防抖 2000ms + watcher 300ms）
+# 然后【不跑 sync】直接查 —— 命中即证明自动同步成立
+npx -y @colbymchenry/codegraph@1.6.0 query zz_watch_marker
+# 删掉该文件，再等 ~6 秒，再查 —— 应变为 "No results found"
+npx -y @colbymchenry/codegraph@1.6.0 query zz_watch_marker
+
+# 第 ② 层（Pending 横幅）—— 本轮未能构造出触发时序，未验证
+#   文档见 README「How auto-syncing works」一节；观测点：
+npx -y @colbymchenry/codegraph@1.6.0 status        # 有 pending 时出现 "### Pending sync:" 段
+
+# 第 ③ 层（手动 sync，双向）
+#   增文件 → sync → "Added: 1 — 3 nodes in 241ms"
+#   删文件 → sync → "Removed: 1 — 0 nodes in 122ms"
+
+# ── daemon 生命周期（§4.2）──
+# 权威来源就是 daemon 自己的日志，比任何文档都直接：
+cat $R/.codegraph/daemon.log
+#   [CodeGraph daemon] Listening on &lt;repo&gt;/.codegraph/daemon.sock (pid NNNN, v1.6.0). Idle timeout 300000ms.
+#   [CodeGraph MCP]    File watcher active — graph will auto-sync on changes
+#   [CodeGraph MCP]    Caught up 1 file(s) changed since last run
+#   [CodeGraph daemon] Shutting down (SIGTERM; clients=2).
+
+# 验证「谁拉起 daemon」：纯 CLI 不会拉起
+pkill -f codegraph && \
+  npx -y @colbymchenry/codegraph@1.6.0 status && \
+  npx -y @colbymchenry/codegraph@1.6.0 daemon     # 仍报 "No CodeGraph daemons running."
+
+# 验证「缺位期间的改动会补齐」
+pkill -f codegraph                                # ① 停 daemon
+echo 'def zz_gap_marker(): return 1' >> <某模块>.py  # ② 无监听时改代码
+npx -y @colbymchenry/codegraph@1.6.0 query zz_gap_marker   # → "No results found"（过期！）
+npx -y @colbymchenry/codegraph@1.6.0 serve --mcp --path . < /dev/null &
+sleep 8
+npx -y @colbymchenry/codegraph@1.6.0 query zz_gap_marker   # → 命中（自动补齐，未跑 sync）
+
+# 验证「谁警告、谁不警告」
+pkill -f codegraph ; echo 'def zz2(): return 2' >> <某模块>.py
+npx -y @colbymchenry/codegraph@1.6.0 status   # ✅ "Pending Changes: Added: 1 files" + 提示跑 sync
+npx -y @colbymchenry/codegraph@1.6.0 query zz2  # ❌ "No results found"，不警告
+
+# 清理：daemon 只能交互式停，实测用 kill
+pkill -f codegraph ; npx -y @colbymchenry/codegraph@1.6.0 daemon   # 应报 "No CodeGraph daemons running."
+
+# ── grep 基线 ──
+grep -rn "def locate_repo" . ; grep -n '@app\.\|"/admin' server.py ; …</code></pre>
+</details>
+
+<div class="foot">
+  <p><b>实验执行</b>：2026-09-23 09:03–10:25（本机，darwin 25.6.0 / arm64）。建图 09:03–09:19；增量更新三层与 daemon 生命周期验证 09:41–10:25。<br>
+  <b>产物状态</b>：<code>$R/.understand-anything/</code> 与 <code>$R/.codegraph/</code> 均为未跟踪，源码 0 行改动。<br>
+  <b>数据来源</b>：本会话转录（<code>29e35932</code>）与两次建图的子代理用量回执，未使用估算值；凡估算之处已在文中标注。</p>
+</div>
+
+</main>
+</body>
+</html>
