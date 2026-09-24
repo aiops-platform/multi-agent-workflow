@@ -11,13 +11,18 @@
 3. **服务名只有一个来源**——`fix` / `remediate` / `test` / `commit` 都 `require: [service]`
    且取自工单的 CMDB CI。没有 locate 节点 ⇒ 缺了必须失败，不能让 agent 猜一个仓库去改
    （`docs/TODO.md` §20，实测 run_c9eb2fe68d）。
-4. **两道门的语义相反、且都显式写出来**——`approve-plan` 是 `abort`（驳回 = 中止，
-   且**没有**驳回边）；`approve-commit` 是 `continue`（驳回 → recap，不中止）。
+4. **三道门的 `on_reject` 都显式写出来，且判据是"门之前不可逆的事发生了没有"**——
+   `approve-plan` 与 `approve-deploy` 是 `abort`（且**都没有**驳回边）；
+   `approve-commit` 是 `continue`（驳回 → recap，不中止）。
    `on_reject` 默认值是 `abort`，写错方向图上不会报错，只会静默换语义。
-5. **`ticket-done` 只在成功路径上**——它挂在 `merge` 之后（曾经直接挂 `commit`）。
+   ⚠️ `approve-deploy` 为什么跟 `approve-commit` 不同：走到它时 **PR 已合、主干已动**，
+   用 `continue` + 驳回边 → recap 会让 run **判 done（绿）**而工单永远停在"处理中" ——
+   正是本仓那句「绿着一条没交付的 run 比红着更危险」。详见该节点的 YAML 注释。
+5. **`ticket-done` 只在成功路径上**——它的入边**改过两次，两次都往右挪一格**
+   （`commit` → `merge` → `ci` → `approve-deploy`），判据始终是同一条：
+   **回传的判据是"有没有可交付的物"，不是"流程跑到哪了"**。
    位置错了的后果不是报错，而是"测试没过 / 审批驳回"那几条路**也不再回传工单**
-   （或反过来重复回传）。挂 `merge` 而不是 `commit` 是 2026-09-24 的修正：只开 PR
-   不等于交付 —— 那样会在改动还没落到主干时就回传「已解决」。
+   （或反过来重复回传）。
 6. **`merge` 的输入取自 `commit` 的输出且必须有值**——`require: [service, pr_url]`。
    少了 `pr_url`，工具会拿到 None 并去"猜一个要合的 PR"；而本仓 main 上堆着多个
    历史 run 留下的未合并 PR，猜错就是合了别人的分支。
@@ -42,6 +47,7 @@ SEED_ID = "seed-problem-diagnose-fix"
 
 PLAN_GATE = "approve-plan"
 COMMIT_GATE = "approve-commit"
+DEPLOY_GATE = "approve-deploy"
 
 INPUTS = {
     "bug_report": {
@@ -128,7 +134,7 @@ def test_workflow_loads_with_exactly_the_expected_nodes() -> None:
     dag = load().dag
     assert set(dag.nodes) == {
         "plan", PLAN_GATE, "fix", "remediate", "test", "review",
-        COMMIT_GATE, "commit", "merge", "ci", "ticket-done", "recap",
+        COMMIT_GATE, "commit", "merge", "ci", DEPLOY_GATE, "ticket-done", "recap",
     }
     assert dag.nodes[PLAN_GATE].is_approval
     assert dag.nodes[COMMIT_GATE].is_approval
@@ -274,7 +280,7 @@ def test_ticket_done_sits_on_the_success_path_only() -> None:
     | `ci` ✅ | 编译打包 + 构建镜像都成了，`image_tag` 在手 —— 这才叫交付 |
     """
     dag = load().dag
-    assert [e.source for e in dag.nodes["ticket-done"].in_edges] == ["ci"]
+    assert [e.source for e in dag.nodes["ticket-done"].in_edges] == [DEPLOY_GATE]
     assert [e.target for e in dag.edges if e.source == "ticket-done"] == ["recap"]
     assert dag.nodes["ticket-done"].on_failure == "abort"
 
@@ -313,14 +319,66 @@ def test_workspace_gets_prepared_for_the_repair_chain() -> None:
     assert agents & WORKSPACE_AGENTS, f"没有任何节点会触发工作区准备（WORKSPACE_AGENTS={sorted(WORKSPACE_AGENTS)}）"
 
 
-# ── 行为：两道门 ────────────────────────────────────────────────────────────
+def test_deploy_gate_aborts_and_has_no_reject_edge() -> None:
+    """发布门：`abort` + **没有**驳回边 —— 与 `approve-commit` 刻意不同。
+
+    判据是「**这道门之前，不可逆的事发生了没有**」：走到它时 `commit` 已推 PR、
+    `merge` 已把改动合进主干（`ci` 又已产出镜像）。用 `continue` + 驳回边 → recap
+    会让 run **判 done（绿）**，而工单永远停在"处理中"、也没有任何补偿 ——
+    那正是本仓反复写的「绿着一条没交付的 run 比红着更危险」（看板会把它算成闭环）。
+
+    ⚠️ 加载期只查**反方向**（`abort` + 驳回边 = 矛盾，直接报 WorkflowDAGError），
+    所以"该有驳回边却没写"这件事没有任何校验 —— 只能靠这条用例钉住。
+    """
+    dag = load().dag
+    node = dag.nodes[DEPLOY_GATE]
+    assert node.is_approval
+    assert node.on_reject == "abort"
+    assert [(e.target, e.when) for e in dag.edges if e.source == DEPLOY_GATE] == [
+        ("ticket-done", f"$.nodes.{DEPLOY_GATE}.output.approved == true")
+    ]
+    assert [(e.source, e.when) for e in dag.edges if e.target == DEPLOY_GATE] == [
+        ("ci", "$.nodes.ci.output.built == true")
+    ]
 
 
-async def test_happy_path_parks_at_both_gates_and_converges() -> None:
-    """计划门 → 提交门 → 提交 → 回传 → 复盘，全程无中断。
+def test_deploy_gate_metadata_is_raw_and_the_card_reads_upstream_output() -> None:
+    """审批节点的 params **从不解析** —— 这条锁的是"卡片上的值从哪来"。
 
-    「两次停放」是这条流程的形状：计划门在动手**之前**（审方案），提交门在推 PR **之前**
-    （审证据）。任一处不批，下游都不该跑。
+    `_process_approvals` 直接读 `node.params`（不做 `resolve_params`），所以：
+      · `timeout` 必须是**字面量**（`dag.py` 建图时把 YAML 顶层的 `timeout:` 折成 int
+        放进 params；写成 `$.` 引用会得到一个字符串，而下游是 `int(...)`）；
+      · 而 `image_tag` / `ci` 这些 `$.` 项，入库存的就是**表达式本身**
+        （实测 `run_e12a47ed4d` 的 approve-commit 记录）。
+    卡片上的实际数据走的是另一条路：`api/app.py` 的 `upstream_out` —— 取**上游节点的
+    output**。所以"审批人看得到 image_tag"这件事，靠的是 `ci` 输出里有它，
+    **不是**靠这里的 params。
+    """
+    node = load().dag.nodes[DEPLOY_GATE]
+    assert isinstance(node.params["timeout"], int), node.params["timeout"]
+    assert node.params["timeout"] == 7200
+    assert node.params["approvers"] == ["lead-engineer"]
+    # 这两项刻意保留原样的 `$.` 表达式 —— 它们只声明"这张门要看什么"，
+    # 不是给人看的值。断言它仍是原样，是为了防止有人误以为它会被解析。
+    assert node.params["image_tag"] == "$.nodes.ci.output.image_tag"
+    assert node.params["ci"] == "$.nodes.ci.output"
+
+
+# ── 行为：三道门 ────────────────────────────────────────────────────────────
+
+
+async def test_happy_path_parks_at_three_gates_and_converges() -> None:
+    """计划门 → 提交门 → **发布门** → 回传 → 复盘，全程无中断。
+
+    「**三次**停放」是这条流程的形状，三道门各压在一类动作之前：
+
+    | 门 | 压住的动作 | 审批人看什么 |
+    |---|---|---|
+    | `approve-plan` | 改代码 | 计划 |
+    | `approve-commit` | 推 PR **并合并到主干** | diff + 测试证据 |
+    | `approve-deploy` | 交付（回传工单） | 构建产物（`image_tag` + 构建日志） |
+
+    任一处不批，下游都不该跑。
     """
     seen: dict = {}
     ex = build(seen=seen)
@@ -337,14 +395,24 @@ async def test_happy_path_parks_at_both_gates_and_converges() -> None:
     assert ex.get_status("commit") == "pending"  # 没批就不推 PR
 
     await ex.approve(COMMIT_GATE, approved=True, by="lead-engineer")
+    assert await ex.run() == "waiting_approval"
+    assert ex.pending_approvals() == [DEPLOY_GATE]
+    # 走到发布门时，产物已经定型（这正是"批的是这个镜像"的前提）
+    for nid in ("commit", "merge", "ci"):
+        assert ex.get_status(nid) == DONE, nid
+    assert ex.get_status("ticket-done") == "pending"  # 没批就不交付
+
+    await ex.approve(DEPLOY_GATE, approved=True, by="lead-engineer")
     assert await ex.run() == "done"
-    assert ex.get_status("commit") == DONE
-    assert ex.get_status("merge") == DONE
     assert ex.get_status("ticket-done") == DONE
     assert ex.get_status("recap") == DONE
     assert ex.halt_triggered() is False
     # merge 真的收到了 commit 的 PR（不是 None，也不是空串）
     assert seen["merge"]["pr_url"].endswith("/pull/42")
+    # ⚠️ 审批节点**不走 runner**（`_process_approvals` 直接置 WAITING_APPROVAL），
+    # 所以脚本化 runner 的 `seen` 里**不会有它** —— 这条断言把那个事实钉住：
+    # 它同时也是"审批 params 从不解析"的根因（没人调 `resolve_params`）。
+    assert DEPLOY_GATE not in seen
     # 复盘**真的收到了**提交结果（`$.nodes.commit.output` 解析出了值，不是 None）——
     # 这条是 `$.nodes.commit.status` 那个恒空入参的同类锁（tests/test_seed_defaults.py
     # 的 test_seed_params_reference_real_schema_fields 只能核字段名，核不了"有没有值"）。

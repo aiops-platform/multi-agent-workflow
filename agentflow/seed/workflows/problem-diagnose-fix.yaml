@@ -1,4 +1,4 @@
-# ===== Problem Center 修复工作流：诊断结论 → 计划 → 修复+止血 → 测试 → 审查 → 提交 → 合并 → CI → 工单回传 =====
+# ===== Problem Center 修复工作流：诊断结论 → 计划 → 修复+止血 → 测试 → 审查 → 提交 → 合并 → CI → 发布门 → 工单回传 =====
 #
 # 由 bug-fix-scenario2 **简化**而来：诊断段
 # （triage / scope / logs / trace / metrics / infra / locate / know / rca + halt）**整段去掉**，
@@ -19,7 +19,7 @@
 # 而本图**一个取数节点都没有**——没有工具会读它，声明了只是摆设。
 name: problem-diagnose-fix
 version: "1.0.0"
-description: "Problem Center 修复闭环：诊断结论（rca）→ 修复计划 → 计划门 → 代码修复 + K8s 止血 → 测试/审查 → 提交门 → PR → 合并主干 → 编译打包+构建镜像 → 工单回传"
+description: "Problem Center 修复闭环：诊断结论（rca）→ 修复计划 → 计划门 → 代码修复 + K8s 止血 → 测试/审查 → 提交门 → PR → 合并主干 → 编译打包+构建镜像 → 发布门 → 工单回传"
 
 inputs:
   bug_report:
@@ -214,6 +214,49 @@ nodes:
       service: "$.inputs.bug_report.cmdb_ci.name"
     on_failure: abort
 
+  # ===== 发布门（本图第一道**压在不可逆动作之后**的门）=====
+  # 走到它时 `commit` 已推了 PR、`merge` 已把改动合进主干 —— 所以它的驳回语义
+  # 与前面两道门**不一样**，见下面 `on_reject` 的说明。
+  #
+  # ⚠️ **审批节点的 params 从不解析**（`_process_approvals` 直接读 `node.params`）——
+  #    入库的审批记录里存的是 `"$.nodes.ci.output.image_tag"` **这串表达式本身**
+  #    （实测 `run_e12a47ed4d` 的 approve-commit：`{"diff": "$.nodes.fix.output.diff", …}`）。
+  #    所以卡片上的数据**不是**从这里来的：它来自**上游节点的 output**
+  #    （`api/app.py` 的 `upstream_out = {u: nodes[u]["output"]}`）。
+  #    params 在这里的作用只有一个：**声明这张门要看什么**（给人读、给审计对账）。
+  #    真要给审批人看的值，必须让**上游节点输出**里有它 —— `ci` 的输出里就有
+  #    `image_tag` / `image_built` / `artifact` / `log_tail`。
+  #
+  # ⚠️ `timeout` **写字面量、不写 `$.` 引用**：审批元数据是从 **raw params** 读的
+  #    （`_process_approvals` / `dag.py` 建图时把 timeout 折成 int），引用不会被解析。
+  approve-deploy:
+    kind: approval
+    description: "人工门：审核构建产物（镜像 tag + 构建日志），通过后才交付"
+    name: "审批发布"
+    params:
+      image_tag: "$.nodes.ci.output.image_tag"
+      ci: "$.nodes.ci.output"
+      merge: "$.nodes.merge.output"
+    approvers: ["lead-engineer"]
+    timeout: 7200
+    # ── 驳回语义：`abort`，且**刻意没有** `approved == false` 的驳回边 ──
+    #
+    # 与 `approve-plan` 同款，与 `approve-commit` **刻意不同**。判据是「这道门之前，
+    # 不可逆的事发生了没有」：
+    #
+    #   approve-plan  之前什么都没发生   → abort，没有驳回边
+    #   approve-commit 之前只改了工作区（可丢弃）→ continue，驳回边 → recap
+    #   approve-deploy 之前 **PR 已合、主干已动** → abort，没有驳回边
+    #
+    # 为什么这里不能用 `continue` + 驳回边 → recap：那样驳回后 run 会**判 done（绿）**，
+    # 而工单永远停在"处理中"（`ticket-done` 在下游、是 SKIPPED）、也没有任何补偿。
+    # 那正是本仓反复写的「**绿着一条没交付的 run 比红着更危险**」—— 看板会把它算成闭环。
+    # 用 `abort`，驳回 = 这次发布不做，run 判 failed，图上那 4 个未跑的节点全 SKIPPED。
+    #
+    # 代价如实记：`abort` 下没有 recap，且 `abort` + 驳回边是**加载期会直接报错**的
+    # 组合（`_check_on_reject_consistency`），所以这里不能"留一条边当退路"。
+    on_reject: abort
+
   # ===== 回传原系统（工单闭环）=====
   # ⚠️ 位置决定覆盖范围：它**只在成功路径上**（ci 之后）。test / review / 审批驳回
   # 那几条边直接到 recap，不经过这里 —— 那些情况工单不会被回传。要让"修复没走完"也回传，
@@ -277,12 +320,15 @@ edges:
   - { from: approve-commit, to: commit, when: "$.nodes.approve-commit.output.approved == true" }
   - { from: approve-commit, to: recap, when: "$.nodes.approve-commit.output.approved == false" }
 
-  # 提交 → 合并 → CI → 回传 → 复盘。
-  # ⚠️ `commit` **不再**直达 `ticket-done`：那样会在 PR 只是"开出来"的时候就回传
-  #    「已解决」，而这次改动还没落到主干上（实测过的形态：8 个 PR 全开着、主干没动，
-  #    工单却一条条变成 resolved）。现在回传挂在 `merge` 之后 —— 有 `merge_commit`
-  #    才叫交付。
+  # 提交 → 合并 → CI → 发布门 → 回传 → 复盘。
+  # ⚠️ 这条链**改过两次入边，两次都是往右挪一格**，判据同一条 ——
+  #    回传的判据是"有没有可交付的物"，不是"流程跑到哪了"：
+  #      `commit`  只开 PR，改动没进主干
+  #      `merge`   进了主干，但还没有可部署的产物
+  #      `ci`      产物出来了，但**没人批准发布**
+  #      → 现在挂 `approve-deploy`：人批过才叫交付。
   - { from: commit, to: merge }
   - { from: merge, to: ci }
-  - { from: ci, to: ticket-done }
+  - { from: ci, to: approve-deploy, when: "$.nodes.ci.output.built == true" }
+  - { from: approve-deploy, to: ticket-done, when: "$.nodes.approve-deploy.output.approved == true" }
   - { from: ticket-done, to: recap }
