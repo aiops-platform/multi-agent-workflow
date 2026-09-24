@@ -1973,3 +1973,34 @@ HTTP 500  耗时 10.02s     ← 正是那个 10.0s 轮询超时
 > `{"ticket_id": "INC-20260922-0002", "status": "resolved"}` —— APM 那条记录实测已
 > `state=resolved`、`reason=agentflow:resolved:INC-20260922-0002`、evidence 多了一条
 > `ticket_status/resolved`。**§33 的票号对齐端到端生效**，三仓闭环第一次真正合上。
+
+## 34. 缺**独立 CI runner**：构建期执行不可信 Dockerfile，与持有全部密钥的 worker 同进程
+
+**背景**（2026-09-24，做发布链的 `ci` 节点时提出）：`ci` 节点要 `docker build -t <svc>:<sha> <repo>`，
+而 `docker build` 会执行**仓库里的 Dockerfile** —— 与 `.git/hooks/pre-commit` 是同一类东西
+（本仓为后者专门加了 `core.hooksPath=/dev/null`，见 §9.6）。
+
+**问题**：这一步**进不了沙箱**（沙箱容器没有 docker daemon / socket 接线；
+把 socket 交给它 = 交出宿主 root），所以它只能在宿主跑 —— 而宿主就是那个
+**一把抓着 git 凭证 / DB DSN / DeepSeek key 的 worker 进程**。
+
+**今天没炸，靠的是三个都不是平台给的东西**：
+
+| # | 事实 | 性质 |
+|---|---|---|
+| ① | 三个服务的 Dockerfile **没有 `RUN`**（只有 `FROM eclipse-temurin:21-jre` + `COPY build/libs/*.jar`） | 来自**被构建的仓库** —— 换一个带 `RUN` 的 Dockerfile 立刻失效 |
+| ② | 构建上下文只有那一个仓（不是整个 workspace，更不是宿主） | 平台的 |
+| ③ | 可以加 `--network=none` 堵外联 | 平台的（**待实施**） |
+
+**正解**：给 CI 一个**独立的、无凭证的、一次性的执行环境**（CI runner），
+让它只拿得到"读代码 + 推镜像"这两样凭证，拿不到生产凭证。
+
+> ⚠️ **别用架构边界去伪装这条债已经还了**。设计初稿曾把 `docker build` 从 `ci` 挪到 `deploy`，
+> 理由是"压到人工门之后"——**那是错的**：挪位置并不消除那个执行（它横竖跑在宿主上），
+> 而门的职责是保护**集群**（`docker build` 不碰集群）。代价是破坏
+> "构建一次、到处部署"，换不来任何实际隔离。详见
+> `RELEASE_CHAIN_PLAN_zh-CN.md` D2 的「为什么推翻初稿」。
+
+**顺带一条同一族的**：镜像现在只 `docker build` 到宿主本地的 docker/podman store，
+由 `minikube image load` 搬进集群 —— **没有 registry**。真形态应当 `docker push` 到 registry、
+集群自己 pull；那要先把 registry 与 k8s 侧凭证理清，与上面是同一件事的两半。

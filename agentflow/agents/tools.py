@@ -109,13 +109,26 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         timeout=60, needs_approval=True,
         level="L2", description="调整资源配额（范围受限）",
     ),
+    "ws_build_artifact": ToolSpec(
+        "ws_build_artifact", ["ci-builder"],
+        timeout=300, level="L2",
+        # 描述要如实：命令**由部署配置给定**（AGENTFLOW_BUILD_CMDS），调用方不能传。
+        description="在本次 run 的工作区编译打包（命令固定，不接受传参）",
+    ),
     # ---- 发布工具（实现见 release_tools.py）----
-    # 这是本仓第一个**动 git 主干**的工具：不可逆，所以合并方式固定 squash、
+    # `ws_merge_pr` 是本仓第一个**动 git 主干**的工具：不可逆，所以合并方式固定 squash、
     # 校验与幂等回落都在实现里（见 release_tools.ws_merge_pr 的 docstring）。
     "ws_merge_pr": ToolSpec(
         "ws_merge_pr", ["merger"],
         timeout=120, needs_approval=True, level="L2",
         description="把本次 run 的 PR 合并到主干（squash；已合并则复用既有结果）",
+    ),
+    # 与 `ws_build_artifact` 同属 ci 节点，但**这个进不了沙箱**（要 docker daemon/socket）
+    # —— 所以它不叫 ws_*，走的是 release_tools 那条宿主侧的线。
+    "ws_build_image": ToolSpec(
+        "ws_build_image", ["ci-builder"],
+        timeout=900, level="L2",
+        description="把工作区构建成镜像，tag = <service>:<主干合并提交前 12 位>",
     ),
 }
 
@@ -223,7 +236,7 @@ def build_local_tools(agent_name: str) -> list[dict]:
 #: **读**（ws_read_file / ws_list_files）刻意不在列：诊断链的 `code-locator` 靠它们
 #: 定位，如果读也依赖沙箱，沙箱一挂整条诊断链就跑不起来。读不改状态、不执行仓库
 #: 代码，风险低。这个取舍是有意的，别"顺手统一"。
-WORKSPACE_SANDBOXED = frozenset({"ws_write_file", "ws_run_tests"})
+WORKSPACE_SANDBOXED = frozenset({"ws_write_file", "ws_run_tests", "ws_build_artifact"})
 
 
 def build_release_tools(agent_name: str) -> list[dict]:
@@ -269,6 +282,7 @@ def build_workspace_tools(agent_name: str, *, sandbox_client=None) -> list[dict]
     from .workspace_tools import (
         WORKSPACE_TOOLS,
         _fail_closed_ws_tool,
+        ws_build_artifact_sandboxed,
         ws_run_tests_sandboxed,
         ws_write_file_sandboxed,
     )
@@ -276,6 +290,7 @@ def build_workspace_tools(agent_name: str, *, sandbox_client=None) -> list[dict]
     sandboxed = {
         "ws_write_file": ws_write_file_sandboxed,
         "ws_run_tests": ws_run_tests_sandboxed,
+        "ws_build_artifact": ws_build_artifact_sandboxed,
     }
 
     out: list[dict] = []

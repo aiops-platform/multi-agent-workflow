@@ -80,6 +80,10 @@ OK_OUTPUTS: dict[str, dict] = {
     "commit": {"pr_url": "https://github.com/acme/order-service/pull/42", "pr_number": 42, "base_sha": "abc123"},
     "merge": {"merged": True, "already_merged": False, "pr_url": "https://github.com/acme/order-service/pull/42",
               "pr_number": 42, "merge_commit": "d34db33f", "head_ref": "aiops/RUN_run_pdf"},
+    # ci 的结论字段是 `built`，语义 = **产物就绪**（jar 与镜像都成了）
+    "ci": {"built": True, "image_built": True, "image_tag": "order-service:d34db33f0000",
+           "artifact": "build/libs/order-service-0.0.1-SNAPSHOT.jar", "artifact_bytes": 35285684,
+           "merge_commit": "d34db33f"},
     "ticket-done": {"payload": {"ticket_id": "PR-0007", "status": "resolved", "description": "已修复"}, "delivered": True, "note": ""},
     "recap": {"summary": "已闭环", "root_cause": "空值未校验", "actions": ["修复并提交 PR"], "followups": []},
 }
@@ -124,7 +128,7 @@ def test_workflow_loads_with_exactly_the_expected_nodes() -> None:
     dag = load().dag
     assert set(dag.nodes) == {
         "plan", PLAN_GATE, "fix", "remediate", "test", "review",
-        COMMIT_GATE, "commit", "merge", "ticket-done", "recap",
+        COMMIT_GATE, "commit", "merge", "ci", "ticket-done", "recap",
     }
     assert dag.nodes[PLAN_GATE].is_approval
     assert dag.nodes[COMMIT_GATE].is_approval
@@ -234,18 +238,43 @@ def test_commit_gate_continues_and_routes_reject_to_recap() -> None:
     ])
 
 
+def test_ci_takes_the_merge_commit_and_builds_before_reporting() -> None:
+    """`ci` 的输入是 **merge 的产物**（主干那个 commit），且 `merge_commit` 是硬前置。
+
+    - **取自 merge**：没有 `merge_commit` 就没有可构建的"主干上的那份代码"，
+      tag 也无从谈起（`image_tag_for` 只用它算）。
+    - **必须有值**（`require`）：解析成 None 时工具会拿一个空 sha 去拼 tag、
+      去 `gh api` 查一个不存在的提交 —— 那是能报错，但错得离原因很远。
+    - **`on_failure: abort`**：构建不出产物就不该继续往下走，更不该走到 `ticket-done`
+      去报「已解决」（那时线上什么都没有）。
+    """
+    node = load().dag.nodes["ci"]
+    assert node.agent == "ci-builder"
+    assert node.params["merge_commit"] == "$.nodes.merge.output.merge_commit"
+    assert node.params["merge"] == "$.nodes.merge.output"
+    assert set(node.require) == {"service", "merge_commit"}
+    assert node.on_failure == "abort"
+    # 回传挂在 CI 之后：只有"编译打包 + 构建镜像"都成了，才算有可交付的物
+    assert [e.source for e in load().dag.nodes["ci"].in_edges] == ["merge"]
+
+
 def test_ticket_done_sits_on_the_success_path_only() -> None:
-    """工单回传挂在 `… → commit → merge → ticket-done → recap` 上：**只有真的交付了才回传**。
+    """工单回传挂在 `… → merge → ci → ticket-done → recap` 上：**只有真的交付了才回传**。
 
     位置是这条节点唯一容易写错的地方（挪到 recap 前面就变成"连驳回也回传"，
     而回传是对外承诺 —— `delivered` 由 `VERDICT_FIELDS` 判红兜一层）。
 
-    ⚠️ **入边必须是 `merge` 而不是 `commit`**（2026-09-24 改）：`commit` 只把分支推出去、
-    开一个 PR，改动**还没落到主干**。挂在 `commit` 上会在那一刻就回传「已解决」——
-    本仓 main 上现在正堆着 8 个"开着但从没合过"的 PR，就是这个形态的实证。
+    这条入边**改过两次，两次都是往左挪一格**，理由同一条 —— 回传的判据是
+    "有没有可交付的物"，而不是"流程跑到哪了"：
+
+    | 挂在 | 为什么不够 |
+    |---|---|
+    | `commit` | 只把分支推出去、开一个 PR，改动**还没落到主干**。本仓 main 上曾堆着 8 个"开着但从没合过"的 PR |
+    | `merge` | 改动到主干了，但**还没有可部署的产物**（没编译、没打镜像）—— 此时回传「已解决」，线上仍是旧的 |
+    | `ci` ✅ | 编译打包 + 构建镜像都成了，`image_tag` 在手 —— 这才叫交付 |
     """
     dag = load().dag
-    assert [e.source for e in dag.nodes["ticket-done"].in_edges] == ["merge"]
+    assert [e.source for e in dag.nodes["ticket-done"].in_edges] == ["ci"]
     assert [e.target for e in dag.edges if e.source == "ticket-done"] == ["recap"]
     assert dag.nodes["ticket-done"].on_failure == "abort"
 

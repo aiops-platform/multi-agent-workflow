@@ -1,6 +1,16 @@
-"""发布工具：把本次 run 的 PR 合并到主干。目前只有 ``merger`` 一个消费方。
+"""发布工具：**发布链上、只能在宿主执行**的动作 —— 合并 PR、构建镜像。
 
 与 ``workspace_tools`` 并列的第四类工具（不是 MCP、不是沙箱、不是 ActionExecutor）。
+
+**判据是"能不能进沙箱"**（2026-09-24 定）：
+
+| 工具 | 为什么在这儿 |
+|---|---|
+| `ws_merge_pr` | 凭证与上下文都在 worker（`gh` 的 token、`exec_context` 的 run/tenant） |
+| `ws_build_image` | **进不了沙箱** —— `docker build` 要 daemon/socket，而把 socket 交给沙箱等于交出宿主 root |
+
+对比：`ws_build_artifact`（编译打包）**能**进沙箱，所以它在 `workspace_tools.py`，
+走 `WORKSPACE_SANDBOXED` 那条线。**同一个 ci 节点的两个工具分属两个模块**，不是疏忽。
 
 **为什么它留在 worker 进程里**（三条，前两条是硬的）：
 
@@ -29,11 +39,13 @@ from typing import Any
 
 from .workspace_tools import (
     WorkspaceToolError,
+    _artifact_jar,
     _git_argv,
     _parse_github_remote,
     _require_github_origin,
     _resolve_repo,
     _run,
+    image_tag_for,
 )
 
 #: GitHub PR 链接 → (owner, repo, number)。**只认 github.com**。
@@ -189,9 +201,80 @@ async def ws_merge_pr(service: str, pr_url: str) -> dict:
     }
 
 
+#: `docker build` 的墙钟上限（秒）。实测 jar 已就绪时是十几秒级，但**首次**构建要拉
+#: `eclipse-temurin:21-jre` 基础镜像，网络慢时分钟级。给足，且**必须显式传** ——
+#: `_run` 的默认值是 120s，砍掉时的报错文案指向"停在交互式输入上"，方向完全指错。
+_DOCKER_BUILD_TIMEOUT_SEC = 900
+
+
+def _require_docker() -> None:
+    """缺 docker CLI 时给一句能操作的错。
+
+    照 §9.6 的判据：这条链**只在本地裸进程形态**下成立 —— worker 容器里没有 docker
+    CLI、也没有 socket（`deploy/` 下连 Role/RoleBinding 都没有）。缺件时的原生表现是
+    `FileNotFoundError` 冒到 runner、变成一个看不出原因的"节点失败"。
+    """
+    if shutil.which("docker") is None:
+        raise WorkspaceToolError(
+            "本机找不到 docker CLI，无法构建镜像。发布链只在**本地进程**形态可用"
+            "（worker 容器里没有 docker，见 RELEASE_CHAIN_PLAN_zh-CN.md §5）"
+        )
+
+
+async def ws_build_image(service: str, merge_commit: str) -> dict:
+    """把工作区构建成镜像：``docker build -t <service>:<merge_commit 前 12 位> <repo>``。
+
+    ## 为什么 tag 由**工具**算，不让模型传
+
+    `image_tag_for()` 是纯函数，两个 ci 工具从**同一个输入**推出**同一个字符串**
+    —— 模型因此不必在工具之间转述 tag。它拼错一个字符，`deploy` 就会去找一个
+    不存在的镜像（而那种失败发生在**部署那一步**，现场离原因很远）。
+
+    ## 为什么它不在沙箱里
+
+    `docker build` 要 docker/podman daemon 与 socket，而把 socket 交给沙箱等于把宿主
+    root 交出去。所以这一步**只能在宿主**跑 —— 与放哪个节点无关（这一点初稿判断错了，
+    见 `RELEASE_CHAIN_PLAN_zh-CN.md` D2 的「为什么推翻初稿」）。
+
+    真正的隔离靠**独立的 CI runner**，本仓还没有（`docs/TODO.md` §34）。
+    """
+    _require_docker()
+    repo = _resolve_repo(service)
+
+    # 产物必须先在（上一步 `ws_build_artifact` 的产出）。不先查的话，docker 会以
+    # "COPY failed: no source files" 报出来 —— 那句话看不出是"上一步没跑"。
+    if _artifact_jar(repo) is None:
+        raise WorkspaceToolError(
+            f"工作区里没有构建产物（{repo / 'build' / 'libs'} 下没有 .jar）—— "
+            "先跑 ws_build_artifact 编译打包，再来构建镜像"
+        )
+
+    tag = image_tag_for(service, merge_commit)
+    # 上下文就是那个仓（`.` + cwd=repo）：不是整个 workspace，更不是宿主。
+    await _run(repo, ["docker", "build", "-t", tag, "."],
+               timeout=_DOCKER_BUILD_TIMEOUT_SEC)
+
+    # 复读：只回 build 的 rc 不证明镜像真的进了本地 store（同 §3.3 的判据）。
+    inspect = await _run(repo, ["docker", "image", "inspect", tag,
+                                "--format", "{{.Id}} {{.Size}}"])
+    parts = inspect.split()
+    image_id = parts[0] if parts else ""
+    image_bytes = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    if not image_id:
+        raise WorkspaceToolError(
+            f"docker build 返回成功，但 `docker image inspect {tag}` 查不到这个镜像"
+        )
+    return {
+        "image_built": True, "image_tag": tag, "image_id": image_id,
+        "image_bytes": image_bytes, "merge_commit": merge_commit,
+        "summary": f"已构建镜像 {tag}（{image_bytes} bytes）",
+    }
+
+
 # ======================================================================
 # Tool Registry 元数据（写入 tools.TOOL_REGISTRY 由调用方完成）
 # ======================================================================
 RELEASE_TOOLS: dict[str, Any] = {
     "ws_merge_pr": ws_merge_pr,
+    "ws_build_image": ws_build_image,
 }

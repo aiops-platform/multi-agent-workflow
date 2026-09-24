@@ -396,6 +396,28 @@ MergeResultSchema = {
     "required": ["merged", "already_merged"],
 }
 
+BuildResultSchema = {
+    "type": "object",
+    "properties": {
+        #: **产物就绪** —— 不是"jar 出来了"，而是"jar 与镜像**都**出来了"。
+        #: 结论字段只能有一个（`VERDICT_FIELDS` 是 agent→单字段的映射），所以两半合成一个：
+        #: `ws_build_artifact.built` 与 `ws_build_image.image_built` 都为 true 时它才为 true。
+        "built": {"type": "boolean"},
+        #: 编译打包那一半的原样转述
+        "artifact": {"type": "string"},
+        "artifact_bytes": {"type": "integer"},
+        "rc": {"type": "integer"},
+        "log_tail": {"type": "string"},
+        #: 构建镜像那一半的原样转述。**下游唯一要用的字段**（D6 逐节点往下传）。
+        "image_built": {"type": "boolean"},
+        "image_tag": {"type": "string"},
+        "image_id": {"type": "string"},
+        "merge_commit": {"type": "string"},
+        "summary": {"type": "string"},
+    },
+    "required": ["built", "image_tag"],
+}
+
 PostmortemSchema = {
     "type": "object",
     "properties": {

@@ -76,28 +76,78 @@ commit → merge → ci → approve-deploy → deploy → verify-deploy → tick
 > ② **`approve-deploy` 这道门本身就强制了 `ci` 与 `deploy` 必须是两个节点** ——
 > 门不能长在一个节点内部。
 
-### D2. `ci` 只做沙箱编译打包；`docker build` 归到 `deploy`
+### D2. `ci` 出**镜像**（编译 + 打包 + `docker build`）；`deploy` 只搬运与滚动
 
-用户的 CI 定义是「编译、打包」= `./gradlew` 出 jar。把 `docker build` 放进 `deploy`：
+> ⚠️ **本节 2026-09-24 重写过一次。** 初稿写的是"`ci` 只出 jar，`docker build` 归 `deploy`"，
+> 理由是"把不可信代码的执行压到人工门之后"。**那个论证是错的**，见下面「为什么推翻初稿」。
+> 保留这段是因为它是个**很容易再犯的错**：拿一个安全顾虑去扭曲更重要的架构边界。
 
-1. **不可信代码的执行挪到人工门之后**。`docker build` 执行仓库里的 `Dockerfile`；
-   worker 持有 DeepSeek key / DSN / PAT（§9.6：「谁持有密钥，谁不执行不可信代码」）。
-   放 `ci` ⇒ 在任何审批之前就执行；放 `deploy` ⇒ 在 `approve-deploy` 之后。
-2. jar 与镜像在同一节点内前后脚，少一次跨节点产物交接。
+**正解（业界标准切法）：**
 
-> 今天三个 testbed 服务的 Dockerfile 恰好没有 `RUN`，所以这一步现在是安全的；
-> **换个带 `RUN` 的 Dockerfile 就失效** —— 这个保护来自被构建的仓库，不来自平台。
-> 记进 `docs/TODO.md` 作为已知接受风险。
+```
+ci              ① 沙箱里 ./gradlew clean bootJar        ← 编译（执行仓库代码 → 隔离）
+                ② 宿主 docker build -t <svc>:<sha12>    ← 产出**不可变产物**
+                ③ docker image inspect 确认镜像真的在    ← 复读（同 jar 那条判据）
+                   产出 image_tag —— 审批卡片上看得见的就是它
+
+approve-deploy  批的是"要把**这个镜像**滚上去"
+
+deploy          minikube image load → kubectl set image → 等就绪 → 回读 pod 的镜像
+                （**不构建任何东西**：只搬运 + 滚动）
+
+verify-deploy   HTTP 冒烟
+```
+
+**三条理由（按重要性）：**
+
+1. **构建一次、到处部署**（build once, deploy many）—— 这是 CI/CD 能成立的前提。
+   镜像一旦构建出来就是不可变产物，被提升到各环境时一字不改。
+   让 `deploy` 构建，同一个 commit 在不同环境会**各构建一次**，那就回到了
+   "staging 好、prod 崩"的经典坑。**这一条单独就足以定案。**
+2. **`deploy` 不该有编译器**。它的环境应该极简：拉镜像、滚动、等就绪 ——
+   不需要 JDK、不需要 gradle、不需要 Dockerfile。
+3. **`ci` 的产出物在容器化世界里就是镜像**，不是 jar。jar 只是中间物。
+
+#### 为什么推翻初稿（初稿错在哪）
+
+**① "挪到 deploy"并没有消除那个执行，只是挪了个位置。**
+`docker build` 不管放哪个节点都**跑在宿主上** —— 沙箱里没有 docker daemon，
+把 socket 交给沙箱等于把宿主 root 交出去。所以"放 deploy 更安全"是个幻觉。
+
+**② 门的职责是保护集群，不是保护宿主。**
+`approve-deploy` 压的是"**要不要动线上**"。而 `docker build` **不碰集群** ——
+它只在宿主上产出一个镜像。真正碰集群的是 `minikube image load` / `kubectl set image`，
+那些**本来就在门后**。用门去挡一件门本来就不负责的事，代价是破坏 build-once-deploy-many，
+**换不来任何实际隔离**。
+
+#### 那"执行不可信 Dockerfile"这件事怎么办 —— 老实说
+
+**这是本仓拓扑的限制，不是 CI/CD 边界能解决的**（已记 `docs/TODO.md`）：
+
+- 正解是给 CI 一个**独立的、无凭证的、一次性的执行环境**（CI runner）。
+- 本仓没有独立 runner —— worker 一把抓（git 凭证 / DB DSN / DeepSeek key / docker socket
+  都在一个进程里）。**这是债，别用架构边界去伪装它已经还了。**
+
+今天实际兜着这条债的三个事实（**都不是平台给的保证**）：
+
+| # | 事实 | 性质 |
+|---|---|---|
+| ① | 三个服务的 Dockerfile **没有 `RUN`**（只有 `FROM` + `COPY`） | 来自**被构建的仓库**，换一个 Dockerfile 就失效 |
+| ② | 构建上下文只有那一个仓（不是整个 workspace，更不是宿主） | 平台的 |
+| ③ | 可以给 `docker build` 加 `--network=none`，堵掉构建期外联 | 平台的（待实施） |
 
 ### D3. 五个节点各配一个工具，工具只做确定性的事
 
-| 工具 | 做什么 | 关键约束 |
-|---|---|---|
-| `ws_merge_pr(service, pr_url)` | 用 **commit 给出的 PR** 去合主干 | 见 **D3.1**（唯一不可逆的一步，单列一节） |
-| `ws_build_artifact(service)` | 沙箱跑 `AGENTFLOW_BUILD_CMDS[service]`，产出 jar | 命令**只来自部署配置**，不接受调用方传参（照 `test_cmd_for`）；未配置即 raise；产物要按 §6.3 复读 |
-| `ws_build_image(service, commit_sha)` | 宿主 `docker build -t <svc>:<sha12> <repo>`，前置校验"树 == 主干上的树"（见 D7） | tag 用**主干合并提交**的 sha12 |
-| `ws_rollout(service, image_tag)` | 校验产物存在 → `minikube image load` → `kubectl -n <ns> set image` → `wait --for=condition=available` → **回读 pod 的 `.spec.containers[0].image`** | ns / deployment / container 由部署配置解析（D6）；回读是这道工具里的「**声称改了 ≠ 真改了**」（§3.3）—— 只回 `set image` 的 rc 不证明滚动到了新镜像 |
-| `ws_smoke_probe(service, image_tag)` | 按配置的探针路径起临时 `kubectl port-forward pod/<pod>`，然后 HTTP GET（in-cluster 时用 `<svc>.<ns>.svc` 直连） | 路径与期望码由配置定死；**只认正在跑 `image_tag` 的那个 pod**，否则冒烟打的是旧 pod、`200` 什么都没证明；`port-forward` 子进程必须在 `finally` 里 kill |
+| 归属节点 | 工具 | 做什么 | 关键约束 |
+|---|---|---|---|
+| `merge` | `ws_merge_pr(service, pr_url)` | 用 **commit 给出的 PR** 去合主干 | 见 **D3.1**（唯一不可逆的一步，单列一节） |
+| `ci` | `ws_build_artifact(service, merge_commit)` | 比树 → 沙箱跑 `AGENTFLOW_BUILD_CMDS[service]` 出 jar → worker 侧复读 | 命令**只来自部署配置**，不接受调用方传参（照 `test_cmd_for`）；未配置即 raise |
+| `ci` | `ws_build_image(service, merge_commit)` | 宿主 `docker build -t <svc>:<sha12> <repo>` → `docker image inspect` 复读 | tag 用**主干合并提交**的 sha12（D4）；`--network=none`（待实施） |
+| `deploy` | `ws_rollout(service, image_tag)` | `minikube image load` → `kubectl -n <ns> set image` → `wait --for=condition=available` → **回读 pod 的 `.spec.containers[0].image`** | **不构建任何东西**（D2）；ns / deployment / container 由部署配置解析（D6）；回读是这道工具里的「**声称改了 ≠ 真改了**」（§3.3）—— 只回 `set image` 的 rc 不证明滚动到了新镜像 |
+| `verify-deploy` | `ws_smoke_probe(service, image_tag)` | 按配置的探针路径起临时 `kubectl port-forward pod/<pod>`，然后 HTTP GET（in-cluster 时用 `<svc>.<ns>.svc` 直连） | 路径与期望码由配置定死；**只认正在跑 `image_tag` 的那个 pod**，否则冒烟打的是旧 pod、`200` 什么都没证明；`port-forward` 子进程必须在 `finally` 里 kill |
+
+> **"比树"从 `ws_build_image` 挪到了 `ws_build_artifact`**（D7 那步）：构建与打包都发生在 `ci`，
+> 在最靠近"读代码"的那一步验一次，后面不必重复。
 
 ### D3.1 `merge` 节点：拿 commit 的 PR 去合，但**每一步都核**
 

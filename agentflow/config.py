@@ -184,6 +184,13 @@ class Settings(BaseSettings):
     # 定死"，这个问题就不存在了。
     # 未配置该服务的命令 → **报错**（fail-closed，不猜一个默认值代跑）。
     test_cmds: str = ""
+    # 每服务的**编译打包命令**（JSON `{"service": "命令"}`），供 CI 节点用。
+    #
+    # 与 `test_cmds` 是**两条独立的命令**，不是同一条：测试跑 `./gradlew test`，
+    # 打包跑 `./gradlew clean bootJar`（`bootJar` 不依赖 `test`，所以不会把测试再跑一遍）。
+    #
+    # 同样的 fail-closed 判据：未配置 → **报错**，不给默认命令。
+    build_cmds: str = ""
 
     # ---- 工作区（§8.7.2）----
     # Run 级代码工作区根目录；布局 {root}/{tenant}/{run}/repos/{service}。

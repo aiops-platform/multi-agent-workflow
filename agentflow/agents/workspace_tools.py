@@ -34,6 +34,12 @@ _READ_MAX_BYTES = 200_000
 _GIT_OUTPUT_LIMIT = 40_000
 # 测试输出上限（保留尾部：gradle 结论在末尾）
 _TEST_OUTPUT_LIMIT = 8_000
+# 打包输出上限（保留尾部：同上，`BUILD SUCCESSFUL/FAILED` 也在末尾）
+_BUILD_OUTPUT_LIMIT = 8_000
+# 打包超时。**与沙箱硬顶 `SBX_MAX_EXEC_SECONDS`(300) 取齐** —— 沙箱侧取
+# `min(timeout, MAX_EXECUTION_SECONDS)`，声明得比它大是自欺。实测一次
+# `clean bootJar` 是 8.5 秒（2026-09-24，干净副本 + `--network none`），余量 35×。
+_BUILD_TIMEOUT_SEC = 300
 # 测试超时：**与 ToolSpec 注册值和 SBX_MAX_EXEC_SECONDS 三者对齐到 300**。
 # 此前函数默认 120 < ToolSpec 300 —— 小的那个**静默覆盖**大的，
 # 看 ToolSpec 的人会以为有 300 秒。真实 Java 构建跑几分钟很常见，
@@ -332,6 +338,187 @@ def _test_result(cmd: str, rc: int, timed_out: bool, text: str, *, where: str = 
     }
 
 
+def build_cmd_for(service: str) -> str:
+    """该服务的**编译打包**命令（**只能来自部署配置**，见 ``AGENTFLOW_BUILD_CMDS``）。
+
+    与 ``test_cmd_for`` 同一套判据、同一条理由（"可执行命令的集合在部署时定死"），
+    只是两条不同的命令：测试跑 ``./gradlew test``，打包跑 ``./gradlew clean bootJar``。
+
+    未配置 → **报错**（fail-closed）。**不要**给默认值：一个"跑得起来"的默认命令会让
+    配置漏了也照跑，正是本仓反复踩的那类静默缺陷。
+    """
+    from ..config import get_settings
+
+    raw = (get_settings().build_cmds or "").strip()
+    if not raw:
+        raise WorkspaceToolError(
+            f"未配置编译打包命令：service={service!r} 无 AGENTFLOW_BUILD_CMDS 条目"
+            "（该配置决定每个服务怎么打包，不再接受调用方传参）"
+        )
+    try:
+        table = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise WorkspaceToolError(f"AGENTFLOW_BUILD_CMDS 不是合法 JSON: {exc}") from exc
+    cmd = (table or {}).get(service)
+    if not cmd:
+        raise WorkspaceToolError(
+            f"service={service!r} 未在 AGENTFLOW_BUILD_CMDS 中配置打包命令"
+            f"（已配置的服务：{sorted((table or {}))}）"
+        )
+    return cmd
+
+
+def image_tag_for(service: str, merge_commit: str) -> str:
+    """``<service>:<主干合并提交的前 12 位>`` —— 本仓镜像 tag 的**唯一算法**。
+
+    ⚠️ **用主干的 merge_commit，不用工作区 HEAD**：squash 之后分支头在主干上是孤儿
+    （实测 `run_e12a47ed4d`：工作区 HEAD `137a75df…`、主干 `211eae4e…`，两个 SHA 不同、
+    树相同）。拿工作区的 sha 当 tag，等于给镜像挂一个**主干上查无此人**的名字。
+
+    放在这里而不是 `release_tools`：`ws_build_artifact`（本模块）与 `ws_build_image`
+    （`release_tools`）都要用它，而 `release_tools` 依赖本模块 —— 反过来放会成环。
+    两个工具**从同一个输入推出同一个字符串**，于是模型不必在工具之间转述 tag
+    （它拼错一个字符，下游就会去找一个不存在的镜像）。
+    """
+    sha = (merge_commit or "").strip()
+    if not sha:
+        raise WorkspaceToolError("merge_commit 为空 —— 没合并成功就没有可构建的产物")
+    return f"{service}:{sha[:12]}"
+
+
+async def _assert_tree_matches_trunk(repo: Path, merge_commit: str) -> str:
+    """证明「**要构建的 == 主干上的**」，返回工作区那棵树的 sha。
+
+    **只能比树，不能比 SHA**：squash 合并会在主干上新建一个提交，工作区的 HEAD
+    因此在主干上是个孤儿 —— 实测 `run_e12a47ed4d` 两个 SHA 不同（`137a75df…` vs
+    `211eae4e…`）、而 tree 逐字相同（`123c2d68…`）。
+
+    只走 `gh api` 取主干那边的对象：`_GIT_ALLOWED` 没有 `fetch`（§8 版本冻结），
+    本地拿不到主干的新提交 —— 这正是 `ws_open_pr` 已有的形态。
+    """
+    origin = await _require_github_origin(repo)
+    pair = _parse_github_remote(origin)
+    if pair is None:  # `_require_github_origin` 已保证，这里只为类型收窄
+        raise WorkspaceToolError(f"工作区 origin 不是 GitHub 远端: {origin}")
+    owner, name = pair
+
+    head_tree = (await _run(repo, _git_argv(["rev-parse", "HEAD^{tree}"]))).strip()
+    trunk_tree = (await _run(repo, [
+        "gh", "api", f"repos/{owner}/{name}/commits/{merge_commit}",
+        "--jq", ".commit.tree.sha",
+    ])).strip()
+    if not trunk_tree or head_tree != trunk_tree:
+        raise WorkspaceToolError(
+            f"要构建的与主干上的**不是同一份代码**，拒绝："
+            f"工作区树 {head_tree[:12]}、主干提交 {merge_commit[:12]} 的树 "
+            f"{trunk_tree[:12] or '（取不到）'}"
+        )
+    return head_tree
+
+
+def _artifact_jar(repo: Path) -> Path | None:
+    """工作区里的构建产物（``build/libs/*.jar``，取最大的那个）。
+
+    取最大的是为了兜住 gradle 的两种 jar：`bootJar` 出可执行 fat jar，
+    而 `jar` 任务会另出一个 `*-plain.jar`（很小的那个）。`clean bootJar` 只跑前者，
+    但配置换成人写的命令时未必 —— 挑大的那个不会挑错。
+    """
+    libs = repo / "build" / "libs"
+    jars = [p for p in libs.glob("*.jar") if p.is_file()] if libs.is_dir() else []
+    return max(jars, key=lambda p: p.stat().st_size) if jars else None
+
+
+def _require_artifact(repo: Path) -> Path:
+    """复读：产物必须**在 worker 侧**真的存在。
+
+    与 `_verify_visible_to_worker` 同一条判据、同一个疤（§9.6）：沙箱写完文件后
+    "报成功"曾经只看 HTTP 回来了没有 —— 而两侧挂的不是同一个卷时，沙箱把文件写进了
+    **容器自己的文件系统**，宿主侧什么都没变，调用方却收到一句「成功」。
+    构建产物是整条链里最不该静默丢的东西，所以这里**看不见就报错，绝不报成功**。
+    """
+    jar = _artifact_jar(repo)
+    if jar is None:
+        raise WorkspaceToolError(
+            f"构建声称成功，但 worker 侧看不到产物（{repo / 'build' / 'libs'} 下没有 .jar）。"
+            "两侧挂的不是同一个工作区卷，或者打包命令没真的产出 jar。"
+        )
+    return jar
+
+
+def _build_result(cmd: str, rc: int, timed_out: bool, text: str,
+                  repo: Path, *, where: str = "") -> dict:
+    """两个实现（本地 / 沙箱）共用同一套结果组装——**别让它们漂移**。
+
+    输出保留**尾部**：gradle 的结论（BUILD SUCCESSFUL / FAILED）在末尾，
+    留头部等于把最该看的那行截掉（同 `_test_result` 的规约与理由）。
+    """
+    if len(text) > _BUILD_OUTPUT_LIMIT:
+        omitted = len(text) - _BUILD_OUTPUT_LIMIT
+        text = f"... [前 {omitted} 字符已省略] ...\n" + text[-_BUILD_OUTPUT_LIMIT:]
+    ok = rc == 0 and not timed_out
+    # 只有真成功了才要求产物存在：失败路径下没有产物是正常的，不该报成"产物丢了"。
+    jar = _require_artifact(repo) if ok else None
+    return {
+        "built": ok,
+        "artifact": str(jar.relative_to(repo)) if jar else "",
+        "artifact_bytes": jar.stat().st_size if jar else 0,
+        "rc": rc, "timed_out": timed_out, "log_tail": text,
+        "summary": f"`{cmd}` → rc={rc}{where}"
+                   + ("（超时）" if timed_out else "")
+                   + (f"，产物 {jar.name}（{jar.stat().st_size} bytes）" if jar else ""),
+    }
+
+
+async def ws_build_artifact(service: str, merge_commit: str) -> dict:
+    """在**本次 run 的工作区**里编译打包，产出可部署的 jar。
+
+    ⚠️ **无 command 参数**——命令来自部署配置（``build_cmd_for``），不接受 LLM 传参。
+
+    三步，缺一不可：
+    1. **比树**（``_assert_tree_matches_trunk``）：证明要构建的 == 主干上的；
+    2. **构建**：跑配置里那条命令；
+    3. **复读**（``_require_artifact``）：产物必须在 worker 侧真的看得见。
+
+    本函数是**本地实现**。生产形态经 ``ws_build_artifact_sandboxed`` 走沙箱 sidecar
+    （``build_workspace_tools`` 注入 ``sandbox_client`` 时自动切换）—— 编译执行的是仓库里的
+    ``build.gradle``（脚本），而 worker 持有全部密钥（§9.6）。
+    """
+    repo = _resolve_repo(service)
+    await _assert_tree_matches_trunk(repo, merge_commit)
+    cmd = build_cmd_for(service)
+    proc = await asyncio.create_subprocess_shell(
+        cmd, cwd=str(repo),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_BUILD_TIMEOUT_SEC)
+        rc, timed_out = proc.returncode, False
+    except TimeoutError:
+        proc.kill()
+        out, rc, timed_out = b"(timeout)", -1, True
+    return _build_result(cmd, rc, timed_out, out.decode("utf-8", "replace"),
+                         repo, where="本地")
+
+
+async def ws_build_artifact_sandboxed(sandbox, service: str, merge_commit: str) -> dict:
+    """经沙箱编译打包（执行的是仓库代码，必须在无密钥容器里）。"""
+    repo = _resolve_repo(service)
+    await _assert_tree_matches_trunk(repo, merge_commit)
+    cmd = build_cmd_for(service)
+    try:
+        res = await sandbox.run_shell(cmd, cwd=str(repo), timeout=_BUILD_TIMEOUT_SEC)
+    except Exception as exc:  # noqa: BLE001
+        # 同 ws_run_tests_sandboxed：`str(exc)` 可能是空的，只写 `{exc}` 等于把原因吞掉。
+        raise WorkspaceToolError(
+            "沙箱执行打包失败（沙箱不可达时**不会**回退到 worker 本地执行）"
+            f"（{type(exc).__name__}: {exc!r}）"
+        ) from exc
+    return _build_result(
+        cmd, res.rc, res.timed_out, (res.stdout or "") + (res.stderr or ""),
+        repo, where="沙箱",
+    )
+
+
 def _truncate(text: str, limit: int) -> tuple[str, bool]:
     """超长输出保留**头部**并显式标注截断。
 
@@ -592,7 +779,8 @@ async def ws_open_pr(service: str, title: str, body: str = "") -> dict:
             "summary": f"已开 PR {pr_url}"}
 
 
-async def _run(repo: Path, argv: list[str], *, check: bool = True) -> str:
+async def _run(repo: Path, argv: list[str], *, check: bool = True,
+               timeout: float | None = None) -> str:
     """在仓库里跑一条命令并返回 **stdout**。
 
     **不经 shell**（``create_subprocess_exec`` 逐个参数传）：模型给的标题/正文里
@@ -610,19 +798,25 @@ async def _run(repo: Path, argv: list[str], *, check: bool = True) -> str:
     `credential.helper` 为空）、gh 会**问"选哪个仓库"** —— 而 stdin 一旦继承又没有超时，
     就是又一条"节点永久 running"（`ws_git` 那次是一个 `vi` 挂了 14 分钟，见 §23.5）。
     这条路径第一次真跑 `git push` over https 的时候最容易撞上。
+
+    ``timeout``：默认 `_SUBPROC_TIMEOUT_SEC`(120) —— 对 git/gh 够用（它们是秒级）。
+    分钟级的命令（`docker build`）必须**显式传**，否则会被 120 秒砍掉，
+    而报错文案指向"停在交互式输入上"，**方向完全指错**（本仓为"小的那个静默覆盖大的"
+    付过代价，见 `_TEST_TIMEOUT_SEC` 的注释）。
     """
+    limit = _SUBPROC_TIMEOUT_SEC if timeout is None else timeout
     proc = await asyncio.create_subprocess_exec(
         *argv, cwd=str(repo), env=_subprocess_env(),
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=_SUBPROC_TIMEOUT_SEC)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=limit)
     except TimeoutError:
         proc.kill()
         await proc.wait()
         raise WorkspaceToolError(
-            f"{' '.join(argv[:2])} 超时（>{_SUBPROC_TIMEOUT_SEC}s）已中止 —— "
+            f"{' '.join(argv[:2])} 超时（>{limit}s）已中止 —— "
             "多半停在交互式输入上（凭证提示 / gh 的选择提示）"
         ) from None
     text = out.decode("utf-8", "replace")
@@ -649,6 +843,7 @@ WORKSPACE_TOOLS: dict[str, Any] = {
     "ws_list_files": ws_list_files,
     "ws_write_file": ws_write_file,
     "ws_run_tests": ws_run_tests,
+    "ws_build_artifact": ws_build_artifact,
     "ws_git": ws_git,
     "ws_open_pr": ws_open_pr,
 }

@@ -1,4 +1,4 @@
-"""17 个职能智能体的 system prompt 模板（design §7 + design-v5.7 §7.2）。
+"""18 个职能智能体的 system prompt 模板（design §7 + design-v5.7 §7.2）。
 
 诊断侧（triage / log-analyst / root-cause）直接复用 S-011 实测通过的模板
 （真实 DeepSeek 双场景 11/11 通过，§7 说明：要求"只输出严格 JSON"，断言用子串包含）。
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from .schemas import (
     BugReportSchema,
+    BuildResultSchema,
     CandidateServicesSchema,
     CodeLocationSchema,
     CommitSchema,
@@ -464,6 +465,26 @@ SYSTEM_PROMPTS: dict[str, str] = {
         '{"merged": true, "already_merged": false, "pr_url": "...", "pr_number": 0, '
         '"merge_commit": "...", "head_ref": "...", "summary": "..."}'
     ),
+    "ci-builder": (
+        "你是「CI」Agent（ci-builder）。任务：把已经合并到主干的代码**编译打包并构建成镜像**，"
+        "产出可部署的物。\n"
+        "两个工具，**顺序固定**：\n"
+        "1. `ws_build_artifact(service, merge_commit)` —— 编译打包（命令由部署配置给定，你不用传）\n"
+        "2. `ws_build_image(service, merge_commit)` —— 构建镜像，返回 image_tag\n"
+        "两个入参都**原样取自入参** `service` 与 `merge_commit`（后者来自 merge 节点），"
+        "不要自己拼、不要自己改。**tag 不用你算** —— 两个工具会用同一个输入算出同一个，"
+        "你只负责把它的返回原样转述。\n"
+        "规则：\n"
+        "- 上一个工具**报错就停**，如实把它的原因写进 `summary` 让节点失败 —— "
+        "**不要因为「上一步成功了」就报下一步也成功**。\n"
+        "- **`built` 的含义是「产物就绪」= jar 与镜像都成了**：只有"
+        "`ws_build_artifact` 和 `ws_build_image` **都成功**时，它才是 `true`；"
+        "任一失败就是 `false`。下游与工单闭环都看这一个字段。\n"
+        "- `image_tag` / `artifact` / `image_id` 等字段一律**原样抄工具的返回**。\n"
+        f"- {_JSON_RULE}\n"
+        '{"built": true, "image_built": true, "image_tag": "svc:<sha12>", '
+        '"artifact": "build/libs/x.jar", "merge_commit": "...", "summary": "..."}'
+    ),
     "postmortem": (
         "你是「复盘」Agent（postmortem）。任务：产出复盘报告。\n"
         "规则：\n"
@@ -494,6 +515,7 @@ AGENT_SCHEMAS: dict[str, dict] = {
     "reviewer": ReviewSchema,
     "committer": CommitSchema,
     "merger": MergeResultSchema,
+    "ci-builder": BuildResultSchema,
     "postmortem": PostmortemSchema,
 }
 
@@ -536,6 +558,11 @@ REMEDIATION_PLANNING_PROMPT = (
     "   把「定位待改代码」列为首个实现步骤，不硬凑路径。\n"
     "4. 出稿前先核实：凡能从绑定工具/代码/仓库状态查实的（调用方、分支/制品、字段可空性、是否已有校验），必须先查实再写，\n"
     "   禁止把「自己本该查清的事」丢给审批人——这类项不得出现在 assumptions / open_questions。\n"
+    "   ⚠️ **核实的预算**：总工具调用 **≤ 12 次**；**同一个位置不要反复查**（同一文件/同一行换关键词重查超过 2 次，\n"
+    "   就是该停的信号）。核实是为了**支撑这份计划的判断**（改哪、怎么改、能不能回退），不是为了把代码库读一遍。\n"
+    "   实测教训（2026-09-24）：同一张单子跑两次，一条用 15 次调用、7 轮出稿；另一条用 21 次调用，\n"
+    "   把 ReAct 轮次烧光，**计划一个字都没写出来**（节点失败、整条 run 中止）。\n"
+    "   超出预算仍未查清的：**降低断言强度**（写进 open_questions，或明确标成 assumption），**不要继续查**。\n"
     "5. **默认只给一个方案**：不要为凑备选而制造决策点，decisions 默认是空数组。\n"
     "   仅当根因依赖**未决前提**（典型：未定的业务规则，如某字段是否必填、边界条件）时，\n"
     "   才禁止静默选边：用 decisions[] 并列**互斥**备选（含 pros/cons/effort/risk/rollback）+ recommended + accept_criteria。\n"

@@ -106,6 +106,11 @@ SIDE_EFFECT_AGENTS = frozenset({"committer", "infra-remediator", "ticket-done", 
 VERDICT_FIELDS = {
     "tester": "passed", "reviewer": "approved", "ticket-done": "delivered",
     "merger": "merged",
+    # #: `ci-builder` 的 `built` 语义是**产物就绪**（jar 与镜像都成了），不是"jar 出来了"。
+    # #: `VERDICT_FIELDS` 是 `agent → 单字段`，一个 agent 放不下两个结论字段 ——
+    # #: 与其让工具"抛错代替返回 false"（那会被 `on_failure: continue` 吞成负证据），
+    # #: 不如把两半合成一个字段，提示词里写死"两者都成功才为 true"。
+    "ci-builder": "built",
 }
 
 #: 「声称改了」≠「真改了」：这几个 agent 的输出里有一个**产物字段**（声称改了哪些文件），

@@ -28,7 +28,17 @@ log = logging.getLogger("agentflow.runner")
 # 逐 agent 迭代上限（默认 10）。修复侧需要「列目录 → 读文件 → 写文件 → 取 diff →
 # 校验」多轮工具调用，10 轮会在写完前耗尽（实测 fix-implementer 超限返回 {}）；
 # tester 要跑 gradle 并读结果，同样放宽。trace-analyst 见 CLAUDE.md §10。
-_MAX_ITERS = {"trace-analyst": 12, "fix-implementer": 20, "tester": 16}
+_MAX_ITERS = {
+    "trace-analyst": 12, "fix-implementer": 20, "tester": 16,
+    # `remediation-planning-analyst` 是**逐字对着失败样本配的**（2026-09-24）：
+    # 同一张单子、同一个 agent、同一份提示词，两条 run 一条 7 轮收工、一条 10 轮撞顶
+    # （`run_f1d5bd7068` 15 次工具调用 ✅ / `run_f1bb9b8dd7` 21 次 ❌，报
+    # `Executed maximum iterations of reasoning-acting loop`）。
+    # 差别不在任务难度，在**它自己选择核实多少** —— 而提示词当时对核实没有上限。
+    # 配到 20 是给它 2× 余量（与 fix-implementer 同档）；同时给提示词加了核实预算，
+    # 两道防线：提示词管行为、这里管兜底。
+    "remediation-planning-analyst": 20,
+}
 _DEFAULT_MAX_ITERS = 10
 
 # DeepSeek 计费（美元 / 百万 token）。deepseek-v4-flash 未公开单独费率，

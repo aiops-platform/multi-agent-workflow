@@ -65,6 +65,8 @@ WORKSPACE_AGENTS = frozenset(
     {
         "code-locator",  # 诊断侧：只读（ws_read_file / ws_list_files）
         "fix-implementer", "tester", "reviewer", "committer",  # 修复侧（§8.7.2）
+        # `ci-builder` 要工作区：编译打包在 `{run}/repos/<service>` 里跑，还要比树。
+        "ci-builder",
         # `merger` 也在这条链上：它按工作区定位 origin / 分支 / HEAD（release_tools）。
         # ⚠️ 漏了它**不会立刻坏** —— 图里只要还有别的成员，准备工作区那段早退就不触发，
         # 于是这也**不会红**（`test_problem_diagnose_fix_workflow.py` 的守护照样绿）。

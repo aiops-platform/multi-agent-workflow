@@ -1103,6 +1103,324 @@ async def test_github_origin_guard_rejects_non_github_hosts(tmp_path, monkeypatc
         _reset(toks)
 
 
+# ----------------------------------------------------------------------
+# ci 节点：ws_build_artifact（沙箱编译打包）+ ws_build_image（宿主构建镜像）
+# ----------------------------------------------------------------------
+# 判据与 `ws_run_tests` 那一族同源，但多两层：**比树**（要构建的 == 主干上的）与
+# **复读**（产物在 worker 侧真的看得见）。两条都不是洁癖，见各自的 docstring。
+_BUILD_CMDS = '{"order-service": "./gradlew clean bootJar --no-daemon -q"}'
+_TRUNK_SHA = "211eae4e251878d52498a6eb0072dc7d3d74e474"
+
+
+def _stub_gh_tree(monkeypatch, tree: str):
+    """桩掉 `gh api .../commits/<sha> --jq .commit.tree.sha`；其余走真的。
+
+    只桩这一条查询是有意的：`git rev-parse HEAD^{tree}` 走**真实仓库**，
+    于是"树相不相等"由仓库自己作证，而不是由桩点头（同 `_stub_gh` 的原则）。
+    """
+    import asyncio as _a
+
+    calls: list[list[str]] = []
+    real = _a.create_subprocess_exec
+
+    async def fake(*argv, **kw):
+        a = list(argv)
+        if a and a[0] == "gh":
+            calls.append(a)
+            return _FakeProc(tree + "\n")
+        return await real(*argv, **kw)
+
+    monkeypatch.setattr(_a, "create_subprocess_exec", fake)
+    return calls
+
+
+class _BuildOKSandbox(_FakeSandbox):
+    """构建成功的沙箱：**真的在 cwd 下落一个 jar**（两侧同一个卷）。
+
+    照 `_FakeSandbox` 的规矩：替身不能比真身"弱"。只回 rc=0 而不落产物，
+    模拟的是"沙箱写到了别处"——那是**故障**形态，该由 `_BuildNowhere` 表达。
+    """
+
+    async def run_shell(self, cmd: str, *, cwd=None, timeout: int = 300):
+        from types import SimpleNamespace
+
+        self.runs.append((cmd, cwd))
+        libs = Path(cwd) / "build" / "libs"
+        libs.mkdir(parents=True, exist_ok=True)
+        (libs / "order-service-0.0.1-SNAPSHOT.jar").write_bytes(b"jar" * 100)
+        return SimpleNamespace(rc=0, stdout="BUILD SUCCESSFUL", stderr="", timed_out=False)
+
+
+class _BuildNowhere(_FakeSandbox):
+    """沙箱回 rc=0、**但工作区里没有产物** —— 两侧不是同一个卷（§9.6 那个疤）。"""
+
+    async def run_shell(self, cmd: str, *, cwd=None, timeout: int = 300):
+        from types import SimpleNamespace
+
+        self.runs.append((cmd, cwd))
+        return SimpleNamespace(rc=0, stdout="BUILD SUCCESSFUL", stderr="", timed_out=False)
+
+
+def test_build_cmd_unconfigured_is_fail_closed(monkeypatch) -> None:
+    """未配置打包命令 → **报错**，不给默认值代跑（同 `test_cmd_for` 的判据）。"""
+    from agentflow.agents.workspace_tools import WorkspaceToolError, build_cmd_for
+    from agentflow.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "build_cmds", "")
+    with pytest.raises(WorkspaceToolError, match="AGENTFLOW_BUILD_CMDS"):
+        build_cmd_for("order-service")
+
+
+def test_build_cmd_missing_service_lists_configured(monkeypatch) -> None:
+    """服务不在配置里 → 报错里**列出已配置的服务**（别让人去猜拼写）。"""
+    from agentflow.agents.workspace_tools import WorkspaceToolError, build_cmd_for
+    from agentflow.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "build_cmds", _BUILD_CMDS)
+    with pytest.raises(WorkspaceToolError, match="order-service"):
+        build_cmd_for("warranty-service")
+
+
+def test_image_tag_uses_the_trunk_commit_not_the_workspace_head(tmp_path, monkeypatch) -> None:
+    """tag = `<service>:<主干 merge_commit 前 12 位>` —— **不是**工作区 HEAD 的 sha。
+
+    这条是 D4 的判据：squash 之后分支头在主干上是孤儿（实测 `run_e12a47ed4d`：
+    工作区 HEAD `137a75df…`、主干 `211eae4e…`）。拿工作区的 sha 当 tag，
+    等于给镜像挂一个**主干上查无此人**的名字。
+    """
+    from agentflow.agents.workspace_tools import WorkspaceToolError, image_tag_for
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    try:
+        head = git("rev-parse", "HEAD", cwd=repo)
+        tag = image_tag_for(service, _TRUNK_SHA)
+        assert tag == f"order-service:{_TRUNK_SHA[:12]}"
+        assert head[:12] != _TRUNK_SHA[:12], "本用例的前提：两个 sha 本来就不一样"
+        assert head[:12] not in tag, "tag 里绝不能出现工作区 HEAD 的 sha"
+        with pytest.raises(WorkspaceToolError, match="merge_commit 为空"):
+            image_tag_for(service, "")
+    finally:
+        _reset(toks)
+
+
+async def test_ws_build_artifact_builds_through_the_sandbox(tmp_path, monkeypatch) -> None:
+    """正常路径：比树通过 → 沙箱里跑配置里那条命令 → 产物在 worker 侧复读得到。"""
+    from agentflow.agents.workspace_tools import ws_build_artifact_sandboxed
+    from agentflow.config import get_settings
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)
+    tree = git("rev-parse", "HEAD^{tree}", cwd=repo)
+    _stub_gh_tree(monkeypatch, tree)
+    monkeypatch.setattr(get_settings(), "build_cmds", _BUILD_CMDS)
+    sandbox = _BuildOKSandbox()
+    try:
+        out = await ws_build_artifact_sandboxed(sandbox, service, _TRUNK_SHA)
+    finally:
+        _reset(toks)
+
+    assert out["built"] is True
+    assert out["artifact"] == "build/libs/order-service-0.0.1-SNAPSHOT.jar"
+    assert out["artifact_bytes"] > 0
+    assert len(sandbox.runs) == 1
+    cmd, cwd = sandbox.runs[0]
+    assert cmd == "./gradlew clean bootJar --no-daemon -q"   # 命令来自配置，不是调用方
+    assert Path(cwd) == repo                                  # 就跑在那个仓里
+
+
+async def test_ws_build_artifact_refuses_when_the_tree_differs(tmp_path, monkeypatch) -> None:
+    """树不匹配 → 在**比树那一步**就拒，沙箱一次都不调。
+
+    挡的是"构建了别的东西"：工作区被人动过、或 merge_commit 不是这棵树对应的提交。
+    先拦能省下一次 8.5 秒的构建，更重要的是**不产生一个来源不明的产物**。
+    """
+    from agentflow.agents.workspace_tools import WorkspaceToolError, ws_build_artifact_sandboxed
+    from agentflow.config import get_settings
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)
+    _stub_gh_tree(monkeypatch, "0" * 40)          # 主干上的树 ≠ 工作区的树
+    monkeypatch.setattr(get_settings(), "build_cmds", _BUILD_CMDS)
+    sandbox = _BuildOKSandbox()
+    try:
+        with pytest.raises(WorkspaceToolError, match="不是同一份代码"):
+            await ws_build_artifact_sandboxed(sandbox, service, _TRUNK_SHA)
+    finally:
+        _reset(toks)
+    assert sandbox.runs == [], "树都不匹配就不该去构建"
+
+
+async def test_ws_build_artifact_is_invisible_to_worker_is_an_error(
+    tmp_path, monkeypatch
+) -> None:
+    """沙箱回 rc=0，但 worker 侧**看不到产物** → 报错，绝不报成功。
+
+    §9.6 那个疤的同一条判据：两侧挂的不是同一个卷时，沙箱会把东西写进容器自己的
+    文件系统、回一句成功，而宿主侧什么都没变。构建产物是整条链里最不该静默丢的东西。
+    """
+    from agentflow.agents.workspace_tools import WorkspaceToolError, ws_build_artifact_sandboxed
+    from agentflow.config import get_settings
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)
+    _stub_gh_tree(monkeypatch, git("rev-parse", "HEAD^{tree}", cwd=repo))
+    monkeypatch.setattr(get_settings(), "build_cmds", _BUILD_CMDS)
+    try:
+        with pytest.raises(WorkspaceToolError, match="看不到产物"):
+            await ws_build_artifact_sandboxed(_BuildNowhere(), service, _TRUNK_SHA)
+    finally:
+        _reset(toks)
+
+
+async def test_ws_build_artifact_failure_keeps_the_log_tail(tmp_path, monkeypatch) -> None:
+    """构建失败：`built=False`，且 `log_tail` 保**尾部**（gradle 的结论在末尾）。"""
+    from types import SimpleNamespace
+
+    from agentflow.agents.workspace_tools import ws_build_artifact_sandboxed
+    from agentflow.config import get_settings
+
+    class _Failing(_FakeSandbox):
+        async def run_shell(self, cmd, *, cwd=None, timeout=300):
+            self.runs.append((cmd, cwd))
+            return SimpleNamespace(rc=1, stdout="x" * 20000 + "\nFAILURE: Build failed",
+                                   stderr="", timed_out=False)
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)
+    _stub_gh_tree(monkeypatch, git("rev-parse", "HEAD^{tree}", cwd=repo))
+    monkeypatch.setattr(get_settings(), "build_cmds", _BUILD_CMDS)
+    try:
+        out = await ws_build_artifact_sandboxed(_Failing(), service, _TRUNK_SHA)
+    finally:
+        _reset(toks)
+
+    assert out["built"] is False
+    assert out["rc"] == 1
+    assert out["log_tail"].endswith("FAILURE: Build failed"), "截断必须留尾部"
+    assert "已省略" in out["log_tail"], "截断处要显式标注，模型才知道看到的是残缺内容"
+
+
+def test_ws_build_artifact_is_fail_closed_without_sandbox() -> None:
+    """未接线沙箱 → **调用即报错**，绝不回退本地执行（编译跑的是仓库代码）。"""
+    import asyncio
+
+    from agentflow.agents.tools import build_workspace_tools
+    from agentflow.agents.workspace_tools import WorkspaceToolError
+
+    tools = {t["name"]: t["func"] for t in build_workspace_tools("ci-builder")}
+    assert "ws_build_artifact" in tools, "模型看不到它，失败会变成静默的"
+    with pytest.raises(WorkspaceToolError, match="需要沙箱"):
+        asyncio.run(tools["ws_build_artifact"](service="s", merge_commit="abc"))
+
+
+def _stub_docker(monkeypatch, *, inspect_out: str = "sha256:deadbeef 35285684"):
+    """桩 `docker build` / `docker image inspect`，记录 argv；其余走真的。"""
+    import asyncio as _a
+
+    calls: list[list[str]] = []
+    real = _a.create_subprocess_exec
+
+    async def fake(*argv, **kw):
+        a = list(argv)
+        if a and a[0] == "docker":
+            calls.append(a)
+            if a[1:2] == ["image"]:
+                return _FakeProc(inspect_out + "\n")
+            return _FakeProc("")
+        return await real(*argv, **kw)
+
+    monkeypatch.setattr(_a, "create_subprocess_exec", fake)
+    return calls
+
+
+async def test_ws_build_image_uses_the_trunk_tag_and_verifies_it(
+    tmp_path, monkeypatch
+) -> None:
+    """正常路径：上下文就是那个仓、tag 由 merge_commit 推出，且**回读镜像真的在**。"""
+    from agentflow.agents import release_tools
+    from agentflow.agents.release_tools import ws_build_image
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    # 产物先就位（上一步 ws_build_artifact 的产出）
+    libs = repo / "build" / "libs"
+    libs.mkdir(parents=True, exist_ok=True)
+    (libs / "order-service-0.0.1-SNAPSHOT.jar").write_bytes(b"jar" * 100)
+    monkeypatch.setattr(release_tools.shutil, "which", lambda _n: "/usr/bin/docker")
+    calls = _stub_docker(monkeypatch)
+    try:
+        out = await ws_build_image(service, _TRUNK_SHA)
+    finally:
+        _reset(toks)
+
+    assert out["image_built"] is True
+    assert out["image_tag"] == f"order-service:{_TRUNK_SHA[:12]}"
+    assert out["image_id"] == "sha256:deadbeef"
+    assert out["image_bytes"] == 35285684
+    builds = [c for c in calls if c[1:2] == ["build"]]
+    assert len(builds) == 1
+    assert builds[0][-1] == ".", "构建上下文是当前仓（cwd 已经是那个仓）"
+    assert out["image_tag"] in builds[0], "tag 必须出现在 docker build 的 argv 里"
+    # 回读：只回 build 的 rc 不证明镜像真的进了本地 store
+    assert any(c[1:3] == ["image", "inspect"] for c in calls)
+
+
+async def test_ws_build_image_refuses_without_an_artifact(tmp_path, monkeypatch) -> None:
+    """产物不在 → 拒，**docker 一次都不调**。
+
+    不先查的话，`docker build` 会以 `COPY failed: no source files` 报出来 ——
+    那句话看不出是"上一步没跑"。
+    """
+    from agentflow.agents import release_tools
+    from agentflow.agents.release_tools import ws_build_image
+    from agentflow.agents.workspace_tools import WorkspaceToolError
+
+    service, _repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    monkeypatch.setattr(release_tools.shutil, "which", lambda _n: "/usr/bin/docker")
+    calls = _stub_docker(monkeypatch)
+    try:
+        with pytest.raises(WorkspaceToolError, match="先跑 ws_build_artifact"):
+            await ws_build_image(service, _TRUNK_SHA)
+    finally:
+        _reset(toks)
+    assert calls == []
+
+
+async def test_ws_build_image_is_loud_when_the_image_is_missing(
+    tmp_path, monkeypatch
+) -> None:
+    """`docker build` 说成功、但 `docker image inspect` 查不到 → 报错。"""
+    from agentflow.agents import release_tools
+    from agentflow.agents.release_tools import ws_build_image
+    from agentflow.agents.workspace_tools import WorkspaceToolError
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    libs = repo / "build" / "libs"
+    libs.mkdir(parents=True, exist_ok=True)
+    (libs / "order-service-0.0.1-SNAPSHOT.jar").write_bytes(b"jar" * 100)
+    monkeypatch.setattr(release_tools.shutil, "which", lambda _n: "/usr/bin/docker")
+    _stub_docker(monkeypatch, inspect_out="")
+    try:
+        with pytest.raises(WorkspaceToolError, match="查不到这个镜像"):
+            await ws_build_image(service, _TRUNK_SHA)
+    finally:
+        _reset(toks)
+
+
+async def test_ws_build_image_is_loud_without_docker(tmp_path, monkeypatch) -> None:
+    """本机没有 docker → 报一句能操作的错（发布链只在本地进程形态可用）。"""
+    from agentflow.agents import release_tools
+    from agentflow.agents.release_tools import ws_build_image
+    from agentflow.agents.workspace_tools import WorkspaceToolError
+
+    service, _repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    monkeypatch.setattr(release_tools.shutil, "which", lambda _n: None)
+    try:
+        with pytest.raises(WorkspaceToolError, match="docker"):
+            await ws_build_image(service, _TRUNK_SHA)
+    finally:
+        _reset(toks)
+
+
 def test_parse_github_remote_accepts_both_url_styles() -> None:
     """https 与 `git@host:` 两种写法都要认；非 GitHub 一律 None。"""
     from agentflow.agents.workspace_tools import _parse_github_remote

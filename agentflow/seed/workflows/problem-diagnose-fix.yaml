@@ -1,4 +1,4 @@
-# ===== Problem Center 修复工作流：诊断结论 → 计划 → 修复+止血 → 测试 → 审查 → 提交 → 合并 → 工单回传 =====
+# ===== Problem Center 修复工作流：诊断结论 → 计划 → 修复+止血 → 测试 → 审查 → 提交 → 合并 → CI → 工单回传 =====
 #
 # 由 bug-fix-scenario2 **简化**而来：诊断段
 # （triage / scope / logs / trace / metrics / infra / locate / know / rca + halt）**整段去掉**，
@@ -19,7 +19,7 @@
 # 而本图**一个取数节点都没有**——没有工具会读它，声明了只是摆设。
 name: problem-diagnose-fix
 version: "1.0.0"
-description: "Problem Center 修复闭环：诊断结论（rca）→ 修复计划 → 计划门 → 代码修复 + K8s 止血 → 测试/审查 → 提交门 → PR → 合并主干 → 工单回传"
+description: "Problem Center 修复闭环：诊断结论（rca）→ 修复计划 → 计划门 → 代码修复 + K8s 止血 → 测试/审查 → 提交门 → PR → 合并主干 → 编译打包+构建镜像 → 工单回传"
 
 inputs:
   bug_report:
@@ -191,8 +191,31 @@ nodes:
       service: "$.inputs.bug_report.cmdb_ci.name"
     on_failure: abort
 
+  # ===== CI：编译打包 → 构建镜像（本图第一次产出"可部署的物"）=====
+  # ① 编译打包在**沙箱**里跑：执行的是仓库的 `build.gradle`（脚本），而 worker 持有
+  #    全部密钥（§9.6：谁持有密钥，谁不执行不可信代码）。
+  # ② 构建镜像在**宿主**跑：`docker build` 要 docker daemon/socket，而把 socket 交给
+  #    沙箱等于交出宿主 root —— 它**进不了沙箱**，与放哪个节点无关。
+  #    真正的隔离要**独立的 CI runner**，本仓还没有；这是债，见 docs/TODO.md §34。
+  #
+  # 构建前先**比树**（工作区 HEAD^{tree} vs 主干那个提交的 tree）：证明"要构建的
+  # == 主干上的"。squash 之后两个 SHA 不同（实测 run_e12a47ed4d：137a75df… vs 211eae4e…），
+  # 只比 SHA 会误判 —— 这条判据在 `ws_build_artifact` 里，不让模型自己判断。
+  #
+  # **产物在门之前就定型了**：`approve-deploy` 批的是"要把这个镜像滚上去"，
+  # `deploy` 只搬运与滚动、不构建任何东西（build once, deploy many）。
+  ci:
+    agent: ci-builder
+    description: "CI：编译打包 + 构建镜像，产出与主干一致的可部署产物"
+    require: [service, merge_commit]
+    params:
+      merge: "$.nodes.merge.output"
+      merge_commit: "$.nodes.merge.output.merge_commit"
+      service: "$.inputs.bug_report.cmdb_ci.name"
+    on_failure: abort
+
   # ===== 回传原系统（工单闭环）=====
-  # ⚠️ 位置决定覆盖范围：它**只在成功路径上**（merge 之后）。test / review / 审批驳回
+  # ⚠️ 位置决定覆盖范围：它**只在成功路径上**（ci 之后）。test / review / 审批驳回
   # 那几条边直接到 recap，不经过这里 —— 那些情况工单不会被回传。要让"修复没走完"也回传，
   # 得把它挪到 recap 之前的分叉点，或另加并行边（与 scenario1/2 同款、同取舍）。
   #
@@ -211,6 +234,9 @@ nodes:
       # merge 的整个输出：合并过就有 merge_commit（主干上那个提交）。
       # 它同时是"这次交付**已经落到主干**"的唯一凭据 —— commit 的 pr_url 只证明开了 PR。
       merge: "$.nodes.merge.output"
+      # ci 的整个输出：有 image_tag ⇒ 产物可部署了。没有它，下游只知道"合了"，
+      # 不知道"能不能发"。
+      ci: "$.nodes.ci.output"
     on_failure: abort
 
   recap:
@@ -226,6 +252,9 @@ nodes:
       # 同理：有 `merge_commit` ⇒ 已经落到主干；`null` ⇒ 没走到合并（被审批驳回，
       # 或合并本身失败）。复盘要能说出"这次改动到底进没进主干"。
       merge: "$.nodes.merge.output"
+      # 有 `image_tag` ⇒ 产物构建出来了；`null` ⇒ 没走到 CI。复盘要能说出
+      # "这次改动到底能不能发"。
+      ci: "$.nodes.ci.output"
 
 edges:
   # 计划门：plan **不直达** fix —— 中间必须有人工决策点（见 approve-plan 上的说明）。
@@ -248,11 +277,12 @@ edges:
   - { from: approve-commit, to: commit, when: "$.nodes.approve-commit.output.approved == true" }
   - { from: approve-commit, to: recap, when: "$.nodes.approve-commit.output.approved == false" }
 
-  # 提交 → 合并 → 回传 → 复盘。
+  # 提交 → 合并 → CI → 回传 → 复盘。
   # ⚠️ `commit` **不再**直达 `ticket-done`：那样会在 PR 只是"开出来"的时候就回传
   #    「已解决」，而这次改动还没落到主干上（实测过的形态：8 个 PR 全开着、主干没动，
   #    工单却一条条变成 resolved）。现在回传挂在 `merge` 之后 —— 有 `merge_commit`
   #    才叫交付。
   - { from: commit, to: merge }
-  - { from: merge, to: ticket-done }
+  - { from: merge, to: ci }
+  - { from: ci, to: ticket-done }
   - { from: ticket-done, to: recap }
