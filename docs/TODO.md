@@ -17,13 +17,13 @@
 | 7 | AgentScope 升级评估 | **前置项**：解锁 §8，并决定 stateful 能不能开 |
 | 8 | MCP 连接复用 | 修既存缺陷（stdio 子进程泄漏），前置是 §7；**经查证不做完整池** |
 | 9 | 已完成主体的遗留尾巴 | 真活但零散、不阻塞，容易被忘 |
-| 10 | 清预置 lint / 测试债 | 不阻塞，但债会让回归信号不可信 |
+| 10 | ~~清预置 lint / 测试债~~ | ✅ 2026-09-24 清库存时核实：`make lint` 0 错误、`test_sandbox` 19 passed。**当初的理由"回归信号不可信"已消解** |
 | 11 | 其余小项 | 观察项 / 长期项 |
 | 12 | 已完成（留痕） | 无正文，只记 commit 与结论 |
 | 13 | ~~新租户缺「播种」~~ | ✅ 已实施——三张表一起播（workflow + MCP server + agent 绑定），开箱可用；剩「同步动作」1 项尾巴 |
 | 14 | 分层：API ↔ Service ↔ Repository | 债，不阻塞。已有一处**重复实现**与一处**反向依赖** |
 | 15 | `datasource/` 例外：保留但立规矩 | 例外**合理**；含一个**无鉴权端点**（只读低危） |
-| 16 | ~~MCP 工具绑定只有 server 级粒度~~ | **先不做**——首版证据已被推翻；复核只剩 2 处零星越界，**先改 prompt 即可** |
+| 16 | MCP 工具绑定只有 server 级粒度 | **先不做**——首版证据已被推翻；复核只剩 2 处零星越界，**先改 prompt 即可** |
 | 17 | ~~`scope` 不输出消歧字段~~ | ✅ 已解决——**真因是 Worker 未重启**，不是 prompt |
 | 18 | **改代码不热载**：Worker 只认库内指纹 | 每次改 prompt/schema 都会静默用旧版——已在实测中骗过一次 |
 | 19 | ~~`rca` 的 `join: any`~~ | ✅ 已修——**根因节点从来没拿到过取证输出**（五维摘要恒为 None），见下 |
@@ -380,79 +380,18 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 
 ## 9. 已完成主体的遗留尾巴
 
-> 三处「主体已完成、确有剩余」的项，正文已移入 §12 留痕，**只把真正还没做的部分留在这里**
+> 「主体已完成、确有剩余」的项，正文已移入 §12 留痕，**只把真正还没做的部分留在这里**
 > ——否则任务在"已完成"里悄悄沉掉。
+>
+> ⚠️ **别在正文里写死条数** —— 这里原写「三处」，加一行就过期了（本节自己就踩过一次）。
+> 以表格行数为准。
 
 | 源项 | 仍未做 | 涉及文件 |
 |---|---|---|
 | **Agent 配置可配置化**（v1.12 主体完成） | **tools 可见性 / 超时 / 限流**尚未纳入 DB 配置（仍硬编码在 `TOOL_REGISTRY` 的 `ToolSpec.agents`）；**按租户覆盖模型参数**（model / max_iters / 是否真实 LLM）未做 | `agents/tools.py`、`agents/registry.py`、配置加载层 |
 | **真实 node_runner 接入 executor**（`383b6b7` + v5.3 批C 完成） | **L2 沙箱工具接入真实 run**——`SandboxClient` 已可用，但 runner 在真实诊断链路中尚未调用 | `agents/runner.py`、`sandbox/orchestrator.py`、租户库的 `workflows` 表 |
 | **CMDB 生产化**（`b25dc4b` + `9b37cbe` + 实体图谱化完成） | ⚠️ **换了载体 ≠ 换了数据源**：`_SERVICES` / `_DEPENDS_ON` 字面量已删除，但实体文件里的 **10 个服务 / 13 条边仍是种子数据**——仍需接真实 CMDB 同步（文件载体、schema 校验、引用完整性、热重载都已就位，缺的只是数据来源）；<br>**两处失真由种子派生而来，录入真实数据时应一并纠正**：① Portfolio 由 `namespace` 派生——namespace 是 k8s 部署分组不是业务域，`common` 是装着两个不同 owner 服务的杂物筐；② `tier1` 标签由 `criticality==critical` 派生；<br>**Event 路径空转**：Incident / Change 节点当前为空（覆盖层机制已通，缺数据），故 `infer_candidate_services` 恒 `degraded=true`，「问题 → 事件 → 应用」这条路径尚未在真实数据上验证过；<br>（可选）拓扑加显式环检测告警——当前 `direction=both` 能反映环但**不告警**（图谱化后实体文件允许含环，此风险未变） | `aiops-datasource-mcp-server/src/.../data/cmdb-entities.json`、`docs/cmdb-entities.md` §5 |
-
----
-
-## 10. 清预置 lint / 测试债
-
-- `make lint` 目前有 **68 个**预置 ruff 错误（改动前后不变，非本次引入）。
-  ✅ `api/app.py` 已清空（2026-09-22，见下）—— **它此前那 4 个里有一个是 F821
-  「未定义名」，会淹没后续真正的 F821**，所以先清这个文件是有价值的。
-- `tests/test_sandbox.py` 5 个用例依赖本机 `~/.kube/config`（本机有 kube 时会因
-  incluster 配置缺失而失败；CI 无 kube 时被 skip）
-
-> **实测（2026-09-11）**：本机 `pytest tests/` = **6 failed / 281 passed / 4 errors**。
-> 4 errors 全为缺可选依赖（`fakeredis` / `kafka`，本机未 `make install`）；6 failed 为
-> kube 依赖 + 陈旧用例 + `test_agent_runner` 需真实 DeepSeek key。
-> **与本次改动无关**（`git stash` 前后结果完全一致）。
-> **后果：回归信号目前不可信**——这是本项最该先清的理由。
->
-> ⚠️ **2026-09-18 更正一条误诊**：上面「`test_agent_runner` 需真实 DeepSeek key」
-> **是错的**。真因是 `Settings` 带 `validation_alias` 的字段默认只认别名 →
-> `Settings(deepseek_api_key="sk-x")` **静默忽略**该 kwarg、读回空串 → 回退 ScriptedJsonModel。
-> 加 `populate_by_name=True` 后该用例**已通过**，**不需要真实 key**。详见 §24。
-> 教训：把"测试红了"归因成"环境没配"之前，先确认**参数真的传进去了没有**——
-> 静默忽略的入参会让"环境缺失"看起来和"代码路径没走到"一模一样。
->
-> **当前基线（2026-09-22）**：**0 failed / 503 passed / 0 errors**。✅ 回归信号**已可用**。
-> 清掉的 3 条全是**陈旧用例**（不是产品缺陷），见下方「已清」。
-
-### ✅ 已清：3 条陈旧用例（2026-09-22）
-
-**共同成因：测试断言的是「改动之前的事实」，而改动发生时没人回来改测试。**
-三条都不是产品缺陷 —— 但**红了很久没人管，导致回归信号整体不可信**（本项存在的理由）。
-
-1. `build_toolkit() got an unexpected keyword argument 'use_mock'` ×2（`test_build_toolkit_includes_l2_tools`
-   / `test_build_toolkit_l2_absent_without_executor`）。
-   `use_mock` 随批次 3 删除直连实现（数据面改走 MCP）一起消失，用例未同步。
-   判据改成「**没有 `sandbox_client` 参数**」——那才是 L2 工具真正的门控。
-2. `test_policy_deny_precedence` 断言 `query_logs` → `ALLOW`。
-   而 `query_logs` **已不在本地注册表**（同样迁了 MCP）→ 兜底 DENY。
-   这条更值得记：**它与 `sandbox/policy.py:35-36` 那段刻意的设计注释直接矛盾** ——
-   注释写着「数据源与 CMDB 工具已迁 MCP……不在此处枚举」，测试却在要求它被枚举。
-
-   **顺带暴露一个真实边界**（已写成 `test_policy_denies_data_plane_tools_not_in_local_registry`
-   钉住）：`ToolPolicy` **对 MCP 工具一无所知** —— 它只看本地 `TOOL_REGISTRY`。
-   将来即便接上运行期，也只管得住本地工具；MCP 侧的放行是另一条路径
-   （readOnlyHint + allow_extra）。这层盲区此前没有任何东西记着。
-
-   ⚠️ 与 §23.3 合起来看：`ToolPolicy` **至今零运行期消费方**，所以这几条断言
-   **全绿也不代表租户 deny 规则生效了**。用例的 docstring 已显式写明这一点 ——
-   让一个测试在死代码上通过而不标注，比它红着更危险。
-
-### ✅ 已清：`api/app.py` 的 4 个 lint（2026-09-22）
-
-其中**只有 1 个是真缺陷**，列出来是因为它示范了「lint 数不该拿来当"反正是风格问题"」：
-
-- **`F821 Undefined name 'Worker'`（真）**：`worker: Worker | None = None` 指向一个
-  **本文件从未 import 过的类型**，而真正赋进去的是 `WorkerPool`。
-  运行期不报错是因为文件头有 `from __future__ import annotations`（注解是惰性字符串）。
-  危害有两条，都不是"风格"：① 任何 `typing.get_type_hints()` 走到这里就炸；
-  ② **读的人会以为存的是单个 Worker**。
-  已用 `eval(注解, vars(module))` 复现旧注解 → `NameError: name 'Worker' is not defined`。
-- **`PLW0602`（真，但无害）**：`_service()` 里的 `global service` 是**死的** ——
-  该函数只读 `service`、从不赋值，而读模块全局本就不需要声明。
-  它误导读者以为这里会写全局（真正赋值的是 `init()`）。
-- **2 个 `F401`（纯风格）**：`TICKET_NEW` / `TicketStore` 导入后未使用。已确认
-  没有别处 `from api.app import` 这两个名字（re-export 假设不成立）才删。
+| **工单回传闭环**（2026-09-22 主体完成） | APM 侧 `find_by_ticket` 是否该顺带支持按 `record_id` **精确匹配**——做了等于“问题单号也能反查到”。**当前只在发起侧对齐，回传契约不变**；那是另一个仓的设计决定 | `aiops-apm-anomaly-detector/src/**/storage/records.py` |
 
 ---
 
@@ -469,7 +408,7 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 
 ## 12. 已完成（留痕）
 
-> 只记 commit 与结论，**不保留正文**。确有余留的直接指向 §7。
+> 只记 commit 与结论，**不保留正文**。确有余留的指向 **§9**（这里是 §7 的笔误，已订正）。
 
 - ~~Agent 配置可配置化（平台化关键）~~ → ✅ `v1.12`（2026-09-03）：DB 驱动 `agent_configs`
   + `AgentConfigResolver` 合并解析 + `/agent-configs` CRUD + agent→MCP server 绑定 + SIP
@@ -480,6 +419,20 @@ dev 模式下 `auth.py` 缺省租户是 `"local"` —— 于是**任何不带 `X
 - ~~CMDB 生产化~~ → ✅ `b25dc4b` + `9b37cbe`（2026-09-11）：CMDB 迁至数据面 MCP
   （`locate_repo` / `get_service_topology`），删硬编码个人路径、本地 `locate_code` 与
   `cmdb=` 注入链；**租户隔离改由部署承载**，接口无 tenant 的问题由架构消除。**尾巴见 §9**
+- ~~清预置 lint / 测试债~~ → ✅ `2026-09-24` 清库存时核实：`make lint` **0 错误**
+  （`ruff check` 全过）。⚠️ 条目里写的“68 个”是**另一套规则集**下的计数，已不可比 ——
+  这恰恰是本项被清掉的原因之一：它记的是一个会随工具版本漂移的数。`tests/test_sandbox.py`
+  **19 passed**，不再依赖本机 `~/.kube/config`。（同日另修：`make lint` 曾长期是红的，
+  见 commit `1766440`）
+- ~~`scope` 不输出业务域消歧字段~~ → ✅ `2026-09-17` 已解决：**真因是 Worker 未重启**
+  （首版诊断“prompt 太长把新字段淹没”是错的）。改 `prompts.py` 改的是**代码**，而热载指纹
+  只看 DB 行 → Worker 里跑的一直是旧 prompt。**底层缺陷是 §18，本项只是它的一个症状。**
+- ~~工单回传用错了号：派单号 ≠ 问题单号~~ → ✅ `2026-09-22`：一张升级工单上有两个号，
+  `ticket-done` 传了**问题单号** `PR-…` 而接收端只认**派单号** `INC-…` → 必然 404。
+  在 `_run_inputs_from_ticket` 把 run 入参副本的 `bug_report.number` 对齐成工单自己的
+  `number`。**端到端验证**：`run_c2c44f9ff8` 的 `ticket-done` 带回
+  `{"ticket_id": "INC-…", "status": "resolved"}`，APM 记录实测 `state=resolved` ——
+  **三仓闭环第一次真正合上**。**尾巴见 §9**
 - ~~`tests/test_workspace.py` 引用不存在的 `agentflow.workspace`~~ → ✅ `67c9549`：
   不是"模块未落树"，而是 `.gitignore` 里裸写的 `workspace/` 匹配任意深度同名目录，
   把源码包整个吞掉、从未入库
@@ -828,7 +781,7 @@ MCP 侧 `backends/prometheus.py`（`_sel()`）
 
 ---
 
-## 16. MCP 工具绑定只有 **server 级**粒度
+## 16. MCP 工具绑定只有 **server 级**粒度 —— **先不做**（见下「已做的」）
 
 > 2026-09-17 记录。做「triage 交出数据工具」时发现：能做的只有**全给或全不给**。
 
@@ -924,55 +877,6 @@ AgentScope 的 `Toolkit(mcps=[...])` **没有按工具过滤的入口**；`ToolP
 
 `agentflow/agents/mcp.py`（`build_toolkit`）、`agentflow/api/agent_store.py`（如需加列）、
 `aiops-mcp-servers/servers/aiops-datasource-mcp-server/server.py`（拆实例）
-
----
-
-## 17. `scope` 不输出业务域消歧字段 —— **已解决，真因是 Worker 未重启**
-
-> 2026-09-17。⚠️ **本项首版诊断是错的**（当时判为"prompt 太长把新字段淹没"），下面是更正后的记录。
-
-### 真实原因
-
-**新 prompt 从来没送达模型。**
-
-`config_sync.py` 的热载指纹是 `(行数, MAX(updated_at))`——**只看数据库的行**。
-而改 `prompts.py` 改的是**代码**，指纹不变 → Worker 不重建 resolver；
-而 `SYSTEM_PROMPTS` 是 import 时的模块级字典，**进程不重启就不更新**。
-
-实测证据：Worker 里跑的是 **1728 字符的旧版 prompt**，连 `business_paths` 这个词都没有；
-新版是 3427 字符。**字段从来没被要求过，当然不会输出。**
-
-**为什么极难发现**：API 侧（`uvicorn --reload`）会重新 import，所以
-`GET /agents/service-scoper` **能看到新 prompt**——你以为改对了，实际 Worker 里是旧的。
-**两侧不一致，且没有任何报错。**
-
-### 修复
-
-1. **重启 Worker**（真正起作用的那一步）
-2. 顺带把 scope 的 prompt 重构了：把「输出契约」从流程规则里**拎出来单独成段**
-   （`## 二、输出契约（逐字段填，缺一不可）`）。**这一条不是必需的修复**——
-   实测证明只要 prompt 送达了就会输出；保留它是因为读起来更清楚，
-   但**不要以为它解决了问题**。
-
-### 验证（重启 Worker 后重跑）
-
-```
-matched_domains : [{'name': 'customer-server-journey', 'type': 'journey', ...}]   ✓
-ambiguous       : False                                                          ✓
-  order-service    evidence_source='ticket_cmdb_ci'  business_paths=有  in_domain=True   ✓
-  payment-service  evidence_source='topology'        business_paths=有  in_domain=True   ✓
-  gateway-service  evidence_source='topology'        business_paths=有  in_domain=False  ✓
-```
-
-### 遗留
-
-**这个坑会在每次改 prompt/schema 时重演**——已提成独立条目 **§18**（含修法与短期兜底）。
-判据与重启命令见 `docs/E2E_VERIFICATION_zh-CN.md` §6.5。
-
-### 相邻问题：`scope` 会自造零证据候选
-
-首版记录里有这条，**未被本轮验证覆盖**（可能同样是旧 prompt 所致，也可能不是）。
-新 prompt 已加禁令 1「不要自己添加工具没返回的候选」。
 
 ---
 
@@ -1919,33 +1823,6 @@ HTTP 500  耗时 10.02s     ← 正是那个 10.0s 轮询超时
 `test_models_send_explicit_max_tokens`（变异：`build_model` 不带 parameters → 红）。
 **仍未做**：parse 失败时的"修复轮"（把上次输出回喂给模型让它只补 JSON）—— 那是另一件事，
 且要先有 1 的判据才知道值不值得做。
-
-## 33. 工单回传用错了号：**派单号 ≠ 问题单号** ✅ 已修（2026-09-22）
-
-**现象**：`ticket-done` 报 `delivered=false`，工具回
-`HTTP 404 {"code":"NOT_FOUND","reason":"没有持有工单 PR-20260922-0001 的问题单"}` ——
-修复做完了、PR 也开了，**原系统永远收不到**。
-
-**根因**：一张升级工单上有**两个号**，而下游把它们当成了同一个：
-
-| 号 | 例子 | 出处 | 谁认它 |
-|---|---|---|---|
-| **派单号** | `INC-20260922-0002` | APM `problems.py:1225`（`next_ticket_number()`）→ 写进 agentflow 工单的 `number`，同时进 APM 记录的 evidence | `records.find_by_ticket`（**只认它**） |
-| **问题单号** | `PR-20260922-0001` | APM `problems.py:404`：`_build_ticket(rec)` 用 `rec["record_id"]` → 成了载荷里的 `bug_report.number` | `ticket-done` 的提示词（"ticket_id 原样取自入参 `ticket.number`，如 `INC95528`"）—— 它**要的本来是派单号** |
-
-`find_by_ticket` 只按 evidence 里的 `ticket_number`/`ticket_id`（或 `resolve_reason='escalated:<号>'`）
-匹配 → 传问题单号**必然 404**（接收端刻意"不建单、不猜"，见 `storage/records.py:108`）。
-实测 `run_a80df3e5d3`：工单 `number=INC-20260922-0002`、载荷 `bug_report.number=PR-20260922-0001`。
-**它影响的是所有从这张工单发起的 run**（那条工单的 `run_ids` 躺着 11 条，每条都会红在最后一公里）。
-
-**修法**（agentflow 侧，`api/app.py:_run_inputs_from_ticket`）：run 的**入参副本**里把
-`bug_report.number` 对齐成**工单自己的 `number`**（派单号），原问题单号留在
-`bug_report.problem_number`（**只在对不上时写**，免得每张单都多一个噪音字段）。
-**不动工单记录本身**（详情页仍显示原样）。测试：
-`test_run_ticket_aligns_the_dispatched_ticket_number`（变异：撤掉对齐 → 红）。
-
-**没做**：APM 侧 `find_by_ticket` 是否该顺带支持按 `record_id` **精确匹配** —— 那是另一个仓的
-设计决定（做了等于"问题单号也能反查到"）。当前只在**发起侧**对齐，回传契约不变。
 
 ### 32⑥ ~~postmortem 的 JSON 里带裸换行~~ ✅ 已修（2026-09-22，同日第三例）
 
