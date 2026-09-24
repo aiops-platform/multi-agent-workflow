@@ -10,10 +10,17 @@ make install   # 创建 venv + 安装依赖
 make doctor    # ⭐ 环境体检（换机器时先跑这个）；INSTALL=1 时把能装的装上
 make test      # 跑 pytest（M0/M2 语义 + 幂等 + Resume）
 make api       # 控制面 FastAPI（:8000/docs）
-make lint      # ruff 检查
+make lint      # ruff **+ §11 分层契约**（`.importlinter`，配置驱动，两条都过才算绿）
+make codegraph # 代码索引：没建就建、有就增量同步（团队约定见 `docs/tooling/`）
 make sync-workflows TENANT=<id>   # 把 seed 的 workflow 推到**已开通租户**（见 §6.0）
 make sync-agents    TENANT=<id>   # 同上，推数据面（MCP server + agent 绑定）
 ```
+
+> **查代码用 `codegraph`，别一上来就 grep**：`callers` / `callees` / `impact`
+> 直接答"谁调用谁、改前波及什么"，`explore` 给 verbatim 原文（字面常量不丢）。
+> 实测比 understand-anything 便宜两个数量级（0 token vs 824k）。
+> 它与 grep 的实测分界、以及**纯 CLI 下会静默返回过期结果**这个坑，
+> 见 [`docs/tooling/README.md`](docs/tooling/README.md)。
 
 > **换一台机器、或者别人第一次接手：先 `make doctor`。** 本系统依赖一批**机器相关**的
 > 外部件（postgres / kafka / 沙箱 / **gh CLI**），它们的共同点是**缺了不报错** ——
@@ -141,6 +148,7 @@ docs/retro/        回顾：我们做事的方式哪里在失效
 | `docs/retro/` | **人** | 里程碑结束 |
 | 提交信息 | **LLM 按需**（`git log` 查为什么）+ 人 | 溯源 |
 | `docs/lessons/*` | **LLM 按需**（团队共享的教训） | 按索引的触发条件 |
+| `docs/tooling/*` | **人**（新队友上手开发工具）+ LLM 按需 | 要用/要改某个开发工具时；`toolchain.toml` 是它机器可查的那一半 |
 
 > ⚠️ **本表本身就是一条约束**：写新文档前先回答「**谁在什么时刻会读它**」——
 > **答不出来的不要写**。本仓有过 134 个既没索引也没入口的 changelog，

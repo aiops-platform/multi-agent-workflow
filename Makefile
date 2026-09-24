@@ -1,4 +1,4 @@
-.PHONY: install test lint api doctor sandbox-image sync-workflows sync-agents retro-harvest
+.PHONY: install test lint api doctor sandbox-image sync-workflows sync-agents retro-harvest codegraph
 
 # 变量：此前几个目标各自硬编码 ./venv/bin/...，而 `doctor` 用了没定义的 $(PY)
 # —— 展开成空，于是它去执行脚本文件本身（`Permission denied`）。**这个目标从加进来
@@ -93,3 +93,32 @@ sync-agents:
 # 可直接粘贴的指令。为什么是"回收"而不是"让人记录"：见脚本头部。
 retro-harvest:
 	$(PY) scripts/retro_harvest.py --since "$(if $(SINCE),$(SINCE),2 weeks ago)" $(foreach r,$(REPOS),--repo $(r))
+
+# 代码索引（codegraph）—— **团队共用的是约定，索引本身每台机器各自建**。
+#
+#   make codegraph          # 没索引就建，有就增量同步，最后报状态
+#   make codegraph MCP=1    # 顺带把 MCP server 接进 agent（**一次性**，改本机配置）
+#
+# 为什么索引不入库：它自带的 `.codegraph/.gitignore` 注释写着
+# 「local to each machine, not for committing」—— 而且索引**必须与代码同步**，
+# 入库的索引对任何改过代码的人立刻就过期。所以入库的只有那条忽略规则。
+#
+# 为什么钉版本号：同一台机器上两个版本的索引器交替写同一个 db 是没意义的。
+# 这个版本号与 `.claude/hooks/codegraph-sync.sh` 里的一致，改要一起改。
+CG := npx -y @colbymchenry/codegraph@1.6.0
+codegraph:
+	@command -v npx >/dev/null 2>&1 || { \
+	  echo "需要 Node ≥22（npx 不在 PATH）。装好后重跑，或 `make doctor` 看版本基线。"; exit 1; }
+	@if [ -d .codegraph ]; then \
+	  echo "== 增量同步 =="; $(CG) sync . ; \
+	else \
+	  echo "== 首次建索引 =="; $(CG) init . ; \
+	fi
+	@echo
+	@$(CG) status . | tail -22
+	@if [ -n "$(MCP)" ]; then \
+	  echo; echo "== 接进 agent（改本机配置）=="; $(CG) install --yes ; \
+	fi
+	@echo
+	@echo "提示：索引靠 MCP server 常驻时自动跟（会话期间），会话之间由"
+	@echo "      .claude/hooks/codegraph-sync.sh 在下次开会话时补齐。"
