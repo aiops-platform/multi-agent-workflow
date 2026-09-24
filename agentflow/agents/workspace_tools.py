@@ -21,6 +21,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -468,6 +469,49 @@ async def ws_git(service: str, args: list[str], message: str = "") -> dict:
     }
 
 
+#: GitHub 远端 URL → (owner, repo)。三种写法都收：https / ssh:// / scp 风格 `git@host:`。
+#: **不是 GitHub 的一律不匹配** —— 本地 `file://` 路径、GitLab 之类都在此被挡下。
+_GITHUB_REMOTE_RE = re.compile(
+    r"^(?:https?://github\.com/|ssh://git@github\.com/|git@github\.com:)"
+    r"(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?$"
+)
+
+
+def _parse_github_remote(url: str) -> tuple[str, str] | None:
+    """解析 GitHub 远端 URL → ``(owner, repo)``；不是 GitHub 远端则返回 ``None``。"""
+    m = _GITHUB_REMOTE_RE.match((url or "").strip().rstrip("/"))
+    return (m.group("owner"), m.group("repo")) if m else None
+
+
+async def _require_github_origin(repo: Path) -> str:
+    """取工作区的 origin 并要求它是**指向 GitHub 的远端**，返回该 URL。
+
+    两个调用方共用（``ws_open_pr`` 要开 PR、``ws_merge_pr`` 要合并 PR），所以抽在这里：
+    各写一份必然漂移，而漂移的那一半不会有任何提示（本仓为「两份实现」付过代价，
+    见 CLAUDE.md §11 的 `_mark_cancelled`）。
+
+    为什么是硬拦而不是"推上去再说"：本地联调形态（``AGENTFLOW_REPO_ROOT`` 指向本机
+    testbed 副本）下工作区是从**本机路径**克隆的，origin 于是是 ``file:///Users/...`` ——
+    推是推得动的，但推到的是**本机那份副本**，而 ``gh`` 面对它只会往 stderr 说一句
+    「none of the git remotes ... point to a known GitHub host」。不先拦的话，症状是
+    ``json.loads: Expecting value: line 1 column 1`` —— 既看不出是远端的问题，
+    还会先在**不相干的地方**留下一个分支（实测 run_d595720e5b）。
+
+    ⚠️ 判据必须是「**解析出来是不是 github.com**」，不能只看"有没有 ``scheme://``"：
+    ``AGENTFLOW_REPO_ROOT`` 配成 GitLab 一类的 org URL 时，origin 长得完全像正常远端，
+    而 ``gh`` 一样用不了 —— 那种形态比 ``file://`` 更难看出来。
+    """
+    origin = (await _run(repo, ["git", "remote", "get-url", "origin"], check=False)).strip()
+    if not origin or _parse_github_remote(origin) is None:
+        raise WorkspaceToolError(
+            f"工作区的 origin 不是 GitHub 远端（{origin or '未配置'}）。"
+            "本地联调时 AGENTFLOW_REPO_ROOT 指向本机副本会有这个现象；"
+            "要开 PR / 合并 PR 需让工作区从真实 GitHub 远端克隆"
+            "（AGENTFLOW_REPO_ROOT 用 https://github.com/<org> 形态，配完重启 API）"
+        )
+    return origin
+
+
 async def ws_open_pr(service: str, title: str, body: str = "") -> dict:
     """把本次 run 的分支推到 origin 并**开一个 PR**，返回 ``{pr_url, pr_number}``。
 
@@ -510,21 +554,9 @@ async def ws_open_pr(service: str, title: str, body: str = "") -> dict:
     if not branch or branch == "HEAD":
         raise WorkspaceToolError("当前是游离 HEAD，无法作为 PR 的 head 分支")
 
-    # ⚠️ **先确认 origin 是指向 GitHub 的远端，再推。**
-    #
-    # 本地联调形态（`.env` 里 `AGENTFLOW_REPO_ROOT` 指向本机 testbed 副本）下，
-    # 工作区是从**本机路径**克隆的，origin 于是是 `file:///Users/...` —— 推是推得动的，
-    # 但推到的是**本机那份副本**，而 `gh` 面对它只会说一句
-    # 「none of the git remotes ... point to a known GitHub host」（写进 stderr）。
-    # 不先拦的话，症状是 `json.loads` 报 `Expecting value: line 1 column 1` ——
-    # 既看不出是远端的问题，还会先在**不相干的地方**留下一个分支（实测踩过）。
-    origin = (await _run(repo, ["git", "remote", "get-url", "origin"], check=False)).strip()
-    if not origin or origin.startswith(("/", "file://", ".")):
-        raise WorkspaceToolError(
-            f"工作区的 origin 不是 GitHub 远端（{origin or '未配置'}），无法开 PR。"
-            "本地联调时 AGENTFLOW_REPO_ROOT 指向本机副本会有这个现象；"
-            "要建 PR 需让工作区从真实远端克隆（不设该变量，走 CMDB 的 repo_url）"
-        )
+    # ⚠️ **先确认 origin 是指向 GitHub 的远端，再推。** 守卫本体在
+    # `_require_github_origin`（与 `ws_merge_pr` 共用）。
+    await _require_github_origin(repo)
 
     # 推分支。同样禁用仓库自带的 hook —— `git push` 会执行 `pre-push`，
     # 而 `.git/hooks/` 在可写的工作区里（信任边界见 ws_git 的说明）。

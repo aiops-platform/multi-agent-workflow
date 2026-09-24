@@ -379,6 +379,23 @@ CommitSchema = {
     "required": ["pr_url", "pr_number"],
 }
 
+MergeResultSchema = {
+    "type": "object",
+    "properties": {
+        "merged": {"type": "boolean"},
+        #: 已经合过了（幂等回落）—— 与 `merged` 分开，因为它意味着"这次没动手"。
+        "already_merged": {"type": "boolean"},
+        "pr_url": {"type": "string"},
+        "pr_number": {"type": "integer"},
+        #: **主干上**那个合并提交（squash 后新生成的，不是分支头）。
+        "merge_commit": {"type": "string"},
+        "merge_method": {"type": "string"},
+        "head_ref": {"type": "string"},
+        "summary": {"type": "string"},
+    },
+    "required": ["merged", "already_merged"],
+}
+
 PostmortemSchema = {
     "type": "object",
     "properties": {

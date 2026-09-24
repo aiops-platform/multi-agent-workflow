@@ -63,7 +63,12 @@ TicketCreator = Callable[[str, dict], Awaitable[dict]]
 #: 真的 POST 到原系统改工单状态，于是同 ``committer`` 一样需要幂等键 ——
 #: resume / crash 重放时 `run_id:node_id` 命中已有成功记录即复用，不重复投递。
 #: **判据：这个 agent 一旦重跑，外部世界会不会多一次可见的变化。**
-SIDE_EFFECT_AGENTS = frozenset({"committer", "infra-remediator", "ticket-done"})
+#:
+#: `merger` 是 2026-09-24 加进来的：**合并到主干是整个流程里唯一不可逆的一步**。
+#: 它比 `committer` 更需要这个键 —— 重复建 PR 只是多一个 PR，重复合并会多一个主干提交。
+#: 注意这个键只覆盖"节点被重跑"这一层；`ws_merge_pr` 内部另有一层
+#: "PR 已 MERGED 就复用既有结果"的回落，两层都在（见 `agents/release_tools.py`）。
+SIDE_EFFECT_AGENTS = frozenset({"committer", "infra-remediator", "ticket-done", "merger"})
 
 #: 「跑完了」≠「通过了」：这几个 agent 的输出里有一个**结论字段**，
 #: 显式为 ``False`` 时节点判 **FAILED**（红），而不是 DONE（绿）。
@@ -93,7 +98,15 @@ SIDE_EFFECT_AGENTS = frozenset({"committer", "infra-remediator", "ticket-done"})
 #: 绿着一条没交付的 run 比红着更危险：看板会把这条算成已闭环。
 #: （曾考虑做成 `halt` 那种"能力未就绪"标识，但那要等出站能力真接上、两种情形
 #: 真能分开时再说；在那之前一律按"没交付"如实呈现。）
-VERDICT_FIELDS = {"tester": "passed", "reviewer": "approved", "ticket-done": "delivered"}
+#: ## `merger` 为什么也在（2026-09-24 加）
+#:
+#: 与上面几条同一族、但后果更硬：`ws_merge_pr` 返回 `merged: false` 而 agent 如实照报时，
+#: 没有这条映射节点照样是 **DONE** —— 下游会继续去构建、去部署一个**根本没合进主干的东西**，
+#: 而图上全绿。（**加一个 agent 就是加一条映射**，别在别处写特判。）
+VERDICT_FIELDS = {
+    "tester": "passed", "reviewer": "approved", "ticket-done": "delivered",
+    "merger": "merged",
+}
 
 #: 「声称改了」≠「真改了」：这几个 agent 的输出里有一个**产物字段**（声称改了哪些文件），
 #: 当它**非空**、而本节点**连一次可能改动工作区的成功调用都没有**时，节点判 **FAILED**（红）。

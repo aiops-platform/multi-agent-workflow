@@ -22,6 +22,41 @@ async def test_toolkit_local_function_registered() -> None:
     assert "locate_code" not in names      # CMDB 也已迁 MCP
 
 
+async def test_every_registered_tool_is_reachable_in_the_toolkit() -> None:
+    """`TOOL_REGISTRY` 里的每条 spec，都必须**走完整条组装链**后出现在 toolkit 里。
+
+    为什么值一条（2026-09-24 补）：往注册表里加一条 spec 会**自动**获得权限 ——
+    `build_permission_context` 只看注册表（`scopes.py` 用 `tools_for_agent`），
+    于是权限层发出 ALLOW。但真正决定"模型看不看得见"的是 `build_toolkit` →
+    `_build_function_tools` 那几行**逐个 builder 的调用**。两者脱节的症状是：
+    **审计里有一条永不被使用的 ALLOW 规则，模型烧完轮次报"未输出合法 JSON"，
+    与工具根本不存在一模一样** —— 没有任何地方会说"注册了但没接上"。
+    `build_l2_tools` 尤其容易漏：它是**白名单式**的（只 append 它认得的名字），
+    其余 spec 静默落空、连个警告都没有。
+
+    ⚠️ **必须走 `build_toolkit` 而不是直接调各个 builder** —— 这条测试第一版就是直接调
+    builder 的，于是把 `mcp.py` 里那行调用摘掉之后它**照样绿**（实测：变异后 14 passed），
+    根本没在守它声称要守的那件事。判据是"**模型看得见**"，那就得从模型那一侧验。
+
+    一句话：**注册 ≠ 可见。**
+    """
+    from agentflow.agents.tools import TOOL_REGISTRY
+
+    class _Fake:
+        """只为满足"执行器已接线"的分支；组装过程不会调用它。"""
+
+    for spec in TOOL_REGISTRY.values():
+        assert spec.agents, f"{spec.name} 没有声明任何 agent"
+        toolkit = build_toolkit(
+            spec.agents[0], sandbox_client=_Fake(), action_executor=_Fake()
+        )
+        names = {s["function"]["name"] for s in await toolkit.get_tool_schemas()}
+        assert spec.name in names, (
+            f"{spec.name} 在 TOOL_REGISTRY 里，却没进 agent={spec.agents[0]} 的 toolkit —— "
+            "权限层会放行，模型却看不到它（检查 agents/mcp.py 的 _build_function_tools）"
+        )
+
+
 def test_permission_context_allow_rules_for_agent_tools() -> None:
     """§9.5：DONT_ASK + allow 规则（agent 注册工具入白名单）。"""
     from agentscope.permission import PermissionMode

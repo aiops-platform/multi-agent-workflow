@@ -1,4 +1,4 @@
-# ===== Problem Center 修复工作流：诊断结论 → 计划 → 修复+止血 → 测试 → 审查 → 提交 → 工单回传 =====
+# ===== Problem Center 修复工作流：诊断结论 → 计划 → 修复+止血 → 测试 → 审查 → 提交 → 合并 → 工单回传 =====
 #
 # 由 bug-fix-scenario2 **简化**而来：诊断段
 # （triage / scope / logs / trace / metrics / infra / locate / know / rca + halt）**整段去掉**，
@@ -19,7 +19,7 @@
 # 而本图**一个取数节点都没有**——没有工具会读它，声明了只是摆设。
 name: problem-diagnose-fix
 version: "1.0.0"
-description: "Problem Center 修复闭环：诊断结论（rca）→ 修复计划 → 计划门 → 代码修复 + K8s 止血 → 测试/审查 → 提交门 → PR → 工单回传"
+description: "Problem Center 修复闭环：诊断结论（rca）→ 修复计划 → 计划门 → 代码修复 + K8s 止血 → 测试/审查 → 提交门 → PR → 合并主干 → 工单回传"
 
 inputs:
   bug_report:
@@ -144,10 +144,13 @@ nodes:
 
   # ===== 提交门（前置审批）=====
   # 压在不可逆动作（推分支 + 开 PR）之前，人看到的是"diff + 测试证据"。
+  # ⚠️ 文案必须带上"合并"：通过之后走的是 `commit → merge`，也就是**这次点击的实际含义
+  #    是"同意提交**并合并到主干**"。写成"通过后才提交 PR"是最坏的那种错 ——
+  #    审批人以为只开一个 PR，实际动了 main，而图上一切正常、没有任何地方会提示。
   approve-commit:
     kind: approval
-    description: "人工门：审核 diff + 测试证据，通过后才提交 PR"
-    name: "审批代码提交"
+    description: "人工门：审核 diff + 测试证据，通过后提交 PR **并合并到主干**"
+    name: "审批代码提交与合并"
     params:
       diff: "$.nodes.fix.output.diff"
       test: "$.nodes.test.output"
@@ -166,8 +169,30 @@ nodes:
       test: "$.nodes.test.output"
       service: "$.inputs.bug_report.cmdb_ci.name"
 
+  # ===== 合并（本图第一个不可逆动作）=====
+  # 输入取自 commit 的输出：图上有现成的 pr_url，工具不该装作看不见去自己反查分支 ——
+  # 那是把一条显式的事实换成隐式推断。但工具会拿它去核：**用 commit 给的链接去定位，
+  # 同时要求它落在我自己的仓库 + 我自己的分支 + 我自己那个 commit 上**，三者任一不符
+  # 就停（实现与理由见 `agents/release_tools.py`）。
+  #
+  # `require: [service, pr_url]` 是标量锚点（同 remediate 的写法）：pr_url 解不出来时
+  # 直接 fail-fast，而不是把一个 None 喂给工具、让它去"猜一个要合的 PR"。
+  # 整个 commit 输出另给一份，是 agent 的上下文（PR 号 / base_sha / 摘要）。
+  #
+  # `on_failure: abort` —— 这是本图第一个**动了就回不去**的节点：合不了就不该继续
+  # 往下走，更不该走到 `ticket-done` 去报"已解决"。
+  merge:
+    agent: merger
+    description: "合并：把 commit 开出的那个 PR 合入主干（squash）"
+    require: [service, pr_url]
+    params:
+      commit: "$.nodes.commit.output"
+      pr_url: "$.nodes.commit.output.pr_url"
+      service: "$.inputs.bug_report.cmdb_ci.name"
+    on_failure: abort
+
   # ===== 回传原系统（工单闭环）=====
-  # ⚠️ 位置决定覆盖范围：它**只在成功路径上**（commit 之后）。test / review / 审批驳回
+  # ⚠️ 位置决定覆盖范围：它**只在成功路径上**（merge 之后）。test / review / 审批驳回
   # 那几条边直接到 recap，不经过这里 —— 那些情况工单不会被回传。要让"修复没走完"也回传，
   # 得把它挪到 recap 之前的分叉点，或另加并行边（与 scenario1/2 同款、同取舍）。
   #
@@ -183,6 +208,9 @@ nodes:
       fix: "$.nodes.fix.output"
       # commit 的整个输出：有 pr_url ⇒ 已提交；null ⇒ 这条路径没走到提交。
       commit: "$.nodes.commit.output"
+      # merge 的整个输出：合并过就有 merge_commit（主干上那个提交）。
+      # 它同时是"这次交付**已经落到主干**"的唯一凭据 —— commit 的 pr_url 只证明开了 PR。
+      merge: "$.nodes.merge.output"
     on_failure: abort
 
   recap:
@@ -195,6 +223,9 @@ nodes:
       # 传 commit 的**整个输出**，不传某个字段：有 `pr_url` ⇒ 已提交；`null` ⇒ 这条
       # 路径根本没走到提交（被审批驳回）——两种含义在下游都读得出来。
       commit: "$.nodes.commit.output"
+      # 同理：有 `merge_commit` ⇒ 已经落到主干；`null` ⇒ 没走到合并（被审批驳回，
+      # 或合并本身失败）。复盘要能说出"这次改动到底进没进主干"。
+      merge: "$.nodes.merge.output"
 
 edges:
   # 计划门：plan **不直达** fix —— 中间必须有人工决策点（见 approve-plan 上的说明）。
@@ -213,10 +244,15 @@ edges:
   # 审查 → 提交门
   - { from: review, to: approve-commit, when: "$.nodes.review.output.approved == true" }
 
-  # 提交门：通过 → 提交；驳回 → 直接复盘（不中止 run）
+  # 提交门：通过 → 提交（并合并）；驳回 → 直接复盘（不中止 run）
   - { from: approve-commit, to: commit, when: "$.nodes.approve-commit.output.approved == true" }
   - { from: approve-commit, to: recap, when: "$.nodes.approve-commit.output.approved == false" }
 
-  # 提交之后先回传原系统、再进复盘 —— 复盘要能提到工单是否已闭环
-  - { from: commit, to: ticket-done }
+  # 提交 → 合并 → 回传 → 复盘。
+  # ⚠️ `commit` **不再**直达 `ticket-done`：那样会在 PR 只是"开出来"的时候就回传
+  #    「已解决」，而这次改动还没落到主干上（实测过的形态：8 个 PR 全开着、主干没动，
+  #    工单却一条条变成 resolved）。现在回传挂在 `merge` 之后 —— 有 `merge_commit`
+  #    才叫交付。
+  - { from: commit, to: merge }
+  - { from: merge, to: ticket-done }
   - { from: ticket-done, to: recap }

@@ -109,6 +109,14 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         timeout=60, needs_approval=True,
         level="L2", description="调整资源配额（范围受限）",
     ),
+    # ---- 发布工具（实现见 release_tools.py）----
+    # 这是本仓第一个**动 git 主干**的工具：不可逆，所以合并方式固定 squash、
+    # 校验与幂等回落都在实现里（见 release_tools.ws_merge_pr 的 docstring）。
+    "ws_merge_pr": ToolSpec(
+        "ws_merge_pr", ["merger"],
+        timeout=120, needs_approval=True, level="L2",
+        description="把本次 run 的 PR 合并到主干（squash；已合并则复用既有结果）",
+    ),
 }
 
 
@@ -216,6 +224,34 @@ def build_local_tools(agent_name: str) -> list[dict]:
 #: 定位，如果读也依赖沙箱，沙箱一挂整条诊断链就跑不起来。读不改状态、不执行仓库
 #: 代码，风险低。这个取舍是有意的，别"顺手统一"。
 WORKSPACE_SANDBOXED = frozenset({"ws_write_file", "ws_run_tests"})
+
+
+def build_release_tools(agent_name: str) -> list[dict]:
+    """为 agent 生成发布工具（实现见 ``release_tools.py``）。
+
+    与 ``build_workspace_tools`` 同一形状，但**不需要注入任何执行器** ——
+    它跑的是 worker 本机的 ``gh``，凭证由 ``gh`` 自己从 keychain 取（§9.7）。
+
+    ⚠️ 这个函数必须被 ``agents/mcp.py:_build_function_tools`` 调用到。只往
+    ``TOOL_REGISTRY`` 里加一条 spec 是**不够**的：那样 ``build_permission_context``
+    照旧会发 allow 规则，而模型**看不到工具** —— 症状是烧完轮次报"未输出合法 JSON"，
+    与工具根本不存在一模一样。`tests/test_agents.py` 有一条不变量测试守这件事。
+    """
+    from .release_tools import RELEASE_TOOLS
+
+    out: list[dict] = []
+    for spec in tools_for_agent(agent_name):
+        func = RELEASE_TOOLS.get(spec.name)
+        if func is None:
+            continue
+        out.append({
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": {"type": "object", "properties": {}},
+            "func": func,
+            "read_only": False,  # 它改的是远端仓库，不是只读
+        })
+    return out
 
 
 def build_workspace_tools(agent_name: str, *, sandbox_client=None) -> list[dict]:

@@ -841,3 +841,276 @@ async def test_run_times_out_instead_of_hanging(monkeypatch) -> None:
     with pytest.raises(WorkspaceToolError, match="超时"):
         await _run(Path("/tmp"), ["sh", "-c", "sleep 30"])
     assert loop.time() - started < 5, "应该在超时点附近就返回，而不是等命令自己结束"
+
+
+# ----------------------------------------------------------------------
+# ws_merge_pr（`agents/release_tools.py`）—— 本仓第一个**不可逆**动作
+# ----------------------------------------------------------------------
+# 用例放在这个文件而不是新开一个：`_FakeProc` / `_with_origin` / `_prepared_workspace`
+# 这些夹具都在这里，复制一份出去就是又一次"两份实现必然漂移"（CLAUDE.md §11）。
+_GH_OWNER_REPO = ("xqfgbc", "aiops-test-order-service")
+_PR_URL = f"https://github.com/{_GH_OWNER_REPO[0]}/{_GH_OWNER_REPO[1]}/pull/7"
+
+
+def _stub_gh_merge(monkeypatch, *, state="OPEN", head_ref="main", head_oid="",
+                   merge_state="CLEAN", merge_sha="d34db33f0000",
+                   merge_response=None, gh_stderr=""):
+    """桩掉 `gh pr view` 与 `gh api .../merge`，返回记录下来的 argv 列表。
+
+    **只桩 gh**：`git remote get-url origin` 与 `git rev-parse` 走真的 ——
+    于是"这个 PR 的头到底是不是工作区这个 commit"由**真实仓库**作证，
+    而不是由桩点头（与 `_stub_gh` 同一条原则）。
+    """
+    import asyncio as _a
+    import json as _json
+
+    calls: list[list[str]] = []
+    real = _a.create_subprocess_exec
+
+    async def fake(*argv, **kw):
+        # ⚠️ `*argv` 收的是 tuple，切片的比较要用 list（第一版栽在这上面，见 `_stub_gh`）
+        a = list(argv)
+        if a and a[0] == "gh":
+            calls.append(a)
+            if a[1:2] == ["pr"] and "view" in a:
+                return _FakeProc(_json.dumps({
+                    "state": state, "headRefName": head_ref, "headRefOid": head_oid,
+                    "mergeCommit": ({"oid": merge_sha} if state == "MERGED" else None),
+                    "mergeStateStatus": merge_state,
+                }), err=gh_stderr)
+            if a[1:2] == ["api"]:
+                body = merge_response if merge_response is not None else {
+                    "merged": True, "sha": merge_sha, "message": "Pull Request successfully merged",
+                }
+                return _FakeProc(_json.dumps(body), err=gh_stderr)
+            return _FakeProc("", 1, err=gh_stderr)
+        return await real(*argv, **kw)
+
+    monkeypatch.setattr(_a, "create_subprocess_exec", fake)
+    return calls
+
+
+def _merge_calls(calls) -> list[list[str]]:
+    return [c for c in calls if c[1:2] == ["api"]]
+
+
+async def test_ws_merge_pr_merges_and_returns_the_merge_commit(tmp_path, monkeypatch) -> None:
+    """正常路径：squash 合并，`merge_commit` 取自 gh 的返回（那是**主干上**那个提交）。"""
+    from agentflow.agents.release_tools import ws_merge_pr
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)
+    head = git("rev-parse", "HEAD", cwd=repo)
+    calls = _stub_gh_merge(monkeypatch, head_oid=head)
+    try:
+        out = await ws_merge_pr(service, _PR_URL)
+    finally:
+        _reset(toks)
+
+    assert out["merged"] is True
+    assert out["already_merged"] is False
+    assert out["merge_commit"] == "d34db33f0000"
+    assert out["pr_number"] == 7
+    puts = _merge_calls(calls)
+    assert len(puts) == 1, f"应当只调一次合并，实际 {len(puts)}"
+    assert "merge_method=squash" in puts[0], "合并方式固定 squash（不让模型挑历史形状）"
+
+
+async def test_ws_merge_pr_rejects_a_non_github_pr_url(tmp_path, monkeypatch) -> None:
+    """`pr_url` 不是 GitHub PR 链接 → 立刻拒，且**一次 gh 都不调**（本地就判掉了）。"""
+    from agentflow.agents.release_tools import ws_merge_pr
+    from agentflow.agents.workspace_tools import WorkspaceToolError
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)
+    calls = _stub_gh_merge(monkeypatch)
+    try:
+        for bad in ("", "7", "https://gitlab.com/o/r/pull/7",
+                    "https://github.com/o/r/issues/7"):
+            with pytest.raises(WorkspaceToolError, match="不是 GitHub PR 链接"):
+                await ws_merge_pr(service, bad)
+    finally:
+        _reset(toks)
+    assert calls == [], "本地就能判掉的不该去问 gh"
+
+
+async def test_ws_merge_pr_rejects_a_pr_from_another_repo(tmp_path, monkeypatch) -> None:
+    """commit 说 PR 在 A，工作区却在 B → 拒，且**不调合并**。
+
+    这条挡的是"合了别人的分支"：本仓 main 上堆着多个历史 run 留下的未合并 PR，
+    一个错/编的链接在过去会被 `gh` 照单全收。
+    """
+    from agentflow.agents.release_tools import ws_merge_pr
+    from agentflow.agents.workspace_tools import WorkspaceToolError
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)  # origin = xqfgbc/aiops-test-order-service
+    calls = _stub_gh_merge(monkeypatch)
+    try:
+        with pytest.raises(WorkspaceToolError, match="拒绝合并"):
+            await ws_merge_pr(service, "https://github.com/someone/other-repo/pull/7")
+    finally:
+        _reset(toks)
+    assert _merge_calls(calls) == []
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "DRAFT"])
+async def test_ws_merge_pr_rejects_a_pr_that_is_not_open(state, tmp_path, monkeypatch) -> None:
+    """只有 OPEN 能合：被关掉的 / 还是草稿的都要拦下来。"""
+    from agentflow.agents.release_tools import ws_merge_pr
+    from agentflow.agents.workspace_tools import WorkspaceToolError
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)
+    calls = _stub_gh_merge(monkeypatch, state=state)
+    try:
+        with pytest.raises(WorkspaceToolError, match=state):
+            await ws_merge_pr(service, _PR_URL)
+    finally:
+        _reset(toks)
+    assert _merge_calls(calls) == []
+
+
+async def test_ws_merge_pr_refuses_when_the_pr_head_is_not_our_commit(
+    tmp_path, monkeypatch
+) -> None:
+    """PR 的头 ≠ 工作区 HEAD → 拒。
+
+    这是「**声称改了 ≠ 真改了**」（§3.3）在合并上的对应物：`commit` 说"我开了 PR"，
+    这里去远端核一句"那个 PR 的头到底是不是我这个 commit"，而不是信它。
+    """
+    from agentflow.agents.release_tools import ws_merge_pr
+    from agentflow.agents.workspace_tools import WorkspaceToolError
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)
+    calls = _stub_gh_merge(monkeypatch, head_oid="0" * 40)  # 不是工作区的 HEAD
+    try:
+        with pytest.raises(WorkspaceToolError, match="不是同一份代码"):
+            await ws_merge_pr(service, _PR_URL)
+    finally:
+        _reset(toks)
+    assert _merge_calls(calls) == []
+
+
+async def test_ws_merge_pr_refuses_when_the_pr_is_not_from_our_branch(
+    tmp_path, monkeypatch
+) -> None:
+    """PR 的源分支 ≠ 工作区当前分支 → 拒。"""
+    from agentflow.agents.release_tools import ws_merge_pr
+    from agentflow.agents.workspace_tools import WorkspaceToolError
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)
+    head = git("rev-parse", "HEAD", cwd=repo)
+    calls = _stub_gh_merge(monkeypatch, head_ref="aiops/RUN_somebody_else", head_oid=head)
+    try:
+        with pytest.raises(WorkspaceToolError, match="不是本次 run 的分支"):
+            await ws_merge_pr(service, _PR_URL)
+    finally:
+        _reset(toks)
+    assert _merge_calls(calls) == []
+
+
+async def test_ws_merge_pr_refuses_a_conflicting_pr(tmp_path, monkeypatch) -> None:
+    """与主干冲突 → 提前给一句人能看懂的话，而不是把 gh 的 405 原样抛出来。
+
+    本仓必然撞到这条：main 上堆着多个同文件的未合并 PR，谁先合谁让其余的全变冲突。
+
+    ⚠️ 冲突态的取值是 **`DIRTY`**。第一版写的是 `CONFLICTING` —— 那是 **GraphQL
+    `mergeable`** 的取值，`mergeStateStatus` 里根本没有它，于是这条守卫**永远不触发**，
+    而测试也照样绿（桩按我写错的值回话，自己验自己）。是拿真实 PR 跑了一遍才看出来的：
+    本仓 PR #11 实测就是 `DIRTY`。
+    """
+    from agentflow.agents.release_tools import ws_merge_pr
+    from agentflow.agents.workspace_tools import WorkspaceToolError
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)
+    head = git("rev-parse", "HEAD", cwd=repo)
+    calls = _stub_gh_merge(monkeypatch, head_oid=head, merge_state="DIRTY")
+    try:
+        with pytest.raises(WorkspaceToolError, match="rebase"):
+            await ws_merge_pr(service, _PR_URL)
+    finally:
+        _reset(toks)
+    assert _merge_calls(calls) == []
+
+
+async def test_ws_merge_pr_is_idempotent_when_already_merged(tmp_path, monkeypatch) -> None:
+    """**已经合过就复用既有结果，绝不第二次合并。**
+
+    这条是承重的，不是锦上添花：`execute_with_idempotency` 的缓存只在 agent
+    **吐出合法 JSON** 时才记成功。若 agent 已经合成功了、却在收尾时失败
+    （`AgentOutputError`，本仓高频），那条 attempt 记的是 failed ⇒ resume 时节点重跑
+    ⇒ **本工具被真真切切再调一次**。没有这个回落就会报"PR 找不到" → `on_failure: abort`
+    → **把已经发生的合并报成失败**。
+
+    判据：重跑一次，外部世界不该再多一次可见的变化。
+    """
+    from agentflow.agents.release_tools import ws_merge_pr
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)
+    calls = _stub_gh_merge(monkeypatch, state="MERGED", head_oid="0" * 40,
+                           merge_sha="abcabcabcabc")
+    try:
+        out = await ws_merge_pr(service, _PR_URL)
+    finally:
+        _reset(toks)
+
+    assert out["merged"] is True
+    assert out["already_merged"] is True, "要如实说这是复用，不是本次合的"
+    assert out["merge_commit"] == "abcabcabcabc"
+    # ★ 这条是整个用例的重点：**PUT 一次都不能有**
+    assert _merge_calls(calls) == [], "已经合并过的 PR 又被合了一次"
+
+
+async def test_ws_merge_pr_is_loud_without_gh(tmp_path, monkeypatch) -> None:
+    """本机没有 gh → 报一句能操作的错，别让它退化成 FileNotFoundError。"""
+    from agentflow.agents import release_tools
+    from agentflow.agents.release_tools import ws_merge_pr
+    from agentflow.agents.workspace_tools import WorkspaceToolError
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    _with_origin(repo, tmp_path)
+    monkeypatch.setattr(release_tools.shutil, "which", lambda _name: None)
+    try:
+        with pytest.raises(WorkspaceToolError, match="gh"):
+            await ws_merge_pr(service, _PR_URL)
+    finally:
+        _reset(toks)
+
+
+async def test_github_origin_guard_rejects_non_github_hosts(tmp_path, monkeypatch) -> None:
+    """origin 长得像远端但**不是 GitHub** 的也要拦（GitLab 一类）。
+
+    判据必须是"解析出来是不是 github.com"，不能只看有没有 `scheme://` ——
+    `AGENTFLOW_REPO_ROOT` 配成别的 org URL 时，origin 看上去完全正常，
+    而 `gh` 一样用不了，且比 `file://` 更难看出来。
+    """
+    from agentflow.agents.workspace_tools import WorkspaceToolError, _require_github_origin
+
+    service, repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    try:
+        git("remote", "add", "origin", "https://gitlab.com/o/r.git", cwd=repo)
+        with pytest.raises(WorkspaceToolError, match="不是 GitHub 远端"):
+            await _require_github_origin(repo)
+        # 换回 GitHub 形态就放行（同一个函数，正反两面都锁）
+        git("remote", "set-url", "origin", "https://github.com/o/r.git", cwd=repo)
+        assert await _require_github_origin(repo) == "https://github.com/o/r.git"
+    finally:
+        _reset(toks)
+
+
+def test_parse_github_remote_accepts_both_url_styles() -> None:
+    """https 与 `git@host:` 两种写法都要认；非 GitHub 一律 None。"""
+    from agentflow.agents.workspace_tools import _parse_github_remote
+
+    assert _parse_github_remote("https://github.com/o/r.git") == ("o", "r")
+    assert _parse_github_remote("https://github.com/o/r") == ("o", "r")
+    assert _parse_github_remote("https://github.com/o/r/") == ("o", "r")
+    assert _parse_github_remote("git@github.com:o/r.git") == ("o", "r")
+    assert _parse_github_remote("ssh://git@github.com/o/r.git") == ("o", "r")
+    for bad in ("file:///Users/x/repos/r", "https://gitlab.com/o/r", "/abs/path", "", "o/r"):
+        assert _parse_github_remote(bad) is None, bad

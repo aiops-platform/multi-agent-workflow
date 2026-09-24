@@ -20,7 +20,12 @@ import logging
 
 from agentscope.tool import FunctionTool, Toolkit
 
-from .tools import build_l2_tools, build_local_tools, build_workspace_tools
+from .tools import (
+    build_l2_tools,
+    build_local_tools,
+    build_release_tools,
+    build_workspace_tools,
+)
 
 log = logging.getLogger("agentflow.toolkit")
 
@@ -58,7 +63,11 @@ def _build_function_tools(
 
     - 本地只读：``search_knowledge``（占位；CMDB 已随 ``locate_repo`` 迁至 MCP）
     - 工作区：读写本次 run 的代码工作区（§8.7）
+    - 发布：合并 PR（``ws_merge_pr``；跑 worker 本机的 gh，无需注入执行器）
     - L2：传 ``sandbox_client``→沙箱 run/write；传 ``action_executor``→§10.3 白名单动作
+
+    ⚠️ 每加一类工具，**必须在这里接上**。只进 ``TOOL_REGISTRY`` 而不进本函数的工具，
+    权限层会放行、模型却看不见 —— 失败形态是"烧完轮次报未输出合法 JSON"。
     """
     tools: list[FunctionTool] = []
     for t in build_local_tools(agent_name):
@@ -66,7 +75,8 @@ def _build_function_tools(
             func=t["func"], name=t["name"], description=t["description"],
             is_read_only=True,  # 本地只读工具
         ))
-    for t in build_workspace_tools(agent_name, sandbox_client=sandbox_client):
+    for t in (*build_workspace_tools(agent_name, sandbox_client=sandbox_client),
+              *build_release_tools(agent_name)):
         tools.append(FunctionTool(
             func=t["func"], name=t["name"], description=t["description"],
             is_read_only=t["read_only"],

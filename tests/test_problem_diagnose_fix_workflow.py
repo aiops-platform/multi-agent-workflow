@@ -14,8 +14,13 @@
 4. **两道门的语义相反、且都显式写出来**——`approve-plan` 是 `abort`（驳回 = 中止，
    且**没有**驳回边）；`approve-commit` 是 `continue`（驳回 → recap，不中止）。
    `on_reject` 默认值是 `abort`，写错方向图上不会报错，只会静默换语义。
-5. **`ticket-done` 只在成功路径上**——它挂在 `commit` 之后。位置错了的后果不是报错，
-   而是"测试没过 / 审批驳回"那几条路**也不再回传工单**（或反过来重复回传）。
+5. **`ticket-done` 只在成功路径上**——它挂在 `merge` 之后（曾经直接挂 `commit`）。
+   位置错了的后果不是报错，而是"测试没过 / 审批驳回"那几条路**也不再回传工单**
+   （或反过来重复回传）。挂 `merge` 而不是 `commit` 是 2026-09-24 的修正：只开 PR
+   不等于交付 —— 那样会在改动还没落到主干时就回传「已解决」。
+6. **`merge` 的输入取自 `commit` 的输出且必须有值**——`require: [service, pr_url]`。
+   少了 `pr_url`，工具会拿到 None 并去"猜一个要合的 PR"；而本仓 main 上堆着多个
+   历史 run 留下的未合并 PR，猜错就是合了别人的分支。
 
 用脚本化 runner（不调 LLM、不连 MCP），跑得快且确定性。
 """
@@ -73,6 +78,8 @@ OK_OUTPUTS: dict[str, dict] = {
     "test": {"passed": True, "tests_run": 12, "failed": []},
     "review": {"approved": True, "comments": [], "risk": "low"},
     "commit": {"pr_url": "https://github.com/acme/order-service/pull/42", "pr_number": 42, "base_sha": "abc123"},
+    "merge": {"merged": True, "already_merged": False, "pr_url": "https://github.com/acme/order-service/pull/42",
+              "pr_number": 42, "merge_commit": "d34db33f", "head_ref": "aiops/RUN_run_pdf"},
     "ticket-done": {"payload": {"ticket_id": "PR-0007", "status": "resolved", "description": "已修复"}, "delivered": True, "note": ""},
     "recap": {"summary": "已闭环", "root_cause": "空值未校验", "actions": ["修复并提交 PR"], "followups": []},
 }
@@ -117,7 +124,7 @@ def test_workflow_loads_with_exactly_the_expected_nodes() -> None:
     dag = load().dag
     assert set(dag.nodes) == {
         "plan", PLAN_GATE, "fix", "remediate", "test", "review",
-        COMMIT_GATE, "commit", "ticket-done", "recap",
+        COMMIT_GATE, "commit", "merge", "ticket-done", "recap",
     }
     assert dag.nodes[PLAN_GATE].is_approval
     assert dag.nodes[COMMIT_GATE].is_approval
@@ -228,15 +235,40 @@ def test_commit_gate_continues_and_routes_reject_to_recap() -> None:
 
 
 def test_ticket_done_sits_on_the_success_path_only() -> None:
-    """工单回传挂在 `commit → ticket-done → recap` 上：**只有真的提交了才回传**。
+    """工单回传挂在 `… → commit → merge → ticket-done → recap` 上：**只有真的交付了才回传**。
 
     位置是这条节点唯一容易写错的地方（挪到 recap 前面就变成"连驳回也回传"，
     而回传是对外承诺 —— `delivered` 由 `VERDICT_FIELDS` 判红兜一层）。
+
+    ⚠️ **入边必须是 `merge` 而不是 `commit`**（2026-09-24 改）：`commit` 只把分支推出去、
+    开一个 PR，改动**还没落到主干**。挂在 `commit` 上会在那一刻就回传「已解决」——
+    本仓 main 上现在正堆着 8 个"开着但从没合过"的 PR，就是这个形态的实证。
     """
     dag = load().dag
-    assert [e.source for e in dag.nodes["ticket-done"].in_edges] == ["commit"]
+    assert [e.source for e in dag.nodes["ticket-done"].in_edges] == ["merge"]
     assert [e.target for e in dag.edges if e.source == "ticket-done"] == ["recap"]
     assert dag.nodes["ticket-done"].on_failure == "abort"
+
+
+def test_merge_takes_the_pr_from_commit_and_fails_fast_without_it() -> None:
+    """`merge` 的输入取自 **commit 的输出**，且 `pr_url` 是硬前置。
+
+    两件事一起锁，因为它们是同一条链的两半：
+
+    - **取自 commit**：图上有现成的 `pr_url`，工具不该装作看不见去自己反查分支 ——
+      那是把一条显式的事实换成隐式推断。
+    - **必须有值**（`require`）：`pr_url` 解析成 None 时，工具会去"猜一个要合的 PR"。
+      而本仓 main 上堆着多个历史 run 留下的未合并 PR —— 猜错就是**合了别人的分支**，
+      且 `gh` 不会有任何异议。`require` 把这件事变成一次明确失败。
+    """
+    node = load().dag.nodes["merge"]
+    assert node.agent == "merger"
+    assert node.params["pr_url"] == "$.nodes.commit.output.pr_url"
+    # 整个输出也传一份，作为 agent 的上下文（PR 号 / base_sha / 摘要）
+    assert node.params["commit"] == "$.nodes.commit.output"
+    assert set(node.require) == {"service", "pr_url"}
+    # 不可逆动作：失败必须中止，不能走到 ticket-done 去报"已解决"
+    assert node.on_failure == "abort"
 
 
 def test_workspace_gets_prepared_for_the_repair_chain() -> None:
@@ -278,9 +310,12 @@ async def test_happy_path_parks_at_both_gates_and_converges() -> None:
     await ex.approve(COMMIT_GATE, approved=True, by="lead-engineer")
     assert await ex.run() == "done"
     assert ex.get_status("commit") == DONE
+    assert ex.get_status("merge") == DONE
     assert ex.get_status("ticket-done") == DONE
     assert ex.get_status("recap") == DONE
     assert ex.halt_triggered() is False
+    # merge 真的收到了 commit 的 PR（不是 None，也不是空串）
+    assert seen["merge"]["pr_url"].endswith("/pull/42")
     # 复盘**真的收到了**提交结果（`$.nodes.commit.output` 解析出了值，不是 None）——
     # 这条是 `$.nodes.commit.status` 那个恒空入参的同类锁（tests/test_seed_defaults.py
     # 的 test_seed_params_reference_real_schema_fields 只能核字段名，核不了"有没有值"）。
@@ -321,6 +356,7 @@ async def test_commit_gate_reject_converges_without_committing_or_delivering() -
     assert await ex.run() == "done"  # 人否决 ≠ 执行失败
     assert ex.get_status(COMMIT_GATE) == REJECTED
     assert ex.get_status("commit") == SKIPPED
+    assert ex.get_status("merge") == SKIPPED  # 没提交就更谈不上合并
     assert ex.get_status("ticket-done") == SKIPPED
     assert ex.get_status("recap") == DONE
     assert ex.rejected_abort_node() is None  # continue → 不中止
@@ -328,6 +364,8 @@ async def test_commit_gate_reject_converges_without_committing_or_delivering() -
     # 前提是 `commit` 节点**有出边被跳过**而不是压根没被引用 —— 后者会让 params 里
     # 连这个键都没有，下游分不清"没提交"与"图里忘了写"。
     assert "commit" in seen["recap"] and seen["recap"]["commit"] is None
+    # merge 同理：驳回这道门时它一路 SKIPPED，复盘要读得出"改动没进主干"。
+    assert "merge" in seen["recap"] and seen["recap"]["merge"] is None
 
 
 # ── 行为：入参预检（fail-fast 而不是空转）────────────────────────────────────

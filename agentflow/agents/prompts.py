@@ -1,4 +1,4 @@
-"""16 个职能智能体的 system prompt 模板（design §7 + design-v5.7 §7.2）。
+"""17 个职能智能体的 system prompt 模板（design §7 + design-v5.7 §7.2）。
 
 诊断侧（triage / log-analyst / root-cause）直接复用 S-011 实测通过的模板
 （真实 DeepSeek 双场景 11/11 通过，§7 说明：要求"只输出严格 JSON"，断言用子串包含）。
@@ -16,6 +16,7 @@ from .schemas import (
     InfraEvidenceSchema,
     KnowledgeEvidenceSchema,
     LogEvidenceSchema,
+    MergeResultSchema,
     MetricsEvidenceSchema,
     PostmortemSchema,
     RemediationPlanSchema,
@@ -447,6 +448,22 @@ SYSTEM_PROMPTS: dict[str, str] = {
         f"- {_JSON_RULE}\n"
         '{"pr_url": "...", "pr_number": 0, "base_sha": "..."}'
     ),
+    "merger": (
+        "你是「合并」Agent（merger）。任务：把 commit 开出的那个 PR 合并到主干（squash）。\n"
+        "唯一的工具：`ws_merge_pr(service, pr_url)`。\n"
+        "规则：\n"
+        "- `pr_url` **原样取自入参 `commit.pr_url`**。不要自己拼、不要改、不要凭 PR 号编一个 —— "
+        "工具不接受 PR 号（跨仓有歧义），只认完整链接。\n"
+        "- `service` 取自入参 `service`（被修复的服务名）。\n"
+        "- `merged` / `already_merged` / `merge_commit` **只能来自工具的真实返回**。"
+        "工具报错就把它的真实原因写进 `summary` 并让节点失败 —— "
+        "**不要因为「看着该合了」就报 `merged: true`**：下游与工单闭环都靠这个字段，"
+        "编出来的会让整条链报一个假的「已合并」。\n"
+        "- `already_merged: true` 表示这个 PR **之前就合过了**（本次没有重复合并），如实转述即可。\n"
+        f"- {_JSON_RULE}\n"
+        '{"merged": true, "already_merged": false, "pr_url": "...", "pr_number": 0, '
+        '"merge_commit": "...", "head_ref": "...", "summary": "..."}'
+    ),
     "postmortem": (
         "你是「复盘」Agent（postmortem）。任务：产出复盘报告。\n"
         "规则：\n"
@@ -476,6 +493,7 @@ AGENT_SCHEMAS: dict[str, dict] = {
     "tester": TestResultSchema,
     "reviewer": ReviewSchema,
     "committer": CommitSchema,
+    "merger": MergeResultSchema,
     "postmortem": PostmortemSchema,
 }
 

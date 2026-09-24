@@ -1,4 +1,4 @@
-"""16-agent 编队注册表（design §7）。
+"""17-agent 编队注册表（design §7）。
 
 映射 agent 名 → 职责 / 工具可见性 / 输出 Schema。executor 的 node_runner
 通过 ``AGENT_REGISTRY`` 把节点调度到对应职能智能体。
@@ -41,6 +41,7 @@ FIX_AGENTS = [
     "tester",
     "reviewer",
     "committer",
+    "merger",
     "postmortem",
 ]
 
@@ -61,6 +62,7 @@ AGENT_DESCRIPTIONS: dict[str, str] = {
     "tester": "对修复运行测试与集成验证",
     "reviewer": "审查修复 diff，判断是否可提交",
     "committer": "把修复提交为 PR（幂等，external_operation_id=PR number）",
+    "merger": "把本次 run 的 PR 合并到主干（校验 origin/分支/HEAD 三者一致，已合并则复用）",
     "postmortem": "产出复盘报告",
 }
 
@@ -83,6 +85,9 @@ AGENT_STAGES: dict[str, str] = {
     "tester": "verify",
     "reviewer": "verify",
     "committer": "deliver",
+    # merge 也在 deliver 段：它与 commit 是同一条动作的两半（推 PR → 合主干），
+    # 且是其中**不可逆**的那一半。
+    "merger": "deliver",
     "postmortem": "learn",
 }
 
