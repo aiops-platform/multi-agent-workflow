@@ -113,8 +113,10 @@ GH_CREDENTIAL_HELP = """  凭证无法自动配置，二选一：
           容器形态要把它挂进 worker 的 env（见 deploy/worker-deployment.yaml）"""
 
 
-def check_toolchain() -> list[str]:
-    """把**实际工具版本**与 `toolchain.toml` 的声明比对。返回问题列表。
+def check_toolchain() -> tuple[list[str], list[str]]:
+    """把**实际工具版本**与 `toolchain.toml` 的声明比对。返回 ``(problems, advisories)``。
+
+    `problems` 影响退出码（环境没就绪）；`advisories` 只打印、不影响退出码。
 
     ## 为什么值得单独一项
 
@@ -130,7 +132,18 @@ def check_toolchain() -> list[str]:
     - 只查**工具**（CLI 可执行文件）。依赖锁定是另一件事（retro §7.2 E1/E2/E3）。
     - `toolchain.toml` 不在 → 静默返回（不阻塞），因为这个文件是**新增**的，
       旧 checkout 上没有它不该被当成"环境坏了"。
-    - `optional = true` 的项缺失不算问题（有替代品或非必需），但**版本不满足**仍报。
+    ## 三档语义（**别把第三档写成第二档**）
+
+    | 声明 | 缺失时 | 版本不符时 | 影响退出码 |
+    |---|---|---|---|
+    | （默认）必需 | 报 problem | 报 problem | ✅ 是 |
+    | `optional = true` | **不提** | 报 problem | 仅版本不符时 |
+    | **`advisory = true`** | **打印提示** | **打印提示** | ❌ **否** |
+
+    `advisory` 这一档是为「值得知道、但缺了不算环境坏了」的工具准备的 ——
+    例如 codegraph：不装它一切照常（`.claude/CLAUDE.md` 指令里有"没索引就跳过"的兜底），
+    但**新队友应该在第一次跑 doctor 时就知道有这么个东西、以及一条命令怎么装**。
+    写成 `optional` 会静默不提（达不到告知目的），写成必需又会把没装它的人挡在门外。
     """
     import tomllib
     from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -138,32 +151,57 @@ def check_toolchain() -> list[str]:
     root = Path(__file__).resolve().parent.parent
     cfg_path = root / "toolchain.toml"
     if not cfg_path.exists():
-        return []
+        return [], []
     try:
         tools = tomllib.loads(cfg_path.read_text(encoding="utf-8")).get("tools", {})
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        return [f"toolchain.toml 读不出来（{exc}）—— 工具版本基线这次没有比对"]
+        return [f"toolchain.toml 读不出来（{exc}）—— 工具版本基线这次没有比对"], []
 
     problems: list[str] = []
+    advisories: list[str] = []
     for name, spec in tools.items():
         cmd = spec.get("cmd") or []
         required = spec.get("required") or ""
         note = spec.get("note") or ""
         optional = bool(spec.get("optional"))
+        advisory = bool(spec.get("advisory"))
+        # advisory 的项：提示语单独攒，不进 problems
+        sink = advisories if advisory else problems
+        # ⚠️ 缺失时**只挡 `optional`**，不挡 `advisory` ——
+        # advisory 存在的全部理由就是"缺失时要出声"。初版把这里写成
+        # `optional or advisory`，结果它被自己挡住、一声不吭，
+        # 而"缺失"恰恰是它唯一的用武之地（实测：模拟新队友没装 → 零输出）。
+
         if not cmd or not required:
             continue
+
+        def _unavailable(why: str) -> None:
+            """命令拿不到版本时的统一出口。
+
+            ⚠️ 两条路径都要覆盖：**可执行文件本身不存在**（FileNotFoundError），
+            与 **`sh -c` 包了一层、但里面那条命令不存在**（sh 自己 rc=0，
+            错误只在 stderr 里）。只判前者会让后者落进"认不出版本号"，
+            对**最该说清楚的那个场景**（新队友没装）吐一句 `sh: ... No such file`。
+            """
+            text = f"{name}：{why}" + (f" —— {note}" if note else "")
+            (advisories if advisory else problems).append(text)
 
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
             raw = f"{r.stdout}\n{r.stderr}"
         except (OSError, subprocess.SubprocessError):
             if not optional:
-                problems.append(f"{name}：跑不起来（{' '.join(cmd)}）" + (f" —— {note}" if note else ""))
+                _unavailable("跑不起来")
             continue
 
         m = re.search(r"\d+\.\d+(?:\.\d+)?", raw)
         if not m:
-            problems.append(f"{name}：认不出版本号（原始输出：{raw.strip()[:80]!r}）")
+            if r.returncode != 0:
+                # 命令在，但跑不出来（或 sh -c 里的目标不存在）→ 当作"没装/不可用"
+                if not optional:
+                    _unavailable("没装")
+            else:
+                sink.append(f"{name}：认不出版本号（原始输出：{raw.strip()[:80]!r}）")
             continue
         actual = m.group(0)
 
@@ -174,12 +212,12 @@ def check_toolchain() -> list[str]:
             continue
 
         if not ok:
-            problems.append(
+            sink.append(
                 f"{name}：实际 {actual}，基线要求 {required}"
                 + (f" —— {note}" if note else "")
                 + "（要么升工具，要么改 toolchain.toml 的基线 —— **别让它悄悄漂着**）"
             )
-    return problems
+    return problems, advisories
 
 
 def main() -> int:
@@ -207,7 +245,7 @@ def main() -> int:
     #    与 _env_preflight 查的"服务在不在"正交：那查**有没有**，这查**版本对不对**。
     #    版本漂移是静默的（本仓实测：ruff 被无上界约束换掉后 lint 无声变红），
     #    所以它必须在"换机器先跑这个"里被挡住。
-    toolchain_problems = check_toolchain()
+    toolchain_problems, advisories = check_toolchain()
     problems.extend(toolchain_problems)
 
     # ② DeepSeek key 不在 _env_preflight 里（它不阻塞"环境能否起来"，
@@ -217,6 +255,14 @@ def main() -> int:
             "未配置 DeepSeek Key（DEEPSEEK_API_KEY）→ agent 会退化成 ScriptedJsonModel "
             "（确定性桩），run 能跑完但结论无意义"
         )
+
+    # ③ 提示项（`advisory = true`）：**不影响退出码**，但每次体检都打印。
+    #    和 problems 分开，是因为它们的"下一步"不同 —— 问题要修，提示只是让你知道。
+    #    codegraph 就在这里：不装它一切照常，但新队友该在这一步知道有这么个东西。
+    if advisories:
+        print("\nℹ 可选工具（不影响环境是否就绪）：")
+        for a in advisories:
+            print(f"  · {a}")
 
     if not problems:
         print("\n✓ 环境就绪（postgres / kafka / 沙箱镜像与沙箱 / gh 均可用）")

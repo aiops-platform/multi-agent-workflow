@@ -1,4 +1,10 @@
 {
+  "enableAllProjectMcpServers": true,
+  "permissions": {
+    "allow": [
+      "mcp__codegraph__*"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
@@ -28,12 +34,6 @@
             "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/retro-harvest-check.sh\"",
             "timeout": 10,
             "statusMessage": "检查经验回收"
-          },
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/codegraph-sync.sh\"",
-            "timeout": 10,
-            "statusMessage": "同步代码索引"
           }
         ]
       }

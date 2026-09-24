@@ -38,6 +38,14 @@ docker/sandbox/wheels/
 
 
 # SessionStart hook 的**每机器**状态（"我上次回收到哪个 commit"）。
-# `.claude/settings.json` 与 `.claude/hooks/` **要提交**（那是给全队的）；
+# `.claude/settings.json`、`.claude/CLAUDE.md` 与 `.claude/hooks/` **要提交**（那是给全队的）；
 # 状态是"我做过没有"，不是仓库的属性 —— 所以在这里排掉。
 .claude/.retro-state.json
+
+# 每个人**本机**的 MCP 批准记录（Claude Code 在工作区被信任后自动写）。
+#
+# `.mcp.json` 定义 server、`.claude/settings.json` 声明"自动批准全部项目级 server"，
+# 但**两者都要等这个人点过一次工作区信任框才生效**（Claude Code 的设计：
+# 「A cloned repository can't approve its own servers」）。点了之后批准结果写在这里。
+# 它是"我信任过这台机器上的这个仓"，不是仓库属性 —— 提交了会互相覆盖。
+.claude/settings.local.json

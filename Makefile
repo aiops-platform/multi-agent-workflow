@@ -94,31 +94,40 @@ sync-agents:
 retro-harvest:
 	$(PY) scripts/retro_harvest.py --since "$(if $(SINCE),$(SINCE),2 weeks ago)" $(foreach r,$(REPOS),--repo $(r))
 
-# 代码索引（codegraph）—— **团队共用的是约定，索引本身每台机器各自建**。
+# 代码索引（codegraph）—— **建索引是使用者的决定，工具自己不做**。
 #
-#   make codegraph          # 没索引就建，有就增量同步，最后报状态
-#   make codegraph MCP=1    # 顺带把 MCP server 接进 agent（**一次性**，改本机配置）
+#   make codegraph       # 没索引就建，有就报状态（顺带增量同步一次）
 #
-# 为什么索引不入库：它自带的 `.codegraph/.gitignore` 注释写着
-# 「local to each machine, not for committing」—— 而且索引**必须与代码同步**，
-# 入库的索引对任何改过代码的人立刻就过期。所以入库的只有那条忽略规则。
+# ## 它在团队里的定位：**入门那一次 + 排查**，不是日常维护
 #
-# 为什么钉版本号：同一台机器上两个版本的索引器交替写同一个 db 是没意义的。
-# 这个版本号与 `.claude/hooks/codegraph-sync.sh` 里的一致，改要一起改。
+# 日常的增量更新**不用这条命令** —— `.mcp.json` 提交后，Claude Code 开会话时会
+# 拉起 MCP server，它自带的文件监听在会话期间实时同步，会话之间的改动则在下次
+# 启动时由 daemon 自己 `Caught up N file(s) changed since last run` 补齐（实测）。
+#
+# 所以这条命令管的是另外两件事：
+#   · **新队友第一次**：工具明说「indexing is the user's decision」，
+#     它不会替你建索引，得有一个人/一条命令来做 → 就是这条。
+#   · **排查**：`status` 能一眼看出索引新不新（有 Pending Changes 就是旧的）。
+#     ⚠️ 这条很重要 —— 纯 CLI 查询在索引过期时**会静默返回过期结果**
+#     （`query` 不警告，只有 `status` 提示），见 docs/tooling/README.md。
+#
+# ## 为什么索引不入库
+#
+# 自带的 `.codegraph/.gitignore` 写着「local to each machine, not for committing」，
+# 而且索引**必须与代码同步** —— 入库的索引对任何改过代码的人立刻就过期，
+# 而一份过期的图**比没有图更糟**（给出确信的错误答案）。
+#
+# 钉版本号是因为：同一台机器上两个版本的索引器交替写同一个 db 没意义。
+# `.mcp.json` 里走的是已装的 `~/.local/bin/codegraph`（软链到 current 版本），
+# 这里用 npx 拉同一个小版本 —— 两者应当保持一致。
 CG := npx -y @colbymchenry/codegraph@1.6.0
 codegraph:
 	@command -v npx >/dev/null 2>&1 || { \
 	  echo "需要 Node ≥22（npx 不在 PATH）。装好后重跑，或 `make doctor` 看版本基线。"; exit 1; }
 	@if [ -d .codegraph ]; then \
-	  echo "== 增量同步 =="; $(CG) sync . ; \
+	  echo "== 已有索引：增量同步一次并报状态 =="; $(CG) sync . ; \
 	else \
 	  echo "== 首次建索引 =="; $(CG) init . ; \
 	fi
 	@echo
 	@$(CG) status . | tail -22
-	@if [ -n "$(MCP)" ]; then \
-	  echo; echo "== 接进 agent（改本机配置）=="; $(CG) install --yes ; \
-	fi
-	@echo
-	@echo "提示：索引靠 MCP server 常驻时自动跟（会话期间），会话之间由"
-	@echo "      .claude/hooks/codegraph-sync.sh 在下次开会话时补齐。"

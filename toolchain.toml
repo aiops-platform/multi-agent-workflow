@@ -16,8 +16,14 @@
 #   [tools.<名字>]
 #   cmd       = [...]         # 取版本的命令（stdout+stderr 里第一个 X.Y[.Z] 即为版本）
 #   required  = ">=X.Y"       # PEP 440 约束（用 packaging.SpecifierSet 判）
-#   optional  = true          # 缺失不算问题（有替代品，或非必需）
+#   optional  = true          # 缺失**不提**；版本不符仍报
+#   advisory  = true          # 缺失/不符都**打印提示**，但**不影响退出码**
 #   note      = "..."         # 缺失/不匹配时给人看的补充说明
+#
+# ⚠️ `cmd` 是**不经 shell 直接 exec** 的（subprocess 的列表形式），所以
+# `$HOME`、`${VAR}` 这类**不会展开**。要用环境变量就写成
+#     cmd = ["sh", "-c", "$HOME/.local/bin/xxx --version"]
+# 「取版本」这一步是拿输出里第一个 `X.Y[.Z]`，实测对 python/ruff/gh/podman/jq/codegraph 都成立。
 #
 # ## 与 pyproject 的关系
 #
@@ -55,3 +61,20 @@ cmd = ["node", "--version"]
 required = ">=22"
 optional = true
 note = "跑 understand-anything / codegraph 等代码索引工具时才需要，后端本身不依赖"
+
+# ── codegraph：**advisory（提示而非问题）** ──
+#
+# 为什么是 advisory 而不是 optional：`optional` 在缺失时**静默不提**，
+# 而这里恰恰要让新队友在第一次 `make doctor` 时**知道有这么个东西** ——
+# 团队要它做代码检索的首选（见 `.claude/CLAUDE.md` 那段指令）。
+#
+# 为什么不是必需：不装它一切照常 —— 那段指令自带兜底
+# 「若根目录没有 `.codegraph/`，则完全跳过 CodeGraph」。把没装的人挡在门外是错的。
+#
+# ⚠️ 装归装，**索引要单独建**：工具明说「indexing is the user's decision」，
+# 它不会替你建（`.mcp.json` 只负责把已装的接上 Claude Code）。
+[tools.codegraph]
+cmd = ["sh", "-c", "$HOME/.local/bin/codegraph --version"]
+required = ">=1.6,<2.0"
+advisory = true
+note = "代码检索首选（`callers`/`callees`/`impact` 答\"谁调用谁\"，实测比 LLM 建图便宜两个数量级）。装法见 docs/tooling/README.md；装完还要 `make codegraph` 建一次索引"
