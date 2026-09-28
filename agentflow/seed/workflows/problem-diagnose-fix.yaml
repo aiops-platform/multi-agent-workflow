@@ -1,4 +1,4 @@
-# ===== Problem Center 修复工作流：诊断结论 → 计划 → 修复+止血 → 测试 → 审查 → 提交 → 合并 → CI → 发布门 → 工单回传 =====
+# ===== Problem Center 修复工作流：诊断结论 → 计划 → 修复+止血 → 测试 → 审查 → 提交 → 合并 → CI → 发布门 → 部署 → 工单回传 =====
 #
 # 由 bug-fix-scenario2 **简化**而来：诊断段
 # （triage / scope / logs / trace / metrics / infra / locate / know / rca + halt）**整段去掉**，
@@ -19,7 +19,7 @@
 # 而本图**一个取数节点都没有**——没有工具会读它，声明了只是摆设。
 name: problem-diagnose-fix
 version: "1.0.0"
-description: "Problem Center 修复闭环：诊断结论（rca）→ 修复计划 → 计划门 → 代码修复 + K8s 止血 → 测试/审查 → 提交门 → PR → 合并主干 → 编译打包+构建镜像 → 发布门 → 工单回传"
+description: "Problem Center 修复闭环：诊断结论（rca）→ 修复计划 → 计划门 → 代码修复 + K8s 止血 → 测试/审查 → 提交门 → PR → 合并主干 → 编译打包+构建镜像 → 发布门 → 部署 → 工单回传"
 
 inputs:
   bug_report:
@@ -257,6 +257,30 @@ nodes:
     # 组合（`_check_on_reject_consistency`），所以这里不能"留一条边当退路"。
     on_reject: abort
 
+  # ===== 部署（本图第一个真的改集群的节点）=====
+  # **不构建任何东西**：产物在 `ci` 就定型了，`approve-deploy` 批的就是那个 tag
+  # （build once, deploy many）。这里只做"搬运 + 滚动"。
+  #
+  # 工具**全部来自 MCP server `deploy-ops`**（本节点在本地 Tool Registry 里**零工具**）：
+  # 该 server 持有 kubeconfig 与部署目标表，agentflow 侧不碰集群细节。
+  # **部署目标（namespace/deployment/container）也不从工单取** —— 实测工单的
+  # `cmdb_ci` 里没有 namespace 键（只有 name 与 service）。
+  #
+  # `require: [service, image_tag]` 是标量锚点：`image_tag` 解不出来就 fail-fast，
+  # 而不是让工具拿一个空字符串去滚。
+  #
+  # ⚠️ 那台 server 有一条承重的拓扑约束（必须与 docker daemon 同机），违反时
+  # **它自己会拒绝启动** —— 见 aiops-mcp-servers 的 deploy-ops-mcp-server/README.md。
+  deploy:
+    agent: deployer
+    description: "部署：把 ci 构建的镜像装进集群并滚动到该服务上"
+    require: [service, image_tag]
+    params:
+      image_tag: "$.nodes.ci.output.image_tag"
+      ci: "$.nodes.ci.output"
+      service: "$.inputs.bug_report.cmdb_ci.name"
+    on_failure: abort
+
   # ===== 回传原系统（工单闭环）=====
   # ⚠️ 位置决定覆盖范围：它**只在成功路径上**（ci 之后）。test / review / 审批驳回
   # 那几条边直接到 recap，不经过这里 —— 那些情况工单不会被回传。要让"修复没走完"也回传，
@@ -280,6 +304,9 @@ nodes:
       # ci 的整个输出：有 image_tag ⇒ 产物可部署了。没有它，下游只知道"合了"，
       # 不知道"能不能发"。
       ci: "$.nodes.ci.output"
+      # deploy 的整个输出：有 `deployed: true` ⇒ **真的滚到线上了**。这是"已解决"
+      # 最硬的一份凭据（前面几个节点都只证明"东西备好了"）。
+      deploy: "$.nodes.deploy.output"
     on_failure: abort
 
   recap:
@@ -298,6 +325,8 @@ nodes:
       # 有 `image_tag` ⇒ 产物构建出来了；`null` ⇒ 没走到 CI。复盘要能说出
       # "这次改动到底能不能发"。
       ci: "$.nodes.ci.output"
+      # 有 `deployed: true` ⇒ 已经到线上了。复盘要能说出"这次改动到底上没上"。
+      deploy: "$.nodes.deploy.output"
 
 edges:
   # 计划门：plan **不直达** fix —— 中间必须有人工决策点（见 approve-plan 上的说明）。
@@ -320,15 +349,17 @@ edges:
   - { from: approve-commit, to: commit, when: "$.nodes.approve-commit.output.approved == true" }
   - { from: approve-commit, to: recap, when: "$.nodes.approve-commit.output.approved == false" }
 
-  # 提交 → 合并 → CI → 发布门 → 回传 → 复盘。
+  # 提交 → 合并 → CI → 发布门 → 部署 → 回传 → 复盘。
   # ⚠️ 这条链**改过两次入边，两次都是往右挪一格**，判据同一条 ——
   #    回传的判据是"有没有可交付的物"，不是"流程跑到哪了"：
   #      `commit`  只开 PR，改动没进主干
   #      `merge`   进了主干，但还没有可部署的产物
   #      `ci`      产物出来了，但**没人批准发布**
-  #      → 现在挂 `approve-deploy`：人批过才叫交付。
+  #      → 挂 `approve-deploy`：人批过才叫交付；
+  #      → 再挂 `deploy`（2026-09-28）：**滚到线上才算**。
   - { from: commit, to: merge }
   - { from: merge, to: ci }
   - { from: ci, to: approve-deploy, when: "$.nodes.ci.output.built == true" }
-  - { from: approve-deploy, to: ticket-done, when: "$.nodes.approve-deploy.output.approved == true" }
+  - { from: approve-deploy, to: deploy, when: "$.nodes.approve-deploy.output.approved == true" }
+  - { from: deploy, to: ticket-done, when: "$.nodes.deploy.output.deployed == true" }
   - { from: ticket-done, to: recap }

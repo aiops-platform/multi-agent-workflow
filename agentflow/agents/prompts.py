@@ -1,4 +1,4 @@
-"""18 个职能智能体的 system prompt 模板（design §7 + design-v5.7 §7.2）。
+"""19 个职能智能体的 system prompt 模板（design §7 + design-v5.7 §7.2）。
 
 诊断侧（triage / log-analyst / root-cause）直接复用 S-011 实测通过的模板
 （真实 DeepSeek 双场景 11/11 通过，§7 说明：要求"只输出严格 JSON"，断言用子串包含）。
@@ -9,6 +9,7 @@ from __future__ import annotations
 from .schemas import (
     BugReportSchema,
     BuildResultSchema,
+    DeployResultSchema,
     CandidateServicesSchema,
     CodeLocationSchema,
     CommitSchema,
@@ -485,6 +486,26 @@ SYSTEM_PROMPTS: dict[str, str] = {
         '{"built": true, "image_built": true, "image_tag": "svc:<sha12>", '
         '"artifact": "build/libs/x.jar", "merge_commit": "...", "summary": "..."}'
     ),
+    "deployer": (
+        "你是「部署」Agent（deployer）。任务：把 CI 构建好的镜像**滚到线上**。\n"
+        "工具**全部来自 MCP server `deploy-ops`**（你没有任何本地工作区工具）：\n"
+        "1. `rollout_deployment(service, image)` —— **写操作**，会真的改线上；\n"
+        "2. `get_deployment_status(service)` —— 只读，用于复核。\n"
+        "规则：\n"
+        "- `service` 与 `image` **原样取自入参**（`service` / `image_tag`）。"
+        "**不要自己拼镜像名、不要改动它** —— 它是人工审批过的那个 tag，改一个字符就是另一回事。\n"
+        "- **部署目标（namespace/deployment）由那台 server 自己持有**，你不要传、也不要知道。\n"
+        "- `deployed` **只能来自 `rollout_deployment` 的真实返回**。"
+        "它返回 `success: false` 时你输出 `deployed: false`，并把它的 `stage`（卡在哪一步）"
+        "与 `error` 原文写进 `summary`。\n"
+        "- **不要因为「审批已经过了」就报 `deployed: true`** —— 滚不上去而工单报「已解决」，"
+        "是这条链上最坏的形态。宁可难看，不要撒谎。\n"
+        "- 失败时**不要重试**、**不要自己回滚**：如实上报即可（回滚命令 server 已经给了）。\n"
+        f"- {_JSON_RULE}\n"
+        '{"deployed": true, "image_tag": "order-service:211eae4e2518", '
+        '"observed_image": "order-service:211eae4e2518", "pod": "...", '
+        '"summary": "..."}'
+    ),
     "postmortem": (
         "你是「复盘」Agent（postmortem）。任务：产出复盘报告。\n"
         "规则：\n"
@@ -516,6 +537,7 @@ AGENT_SCHEMAS: dict[str, dict] = {
     "committer": CommitSchema,
     "merger": MergeResultSchema,
     "ci-builder": BuildResultSchema,
+    "deployer": DeployResultSchema,
     "postmortem": PostmortemSchema,
 }
 

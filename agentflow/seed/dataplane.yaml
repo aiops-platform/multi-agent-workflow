@@ -18,6 +18,15 @@ servers:
     transport: http
     is_stateful: 0
     url_setting: mcp_datasource_url
+  # 发布链的部署工具（:8400）。**只绑给 deployer**。
+  #
+  # ⚠️ 为什么单独一台、不并进 aiops-datasource：那台被 9 个诊断 agent 绑着，
+  # 而 MCP 绑定是 **server 级**粒度（docs/TODO.md §16）—— 把那台唯一的写工具
+  # （rollout_deployment）加进去，等于**把滚线上的权限发给所有绑它的 agent**。
+  - name: deploy-ops
+    transport: http
+    is_stateful: 0
+    url_setting: mcp_deploy_url
 
 # ── agent 绑定（agent 名 → [server 名]）────────────────────────────
 # 绑定是 **per-agent** 的，没有租户级默认（`AgentConfigResolver.server_ids_for`
@@ -36,3 +45,9 @@ bindings:
   infra-locator:   [aiops-datasource]
   code-locator:    [aiops-datasource]
   root-cause:      [aiops-datasource]
+  # ⚠️ `deployer` 是本仓**第一个「工具全靠 MCP」的内置执行型 agent** ——
+  # 它在本地的 `TOOL_REGISTRY` 里**一个工具都没有**，全部来自这一行绑定。
+  # 绑定缺行 ⇒ 它零工具（`GET /agents` 的 `tool_count` 看得出来）⇒ 模型把工具调用
+  # 写成纯文本 ⇒ 最终表现是"未输出合法 JSON"，中间没有一步会说"绑定缺失"。
+  # 已开通租户改这一行要 `make sync-agents TENANT=<id>`（种子只对新租户生效）。
+  deployer:        [deploy-ops]

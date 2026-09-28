@@ -99,6 +99,13 @@ class Settings(BaseSettings):
     # （本地 127.0.0.1，k8s 里要 pod 可达的 service DNS）。默认值对齐
     # `uv run python -m aiops_datasource_mcp_server`（:8300）。
     mcp_datasource_url: str = "http://127.0.0.1:8300/mcp"
+    # `deploy-ops` 的地址（发布链的 `deploy` 节点用）。默认值对齐
+    # `uv run python -m deploy_ops_mcp_server`（:8400）。
+    #
+    # ⚠️ **它绑给 `deployer` 一个 agent、而且是写集群的**（那台 server 上唯一的写工具是
+    # `rollout_deployment`）。所以它既不与 datasource 混用，也不给别的 agent 绑 ——
+    # MCP 绑定是 **server 级**粒度（`docs/TODO.md` §16），混绑等于把写权限发出去。
+    mcp_deploy_url: str = "http://127.0.0.1:8400/mcp"
 
     # ---- 数据面姿态（v5.3 §7/P1，v5.5 批3 起语义收窄）----
     # 原名"共享数据源开关"：**内置共享数据源工具已删除**（数据查询全部走租户 MCP，

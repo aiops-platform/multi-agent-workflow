@@ -68,7 +68,7 @@ TicketCreator = Callable[[str, dict], Awaitable[dict]]
 #: 它比 `committer` 更需要这个键 —— 重复建 PR 只是多一个 PR，重复合并会多一个主干提交。
 #: 注意这个键只覆盖"节点被重跑"这一层；`ws_merge_pr` 内部另有一层
 #: "PR 已 MERGED 就复用既有结果"的回落，两层都在（见 `agents/release_tools.py`）。
-SIDE_EFFECT_AGENTS = frozenset({"committer", "infra-remediator", "ticket-done", "merger"})
+SIDE_EFFECT_AGENTS = frozenset({"committer", "infra-remediator", "ticket-done", "merger", "deployer"})
 
 #: 「跑完了」≠「通过了」：这几个 agent 的输出里有一个**结论字段**，
 #: 显式为 ``False`` 时节点判 **FAILED**（红），而不是 DONE（绿）。
@@ -111,6 +111,9 @@ VERDICT_FIELDS = {
     # #: 与其让工具"抛错代替返回 false"（那会被 `on_failure: continue` 吞成负证据），
     # #: 不如把两半合成一个字段，提示词里写死"两者都成功才为 true"。
     "ci-builder": "built",
+    # `deployed: false` ⇒ 节点判红。判据同上面几条：滚不上去而下游继续去回传工单
+    # 说「已解决」，是这条链上最坏的形态。
+    "deployer": "deployed",
 }
 
 #: 「声称改了」≠「真改了」：这几个 agent 的输出里有一个**产物字段**（声称改了哪些文件），

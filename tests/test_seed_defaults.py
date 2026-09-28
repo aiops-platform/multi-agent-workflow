@@ -39,9 +39,16 @@ def _seed_agent_schemas() -> dict[str, dict]:
 
 
 class _Settings:
-    """播种器只用到这一个设置项（URL 由配置注入，不写死在种子里）。"""
+    """播种器只用到这几个设置项（URL 由配置注入，不写死在种子里）。
+
+    ⚠️ **它与 `.env` 的真实 Settings 是两份**：这里少写一个 `url_setting` 指向的字段，
+    播种时那条 server 就会被**跳过**（`seed_defaults` 里 `if not url: log.warning(...)`），
+    而症状是"某台 server 没播进去 + 绑它的 agent 也少一行" —— 测试会红，但报的是
+    数量对不上，看不出是这里漏了。加 server 时**记得同步这里**。
+    """
 
     mcp_datasource_url = "http://127.0.0.1:8300/mcp"
+    mcp_deploy_url = "http://127.0.0.1:8400/mcp"
 
 
 async def _stores():
@@ -287,13 +294,36 @@ async def test_binding_points_at_the_real_server_id() -> None:
     await seed_defaults(w, m, a, settings=_Settings())
 
     rows = {r["name"]: r for r in await a.list()}
+    servers = {s["name"]: s["id"] for s in await m.list()}
     bound = load_dataplane_seed()["bindings"]
     assert bound, "dataplane 种子里没有绑定"
-    for agent in bound:
+
+    # ① **通用判据**：绑定指向库里**真实存在**的 id（不是种子里那个假想的 `seed-<name>`）。
+    #    ⚠️ 本用例**预置了一台 server** ⇒ `mcp_servers` 非空 ⇒ 种子的 ②整段被跳过
+    #    （"三张表各自独立判断是不是空的"）⇒ **只有 `aiops-datasource` 在库里**，
+    #    绑到别的 server 的 agent（如 `deployer → deploy-ops`）**会被正确地跳过**。
+    #    所以判据要按"那台 server 在不在库里"分两种，不能一概断言"每个绑定都有行"。
+    for agent, names in bound.items():
+        present = [n for n in names if n in servers]
+        if not present:
+            assert agent not in rows, (
+                f"{agent} 绑的 server 一个都不在库里，不该有绑定行（应被跳过并记 warning）"
+            )
+            continue
         assert agent in rows, f"{agent} 的绑定行没播上"
-        assert rows[agent]["mcp_server_ids"] == [existing], (
-            f"{agent} 绑到了 {rows[agent]['mcp_server_ids']}，应为库里真实的 {existing!r}"
+        expected = [servers[n] for n in present]
+        assert rows[agent]["mcp_server_ids"] == expected, (
+            f"{agent} 绑到了 {rows[agent]['mcp_server_ids']}，应为库里真实的 {expected}"
         )
+
+    # ② **同名冲突那一路**（本用例的原始动因）：租户已有同名 server 时，种子的插入被
+    #    `ON CONFLICT` 吞掉 —— 此时必须按名读回**库里那条**的 id，否则就绑到一个不存在的 server，
+    #    症状是静默零工具。
+    for agent, names in bound.items():
+        if "aiops-datasource" in names:
+            assert rows[agent]["mcp_server_ids"] == [existing], (
+                f"{agent} 绑到了 {rows[agent]['mcp_server_ids']}，应为库里真实的 {existing!r}"
+            )
     # 自定义 agent **故意不在**这条断言里：它们目前不绑任何 server（没有出站工具可绑），
     # 播出来的 `mcp_server_ids` 是 None —— 那不等于"播漏了"，见 seed/agents/*.yaml
 

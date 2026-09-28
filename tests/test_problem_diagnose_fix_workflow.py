@@ -90,6 +90,9 @@ OK_OUTPUTS: dict[str, dict] = {
     "ci": {"built": True, "image_built": True, "image_tag": "order-service:d34db33f0000",
            "artifact": "build/libs/order-service-0.0.1-SNAPSHOT.jar", "artifact_bytes": 35285684,
            "merge_commit": "d34db33f"},
+    # deploy 的结论字段是 `deployed`（VERDICT_FIELDS）；observed_image 是从 pod 读回来的
+    "deploy": {"deployed": True, "image_tag": "order-service:d34db33f0000",
+               "observed_image": "order-service:d34db33f0000", "pod": "order-service-x-y", "stage": ""},
     "ticket-done": {"payload": {"ticket_id": "PR-0007", "status": "resolved", "description": "已修复"}, "delivered": True, "note": ""},
     "recap": {"summary": "已闭环", "root_cause": "空值未校验", "actions": ["修复并提交 PR"], "followups": []},
 }
@@ -134,7 +137,7 @@ def test_workflow_loads_with_exactly_the_expected_nodes() -> None:
     dag = load().dag
     assert set(dag.nodes) == {
         "plan", PLAN_GATE, "fix", "remediate", "test", "review",
-        COMMIT_GATE, "commit", "merge", "ci", DEPLOY_GATE, "ticket-done", "recap",
+        COMMIT_GATE, "commit", "merge", "ci", DEPLOY_GATE, "deploy", "ticket-done", "recap",
     }
     assert dag.nodes[PLAN_GATE].is_approval
     assert dag.nodes[COMMIT_GATE].is_approval
@@ -264,6 +267,29 @@ def test_ci_takes_the_merge_commit_and_builds_before_reporting() -> None:
     assert [e.source for e in load().dag.nodes["ci"].in_edges] == ["merge"]
 
 
+def test_deploy_takes_the_approved_image_and_gates_the_report() -> None:
+    """`deploy` 的输入是 **ci 产出的镜像 tag**（人工门批过的那个），且 `image_tag` 是硬前置。
+
+    - **取自 `ci` 而不是 `merge`**：镜像 tag 是 `ci` 算出来的（`<svc>:<主干 sha12>`），
+      `approve-deploy` 批的就是它。取 `merge` 拿不到 tag。
+    - **必须有值**（`require`）：解析成 None 时工具会拿一个空字符串去滚 —— 而
+      "滚了一个空镜像"这件事在集群上的表现要晚得多才现形。
+    - **`on_failure: abort`**：滚不上去就不该走到 `ticket-done` 去报「已解决」。
+    - 回报挂在它之后、且带 `deployed == true` 的条件：**滚到线上才算交付**。
+    """
+    dag = load().dag
+    node = dag.nodes["deploy"]
+    assert node.agent == "deployer"
+    assert node.params["image_tag"] == "$.nodes.ci.output.image_tag"
+    assert node.params["ci"] == "$.nodes.ci.output"
+    assert set(node.require) == {"service", "image_tag"}
+    assert node.on_failure == "abort"
+    assert [e.source for e in node.in_edges] == [DEPLOY_GATE]
+    assert [(e.target, e.when) for e in dag.edges if e.source == "deploy"] == [
+        ("ticket-done", "$.nodes.deploy.output.deployed == true")
+    ]
+
+
 def test_ticket_done_sits_on_the_success_path_only() -> None:
     """工单回传挂在 `… → merge → ci → ticket-done → recap` 上：**只有真的交付了才回传**。
 
@@ -280,7 +306,7 @@ def test_ticket_done_sits_on_the_success_path_only() -> None:
     | `ci` ✅ | 编译打包 + 构建镜像都成了，`image_tag` 在手 —— 这才叫交付 |
     """
     dag = load().dag
-    assert [e.source for e in dag.nodes["ticket-done"].in_edges] == [DEPLOY_GATE]
+    assert [e.source for e in dag.nodes["ticket-done"].in_edges] == ["deploy"]
     assert [e.target for e in dag.edges if e.source == "ticket-done"] == ["recap"]
     assert dag.nodes["ticket-done"].on_failure == "abort"
 
@@ -335,7 +361,7 @@ def test_deploy_gate_aborts_and_has_no_reject_edge() -> None:
     assert node.is_approval
     assert node.on_reject == "abort"
     assert [(e.target, e.when) for e in dag.edges if e.source == DEPLOY_GATE] == [
-        ("ticket-done", f"$.nodes.{DEPLOY_GATE}.output.approved == true")
+        ("deploy", f"$.nodes.{DEPLOY_GATE}.output.approved == true")
     ]
     assert [(e.source, e.when) for e in dag.edges if e.target == DEPLOY_GATE] == [
         ("ci", "$.nodes.ci.output.built == true")

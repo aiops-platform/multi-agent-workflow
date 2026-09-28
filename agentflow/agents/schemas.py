@@ -418,6 +418,25 @@ BuildResultSchema = {
     "required": ["built", "image_tag"],
 }
 
+DeployResultSchema = {
+    "type": "object",
+    "properties": {
+        #: **结论字段**（进 `VERDICT_FIELDS`）：真的滚上去了才是 true。
+        "deployed": {"type": "boolean"},
+        "image_tag": {"type": "string"},
+        "namespace": {"type": "string"},
+        "deployment": {"type": "string"},
+        "pod": {"type": "string"},
+        #: **从 pod 上读回来**的镜像 —— "真的滚上去了"的唯一凭据
+        #: （`image_tag` 只是我们**要求**的值）。
+        "observed_image": {"type": "string"},
+        #: 失败时卡在哪一步：image_load / set_image / rollout_status / read_back
+        "stage": {"type": "string"},
+        "summary": {"type": "string"},
+    },
+    "required": ["deployed"],
+}
+
 PostmortemSchema = {
     "type": "object",
     "properties": {
