@@ -13,10 +13,14 @@
 source: agentflow-otr
 exported_at: "2026-09-18"
 note: |
-  前两条（scenario1 / scenario2）从参考租户 agentflow-otr 原样导出（与库内**逐字节相同**）。
+  前两条（scenario1 / scenario2）从参考租户 agentflow-otr 原样导出。
   导出时已核对：
   · agent 名全部在内置注册表（DIAGNOSE_AGENTS ∪ FIX_AGENTS），不依赖任何自定义 agent；
   · YAML 正文不含 URL / 端口 / 本机路径等环境绑定，只有 name 标签与注释里提到服务名。
+  ⚠️ **"与库内逐字节相同"这句话对 scenario2 已经不再成立**（2026-09-28）：它在仓库里
+     演进过一次——`commit` 之后补了发布链（merge → ci → approve-deploy → deploy →
+     verify-deploy），收尾节点从 `commit` 挪到了 `verify-deploy` 之后。scenario1 仍是导出副本。
+     **判断某份 YAML 与库内是否一致，不要靠这句话，去 `make sync-workflows DRY=1` 看。**
   ⚠️ scenario1 独有的 `remediate`（K8s 止血）分支目前**只产计划、不执行**——
      ActionExecutor 的接线在 agentflow 侧尚未打通（见 docs/TODO.md）。
      别以为新租户拿它能真止血。

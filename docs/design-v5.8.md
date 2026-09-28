@@ -1459,6 +1459,45 @@ plan → 计划门 → fix → remediate → test → review → 提交门 → c
 服务来源，缺了必须失败（`docs/TODO.md` §20：工作区默认全量准备，service 猜错静默通过）；
 `ticket-done` 仍只挂在 `commit` 之后（成功路径），所以测试没过 / 审批驳回那几条路**不回传工单**。
 
+### 4.16 补记（2026-09-28）：`bug-fix-scenario2` 也补上发布链 —— 失败段的两份副本
+
+§4.15 那条发布链（`merge → ci → approve-deploy → deploy → verify-deploy`）先落在
+`problem-diagnose-fix` 上（理由与取舍见 `RELEASE_CHAIN_PLAN_zh-CN.md` 的 D1–D7）。
+本次把**同一条链**搬到 `bug-fix-scenario2` —— 它与前者是**同一条修复段的两个副本**，
+差别只在有没有自带诊断链。
+
+```
+改前: … → review → 提交门 → commit → ticket-closed → recap
+改后: … → review → 提交门 → commit → merge → ci → 发布门 → deploy → verify-deploy
+                              → ticket-closed → recap
+```
+
+**收尾节点的入边从 `commit` 挪到了 `verify-deploy`**，判据与 §4.15 那条同源：
+**收尾的判据是"有没有真的交付"，不是"流程跑到哪了"**。挂在 `commit` 上时它只证明
+"PR 开出来了"——后面合并/构建/部署/冒烟四步全没发生也照样宣布"处理流程走完了"。
+现在前面每一环都被一份**能证伪**的证据兜着（`merged` / `built` / `deployed` / `passed`
+任一为 `false` ⇒ 节点判红、整条 run failed）。
+
+**两份副本刻意的差异只有两处**，改一份时看另一份：
+
+| | `problem-diagnose-fix` | `bug-fix-scenario2` |
+|---|---|---|
+| `service` 来源 | `$.inputs.bug_report.cmdb_ci.name`（无诊断链，工单 CI 是唯一来源） | `$.nodes.locate.output.service`（`code-locator` 定出来的） |
+| 链尾接谁 | `ticket-done`（APM 主路径要回传原系统） | `ticket-closed`（`kind: closed`，本流程不回传） |
+
+> ⚠️ **最容易抄错的是第一行**：照抄 `cmdb_ci.name` 会让 5 个节点在真实工单上
+> **全线 fail-fast**（本仓实测工单的 `cmdb_ci` 只有 `{name, service}`，而本图的入口
+> 工单连 `cmdb_ci` 都不保证有）。而单测的 INPUTS 若也照抄一份 `cmdb_ci`，
+> **两边一起错、测试照样绿** —— `tests/test_scenario2_bug_fix_workflow.py` 里那条
+> "service 只能取自 locate"的用例就是为这个形态写的。
+
+**同步范围**：workflow 的真源是数据库（§6.0）⇒ 改了种子要对已开通租户
+`make sync-workflows TENANT=<id>`。本次**只推 `otr`**：`local` / `default` 两个租户的
+`mcp_servers` 里没有 `deploy-ops`（`deployer` / `smoke-tester` 会**零工具**，症状是
+"未输出合法 JSON"、中间没有任何一步说"绑定缺失"），且推全量会顺手把那两个库里
+`problem-diagnose-fix` 的**入参契约**一起改掉（顶层 `inputs.rca` → `inputs.bug_report.diagnosis`）
+—— 那是一次契约变更，不是例行同步。
+
 ---
 
 ## 5. 编排层：动态编排 🟡 未实施（设计稿）

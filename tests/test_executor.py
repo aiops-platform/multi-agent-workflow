@@ -1524,6 +1524,12 @@ def test_scenario_workflows_end_with_closed_not_ticket_done() -> None:
     **那不是投递坏了，是我们不该把一张没有上游的单送去投递口。**
 
     `problem-diagnose-fix` **保留** `ticket-done`（APM 主路径的回传走它），故只断言这两张。
+
+    ⚠️ 断言的是"**收尾在链尾**"而不是某个具体的前驱：scenario2 在 2026-09-28 补了发布链，
+    它的前驱从 `commit` 变成了 `verify-deploy`。把它钉死在 `commit` 上，加发布链时这条
+    会红——而红是对的（旧位置确实是错的：`commit` 只证明 PR 开出来了，后面四步全没发生
+    也照样宣布"走完了"）。但**判据本身**（是 `closed` 不是 `ticket-done`、且后面只接
+    `recap`）不随链长短变化，所以这里按判据写。
     """
     from agentflow.seed import load_workflow_seeds
 
@@ -1532,9 +1538,18 @@ def test_scenario_workflows_end_with_closed_not_ticket_done() -> None:
         dag = dags[name]
         assert dag.nodes["ticket-closed"].is_closed
         assert not [n for n in dag.nodes.values() if n.agent == "ticket-done"], name
-        # 位置不变：commit → ticket-closed → recap
-        assert [e.target for e in dag.edges if e.source == "commit"] == ["ticket-closed"]
+        # 收尾是链尾：没有出边指向它该继续往下走的地方，且它自己只接 recap
         assert [e.target for e in dag.edges if e.source == "ticket-closed"] == ["recap"]
+        assert dag.nodes["ticket-closed"].in_edges, f"{name} 的 ticket-closed 成了孤岛"
+
+    # 分发到收尾的那个节点：scenario1 仍是 commit（没有发布链），scenario2 已是 verify-deploy。
+    # 这条是**有意钉住的差异**——两张图不再对称，别把它们"对齐"回去。
+    assert [e.target for e in dags["order-service-quotation-print-fail"].edges if e.source == "commit"] == [
+        "ticket-closed"
+    ]
+    assert [e.target for e in dags["bug-fix-scenario2"].edges if e.source == "verify-deploy"] == [
+        "ticket-closed"
+    ]
 
     # 保留项：APM 主路径那条图仍靠 ticket-done 回传
     assert dags["problem-diagnose-fix"].nodes["ticket-done"].agent == "ticket-done"

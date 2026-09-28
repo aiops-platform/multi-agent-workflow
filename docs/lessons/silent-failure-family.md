@@ -24,7 +24,26 @@
   `$.nodes.X.output.summary` → "这一路挂了"在下游眼里变成"这一路什么都没说"。
 - **`params` 引用不存在的字段**：`recap` 写 `$.nodes.commit.status`，而 `CommitSchema`
   无 `status` → 恒 `null`，"提交成没成"从未到达复盘 agent。**这种引用不报错、不加载失败**。
-  已加测试 `test_seed_params_reference_real_schema_fields` 全量兜住种子里所有引用。
+  已加测试 `test_seed_params_reference_real_schema_fields` 兜住种子里所有引用。
+  ⚠️ **但它只核路径的第一段**
+  （`head = field.split(".")[0].split("[")[0]`，`tests/test_seed_defaults.py:157`），
+  所以**嵌套引用它是放行的**：
+
+  | 写错法 | 那张通用网 | 靠什么抓 |
+  |---|---|---|
+  | `$.nodes.X.output.nosuchfield` | ✅ 红（首段不在 schema 里） | — |
+  | `$.nodes.plan.output.verificationProbe`（**层数对、叶子拼错**） | ❌ **放行**（首段 `plan` 合法） | 只能靠各 workflow 测试里的**整串精确断言** |
+
+  第二条**实测过**（2026-09-28，变异验证）：改坏后 `test_seed_defaults` 14 passed 放行，
+  而值恒解析成 `None`、run 照样绿。
+  **现状**：全仓 146 条 params 引用里嵌套的只有 **2 条**（都是
+  `$.nodes.plan.output.plan.verification_probe`，两份副本各一条），两条都已由各自
+  workflow 测试的整串断言钉住——`test_verify_deploy_probes_what_was_just_rolled_and_gates_the_report`
+  与 `test_verify_deploy_takes_the_business_probe_from_plan_and_walks_the_nested_path`
+  （**按用例名 grep，别按行号**：行号会漂）——**所以现在没有活着的洞**。
+  **触发条件**：出现第 3 条嵌套引用，或上面那两条断言被删 → 那时把通用网改成**逐层**核
+  （注意 `verification_probe` 的 `type` 是 `["object","null"]`，list 型要能处理，
+  否则会给所有 workflow 假红）。
 - **`join` 默认 `any` 导致的多入边节点过早调度**（踩过两次：`locate`、`rca`）：
   `rca` 因此**从来没拿到过五维取证摘要**（`docs/TODO.md` §19）。
   **判据：入边是不是都"同一批产出"？是就 `join: all` + `required_edges`。**
