@@ -1,4 +1,4 @@
-# ===== Problem Center 修复工作流：诊断结论 → 计划 → 修复+止血 → 测试 → 审查 → 提交 → 合并 → CI → 发布门 → 部署 → 工单回传 =====
+# ===== Problem Center 修复工作流：诊断结论 → 计划 → 修复+止血 → 测试 → 审查 → 提交 → 合并 → CI → 发布门 → 部署 → 部署后验证 → 工单回传 =====
 #
 # 由 bug-fix-scenario2 **简化**而来：诊断段
 # （triage / scope / logs / trace / metrics / infra / locate / know / rca + halt）**整段去掉**，
@@ -19,7 +19,7 @@
 # 而本图**一个取数节点都没有**——没有工具会读它，声明了只是摆设。
 name: problem-diagnose-fix
 version: "1.0.0"
-description: "Problem Center 修复闭环：诊断结论（rca）→ 修复计划 → 计划门 → 代码修复 + K8s 止血 → 测试/审查 → 提交门 → PR → 合并主干 → 编译打包+构建镜像 → 发布门 → 部署 → 工单回传"
+description: "Problem Center 修复闭环：诊断结论（rca）→ 修复计划 → 计划门 → 代码修复 + K8s 止血 → 测试/审查 → 提交门 → PR → 合并主干 → 编译打包+构建镜像 → 发布门 → 部署 → 部署后冒烟验证 → 工单回传"
 
 inputs:
   bug_report:
@@ -281,10 +281,50 @@ nodes:
       service: "$.inputs.bug_report.cmdb_ci.name"
     on_failure: abort
 
+  # ===== 部署后验证（本图最后一道关）=====
+  # 前面所有节点只证明"东西备好了 / 滚上去了"，**只有它回答「跑起来真的能响应吗」**。
+  # 它同时压在 `ticket-done` 之前 —— 冒烟没过就不该回传「已解决」。
+  #
+  # ── **探针不由人配**（本节点唯一需要解释的地方）──
+  #   · 健康层（路径 + 端口）→ 从 **Deployment 自己声明的 HTTP 探针**读
+  #     （`readinessProbe` → 退 `livenessProbe` → 退 `startupProbe`；本机 order-service
+  #     只声明了 livenessProbe，实测就是靠这条回退链读到的）。
+  #     那句探针的语义**就是**"这容器能不能接流量"，与冒烟同义；平台再抄一份
+  #     （早期那版是让人在 `DEPLOY_OPS_TARGETS` 里写 port/probes）= **第二个真源**，必然漂移。
+  #   · 业务层（这次故障打到的那条链路）→ 由本图 `plan` 节点产出（`plan.verification_probe`）。
+  #     它拿的是工单里那份诊断，且**最接近"这次改了什么"**。
+  #     ⚠️ 那条路径**只能取自入参**（工单/rca 里出现过的接口），三条约束见 fix-planner 的提示词。
+  #
+  # 工具**全部来自 MCP server `deploy-ops`**（与 `deploy` 同因：集群细节与凭证留在集群侧），
+  # 且都是只读的 —— 所以它**不进** `SIDE_EFFECT_AGENTS`，重跑不产生外部可见变化。
+  #
+  # ⚠️ 它**只探正在跑 `image_tag` 的那个 pod**：打旧 pod 得到的 200 什么都不证明。
+  #    "探到旧 pod"不是理论风险 —— 本机 testbed 的启动脚本起了 7 个 `svc/` 的
+  #    port-forward，其中 order-service 那个（18080）在滚动换过 pod 之后实测**打不通**
+  #    （`curl` 0.011s 失败）：进程还在、服务名没变，**只有 pod 换了**。
+  # 判据是**期望码的精确比对**（不放宽到 2xx）：`passed: false` 进 VERDICT_FIELDS ⇒
+  #    节点判红 ⇒ run failed ⇒ **工单不回传**（同 `deploy.deployed`）。
+  # `probe` 解析不出来（计划判定这次没有可探的 HTTP 链路）是**合法**的：只探健康层、
+  #    输出带 `coverage: health_only`、**不判红** —— CPU 打满那类故障本就该用指标/日志验，
+  #    那是另一个手段的事。但"这次没验业务链路"必须**可见**：红只会让人去关掉它，可见才会让人去看。
+  verify-deploy:
+    agent: smoke-tester
+    description: "部署后冒烟：对刚滚上去的那个 pod 打探针（健康层 + 业务链路）"
+    require: [service, image_tag]
+    params:
+      image_tag: "$.nodes.ci.output.image_tag"
+      deploy: "$.nodes.deploy.output"
+      # 业务探针**整条**从 plan 来（可能为 null ⇒ 只探健康层，见上）。
+      # ⚠️ 路径要跟着 `FixPlanSchema` 的实际嵌套走：`{"plan": {…, "verification_probe": …}}`
+      #    （实测 run_491af83270 的 plan 输出确实是这个形状，不是平铺的）。
+      probe: "$.nodes.plan.output.plan.verification_probe"
+      service: "$.inputs.bug_report.cmdb_ci.name"
+    on_failure: abort
+
   # ===== 回传原系统（工单闭环）=====
-  # ⚠️ 位置决定覆盖范围：它**只在成功路径上**（ci 之后）。test / review / 审批驳回
-  # 那几条边直接到 recap，不经过这里 —— 那些情况工单不会被回传。要让"修复没走完"也回传，
-  # 得把它挪到 recap 之前的分叉点，或另加并行边（与 scenario1/2 同款、同取舍）。
+  # ⚠️ 位置决定覆盖范围：它**只在成功路径上**（`verify-deploy` 之后）。test / review /
+  # 审批驳回那几条边直接到 recap，不经过这里 —— 那些情况工单不会被回传。要让"修复没走完"
+  # 也回传，得把它挪到 recap 之前的分叉点，或另加并行边（与 scenario1/2 同款、同取舍）。
   #
   # on_failure 用 abort：回传失败必须让 run 失败。工单闭环是对外承诺，静默吞掉等于
   # "界面看着成功、原系统那边什么都没收到"（`delivered` 由 VERDICT_FIELDS 判红兜一层）。
@@ -304,9 +344,14 @@ nodes:
       # ci 的整个输出：有 image_tag ⇒ 产物可部署了。没有它，下游只知道"合了"，
       # 不知道"能不能发"。
       ci: "$.nodes.ci.output"
-      # deploy 的整个输出：有 `deployed: true` ⇒ **真的滚到线上了**。这是"已解决"
-      # 最硬的一份凭据（前面几个节点都只证明"东西备好了"）。
+      # deploy 的整个输出：有 `deployed: true` ⇒ **真的滚到线上了**（前面几个节点
+      # 都只证明"东西备好了"）。
       deploy: "$.nodes.deploy.output"
+      # verify-deploy 的整个输出：有 `passed: true` ⇒ **滚上去之后真的验过了**。
+      # 这是"已解决"最硬的一份凭据 —— `deploy` 只证明滚上去了，不证明它跑得起来；
+      # 而 `coverage` 要一起带上：`health_only` 意味着**这次没验业务链路**
+      # （合法，但回传时不能让人以为验过了）。
+      verify: "$.nodes.verify-deploy.output"
     on_failure: abort
 
   recap:
@@ -327,6 +372,9 @@ nodes:
       ci: "$.nodes.ci.output"
       # 有 `deployed: true` ⇒ 已经到线上了。复盘要能说出"这次改动到底上没上"。
       deploy: "$.nodes.deploy.output"
+      # 有 `passed: true` / `coverage: business|health_only` ⇒ **上线后验没验、验到哪一层**。
+      # 复盘要能说出"这次交付**证伪过**吗"——`deployed` 只说明滚上去了。
+      verify: "$.nodes.verify-deploy.output"
 
 edges:
   # 计划门：plan **不直达** fix —— 中间必须有人工决策点（见 approve-plan 上的说明）。
@@ -349,17 +397,20 @@ edges:
   - { from: approve-commit, to: commit, when: "$.nodes.approve-commit.output.approved == true" }
   - { from: approve-commit, to: recap, when: "$.nodes.approve-commit.output.approved == false" }
 
-  # 提交 → 合并 → CI → 发布门 → 部署 → 回传 → 复盘。
-  # ⚠️ 这条链**改过两次入边，两次都是往右挪一格**，判据同一条 ——
-  #    回传的判据是"有没有可交付的物"，不是"流程跑到哪了"：
-  #      `commit`  只开 PR，改动没进主干
-  #      `merge`   进了主干，但还没有可部署的产物
-  #      `ci`      产物出来了，但**没人批准发布**
-  #      → 挂 `approve-deploy`：人批过才叫交付；
-  #      → 再挂 `deploy`（2026-09-28）：**滚到线上才算**。
+  # 提交 → 合并 → CI → 发布门 → 部署 → 验证 → 回传 → 复盘。
+  # ⚠️ `ticket-done` 的入边**改过五次，每次都是往右挪一格**（`git log` 逐版可查：
+  #    `commit` → `merge` → `ci` → `approve-deploy` → `deploy` → `verify-deploy`），
+  #    判据始终是同一条 —— **回传的判据是"有没有真的交付"，不是"流程跑到哪了"**：
+  #      `commit`        只开 PR，改动没进主干
+  #      `merge`         进了主干，但还没有可部署的产物
+  #      `ci`            产物出来了，但**没人批准发布**
+  #      `approve-deploy` 人批过了，但**集群上还什么都没发生**
+  #      `deploy`        滚上去了，但**它跑不跑得起来没人问过**
+  #      `verify-deploy` 冒烟过了 ⇒ 前面每一环都被一份**能证伪**的证据兜住
   - { from: commit, to: merge }
   - { from: merge, to: ci }
   - { from: ci, to: approve-deploy, when: "$.nodes.ci.output.built == true" }
   - { from: approve-deploy, to: deploy, when: "$.nodes.approve-deploy.output.approved == true" }
-  - { from: deploy, to: ticket-done, when: "$.nodes.deploy.output.deployed == true" }
+  - { from: deploy, to: verify-deploy, when: "$.nodes.deploy.output.deployed == true" }
+  - { from: verify-deploy, to: ticket-done, when: "$.nodes.verify-deploy.output.passed == true" }
   - { from: ticket-done, to: recap }

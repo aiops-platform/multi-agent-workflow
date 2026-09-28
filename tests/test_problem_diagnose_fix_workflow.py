@@ -18,9 +18,10 @@
    ⚠️ `approve-deploy` 为什么跟 `approve-commit` 不同：走到它时 **PR 已合、主干已动**，
    用 `continue` + 驳回边 → recap 会让 run **判 done（绿）**而工单永远停在"处理中" ——
    正是本仓那句「绿着一条没交付的 run 比红着更危险」。详见该节点的 YAML 注释。
-5. **`ticket-done` 只在成功路径上**——它的入边**改过两次，两次都往右挪一格**
-   （`commit` → `merge` → `ci` → `approve-deploy`），判据始终是同一条：
-   **回传的判据是"有没有可交付的物"，不是"流程跑到哪了"**。
+5. **`ticket-done` 只在成功路径上**——它的入边**改过五次，每次都是往右挪一格**
+   （`commit` → `merge` → `ci` → `approve-deploy` → `deploy` → `verify-deploy`，
+   `git log` 逐版可查），判据始终是同一条：
+   **回传的判据是"有没有真的交付"，不是"流程跑到哪了"**。
    位置错了的后果不是报错，而是"测试没过 / 审批驳回"那几条路**也不再回传工单**
    （或反过来重复回传）。
 6. **`merge` 的输入取自 `commit` 的输出且必须有值**——`require: [service, pr_url]`。
@@ -48,6 +49,7 @@ SEED_ID = "seed-problem-diagnose-fix"
 PLAN_GATE = "approve-plan"
 COMMIT_GATE = "approve-commit"
 DEPLOY_GATE = "approve-deploy"
+VERIFY_NODE = "verify-deploy"
 
 INPUTS = {
     "bug_report": {
@@ -77,8 +79,20 @@ INPUTS = {
 #: 默认 mock 输出 `{"node": ..., "ok": True}` 里没有 `passed` / `approved` / `delivered`，
 #: 而 `when: $.nodes.test.output.passed == true` 之类的边取不到字段即不满足 ——
 #: 条件边会静默走成"不通过"，测试于是测的是一条别的路径。
+#: `plan` 节点产出的业务探针（`FixPlanSchema.plan.verification_probe`）。
+#: 形状取自 order-service 那次真实故障：`/quotation?orderId=ORD001` 故障态 500 → 修复后 200。
+PROBE_FIXTURE = {"path": "/quotation?orderId=ORD001", "expect": 200, "broken_expect": 500}
+
 OK_OUTPUTS: dict[str, dict] = {
-    "plan": {"summary": "补空值校验", "steps": [{"type": "code_fix", "target": "QuotationService.java"}]},
+    # ⚠️ **形状照 `FixPlanSchema` 来（`{"plan": {…}}` 嵌套），不是平铺的。**
+    # 实测 run_491af83270（otr，2026-09-28）的 plan 节点输出就是这个嵌套形。
+    # 这里平铺过一次，代价是 `verify-deploy` 的 `probe` 入参路径**无论如何都写得"对"**——
+    # 因为测试里没有那条路径可解析。fixture 与真源的形状一致，那条断言才有意义。
+    "plan": {"plan": {
+        "summary": "补空值校验",
+        "steps": [{"type": "code_fix", "target": "QuotationService.java"}],
+        "verification_probe": PROBE_FIXTURE,
+    }},
     "fix": {"diff": "--- a/QuotationService.java\n+++ b/QuotationService.java\n", "files_changed": ["QuotationService.java"], "explanation": "加空值校验"},
     "remediate": {"changes": [{"action": "restart_pod", "namespace": "order", "params": {}}]},
     "test": {"passed": True, "tests_run": 12, "failed": []},
@@ -93,6 +107,12 @@ OK_OUTPUTS: dict[str, dict] = {
     # deploy 的结论字段是 `deployed`（VERDICT_FIELDS）；observed_image 是从 pod 读回来的
     "deploy": {"deployed": True, "image_tag": "order-service:d34db33f0000",
                "observed_image": "order-service:d34db33f0000", "pod": "order-service-x-y", "stage": ""},
+    # verify-deploy 的结论字段是 `passed`（VERDICT_FIELDS）；`coverage` 说明验到哪一层
+    "verify-deploy": {"passed": True, "coverage": "business", "pod": "order-service-x-y",
+                      "observed_image": "order-service:d34db33f0000",
+                      "probes": [{"path": "/actuator/health", "status": 200, "ok": True},
+                                 {"path": "/quotation?orderId=ORD001", "status": 200, "ok": True}],
+                      "failed": [], "summary": "2/2 探针通过（业务链路已验）"},
     "ticket-done": {"payload": {"ticket_id": "PR-0007", "status": "resolved", "description": "已修复"}, "delivered": True, "note": ""},
     "recap": {"summary": "已闭环", "root_cause": "空值未校验", "actions": ["修复并提交 PR"], "followups": []},
 }
@@ -137,7 +157,7 @@ def test_workflow_loads_with_exactly_the_expected_nodes() -> None:
     dag = load().dag
     assert set(dag.nodes) == {
         "plan", PLAN_GATE, "fix", "remediate", "test", "review",
-        COMMIT_GATE, "commit", "merge", "ci", DEPLOY_GATE, "deploy", "ticket-done", "recap",
+        COMMIT_GATE, "commit", "merge", "ci", DEPLOY_GATE, "deploy", VERIFY_NODE, "ticket-done", "recap",
     }
     assert dag.nodes[PLAN_GATE].is_approval
     assert dag.nodes[COMMIT_GATE].is_approval
@@ -263,7 +283,7 @@ def test_ci_takes_the_merge_commit_and_builds_before_reporting() -> None:
     assert node.params["merge"] == "$.nodes.merge.output"
     assert set(node.require) == {"service", "merge_commit"}
     assert node.on_failure == "abort"
-    # 回传挂在 CI 之后：只有"编译打包 + 构建镜像"都成了，才算有可交付的物
+    # ci 的入边是 merge：产物必须来自"主干上的那份代码"，不能来自工作区
     assert [e.source for e in load().dag.nodes["ci"].in_edges] == ["merge"]
 
 
@@ -285,30 +305,68 @@ def test_deploy_takes_the_approved_image_and_gates_the_report() -> None:
     assert set(node.require) == {"service", "image_tag"}
     assert node.on_failure == "abort"
     assert [e.source for e in node.in_edges] == [DEPLOY_GATE]
+    # 滚完了**不直接回传**：先过 `verify-deploy`（见下一条用例）
     assert [(e.target, e.when) for e in dag.edges if e.source == "deploy"] == [
-        ("ticket-done", "$.nodes.deploy.output.deployed == true")
+        (VERIFY_NODE, "$.nodes.deploy.output.deployed == true")
     ]
 
 
+def test_verify_deploy_probes_what_was_just_rolled_and_gates_the_report() -> None:
+    """`verify-deploy` 是**回传之前最后一道关**：滚上去了 ≠ 跑得起来。
+
+    四件事一起锁，它们各自坏掉都不会报错：
+
+    - **结论字段进判红路径**：出边带 `passed == true`，且 `passed` 在
+      `VERDICT_FIELDS`（见 test_executor 的映射表参数化用例）⇒ 冒烟不过 = 节点红
+      ⇒ run failed ⇒ **工单不回传**。
+    - **业务探针来自 `plan`，不由人配**：`$.nodes.plan.output.plan.verification_probe`。
+      路径要跟着 `FixPlanSchema` 的**实际嵌套**走（`{"plan": {…}}`）——写平铺的话
+      `_walk` 遇失配键返回 None，探针**静默消失**、只剩健康层，run 照样绿。
+    - **`image_tag` 是硬前置（require）**：解不出来时工具会拿空串去比 "哪个 pod 在跑这个镜像"，
+      结果是 `pod_not_found` —— 能报错，但错得离原因很远。
+    - **只读**：它不进 `SIDE_EFFECT_AGENTS`（重跑没有外部可见变化），但**在** `VERDICT_FIELDS`
+      （它答的是"成没成"，不是"做了没有"）。
+    """
+    from agentflow.executor.dag_executor import SIDE_EFFECT_AGENTS
+
+    dag = load().dag
+    node = dag.nodes[VERIFY_NODE]
+    assert node.agent == "smoke-tester"
+    assert node.params["probe"] == "$.nodes.plan.output.plan.verification_probe"
+    assert node.params["image_tag"] == "$.nodes.ci.output.image_tag"
+    assert set(node.require) == {"service", "image_tag"}
+    assert node.on_failure == "abort"
+    assert [e.source for e in node.in_edges] == ["deploy"]
+    assert [(e.target, e.when) for e in dag.edges if e.source == VERIFY_NODE] == [
+        ("ticket-done", f"$.nodes.{VERIFY_NODE}.output.passed == true")
+    ]
+    assert node.agent not in SIDE_EFFECT_AGENTS
+
+
 def test_ticket_done_sits_on_the_success_path_only() -> None:
-    """工单回传挂在 `… → merge → ci → ticket-done → recap` 上：**只有真的交付了才回传**。
+    """工单回传挂在 `… → deploy → verify-deploy → ticket-done → recap` 上：**只有真的交付了才回传**。
 
     位置是这条节点唯一容易写错的地方（挪到 recap 前面就变成"连驳回也回传"，
     而回传是对外承诺 —— `delivered` 由 `VERDICT_FIELDS` 判红兜一层）。
 
-    这条入边**改过两次，两次都是往左挪一格**，理由同一条 —— 回传的判据是
-    "有没有可交付的物"，而不是"流程跑到哪了"：
+    这条入边**改过五次，每次都是往右挪一格**，理由同一条 —— 回传的判据是
+    "有没有**真的**交付"，而不是"流程跑到哪了"：
 
     | 挂在 | 为什么不够 |
     |---|---|
     | `commit` | 只把分支推出去、开一个 PR，改动**还没落到主干**。本仓 main 上曾堆着 8 个"开着但从没合过"的 PR |
     | `merge` | 改动到主干了，但**还没有可部署的产物**（没编译、没打镜像）—— 此时回传「已解决」，线上仍是旧的 |
-    | `ci` ✅ | 编译打包 + 构建镜像都成了，`image_tag` 在手 —— 这才叫交付 |
+    | `ci` | 编译打包 + 构建镜像都成了，`image_tag` 在手 —— 但**还没人批准发布** |
+    | `approve-deploy` | 人批过了 —— 但**集群上还什么都没发生**（产物还在本地） |
+    | `deploy` | 滚上去了 —— 但**它跑不跑得起来没人问过**：滚动没完成 / 被回滚了 / 探到另一个旧 pod，三种假绿都长得像交付 |
+    | `verify-deploy` ✅ | 冒烟过了 ⇒ 前面每一环都被一份**能证伪**的证据兜住，这才叫交付 |
     """
     dag = load().dag
-    assert [e.source for e in dag.nodes["ticket-done"].in_edges] == ["deploy"]
+    assert [e.source for e in dag.nodes["ticket-done"].in_edges] == [VERIFY_NODE]
     assert [e.target for e in dag.edges if e.source == "ticket-done"] == ["recap"]
     assert dag.nodes["ticket-done"].on_failure == "abort"
+    # 回传要能拿到"上线后验过没有、验到哪一层" —— 只有 `deploy` 是不够的
+    assert dag.nodes["ticket-done"].params["verify"] == f"$.nodes.{VERIFY_NODE}.output"
 
 
 def test_merge_takes_the_pr_from_commit_and_fails_fast_without_it() -> None:
@@ -430,11 +488,21 @@ async def test_happy_path_parks_at_three_gates_and_converges() -> None:
 
     await ex.approve(DEPLOY_GATE, approved=True, by="lead-engineer")
     assert await ex.run() == "done"
+    # 批完发布门之后**还要自己再跑一步**：`deploy → verify-deploy → ticket-done → recap`
+    assert ex.get_status(VERIFY_NODE) == DONE
     assert ex.get_status("ticket-done") == DONE
     assert ex.get_status("recap") == DONE
     assert ex.halt_triggered() is False
     # merge 真的收到了 commit 的 PR（不是 None，也不是空串）
     assert seen["merge"]["pr_url"].endswith("/pull/42")
+    # ⭐ 业务探针**真的从 plan 传到了 verify-deploy**（不是 None，也不是 dict 里的空壳）。
+    # 这条是"plan 产出 → 冒烟用上"这条链在单测里唯一的锚点：`$.nodes.plan.output.plan.
+    # verification_probe` 写平铺一层（或 fixture 写成平铺）时它都会拿到 None，
+    # 而那**不会报错** —— 工具只探健康层、`coverage: health_only`、run 照样绿。
+    assert seen[VERIFY_NODE]["probe"] == PROBE_FIXTURE
+    # 回传与复盘都拿得到 verify 的结果（`coverage` 要能一路带到工单描述与复盘里）
+    assert seen["ticket-done"]["verify"]["coverage"] == "business"
+    assert seen["recap"]["verify"]["passed"] is True
     # ⚠️ 审批节点**不走 runner**（`_process_approvals` 直接置 WAITING_APPROVAL），
     # 所以脚本化 runner 的 `seen` 里**不会有它** —— 这条断言把那个事实钉住：
     # 它同时也是"审批 params 从不解析"的根因（没人调 `resolve_params`）。
@@ -443,6 +511,77 @@ async def test_happy_path_parks_at_three_gates_and_converges() -> None:
     # 这条是 `$.nodes.commit.status` 那个恒空入参的同类锁（tests/test_seed_defaults.py
     # 的 test_seed_params_reference_real_schema_fields 只能核字段名，核不了"有没有值"）。
     assert seen["recap"]["commit"]["pr_url"].endswith("/pull/42")
+
+
+async def test_smoke_failure_blocks_the_ticket_callback() -> None:
+    """冒烟不过 ⇒ 节点判红 ⇒ run failed ⇒ **工单不回传**。
+
+    判红发生在 **executor 层**（`passed` 在 `VERDICT_FIELDS` 里），不在图的 `when` 上：
+    所以"测试没过照样绿"那种形态在这里不可能出现 —— 失败节点的出边**恒失活**，
+    `ticket-done` 连一次都不会跑。这也正是这个节点存在的理由：
+    `deploy` 只证明滚上去了，**它跑不跑得起来**没人问过。
+    """
+    outputs = {
+        **OK_OUTPUTS,
+        VERIFY_NODE: {
+            "passed": False, "coverage": "business", "pod": "order-service-x-y",
+            "probes": [{"path": "/actuator/health", "status": 200, "ok": True},
+                       {"path": "/quotation?orderId=ORD001", "status": 500, "ok": False,
+                        "why": "**这条路径还是坏的**：返回故障态的 500"}],
+            "failed": [{"path": "/quotation?orderId=ORD001", "status": 500}],
+            "summary": "1/2 探针通过",
+        },
+    }
+    seen: dict = {}
+    ex = build(outputs=outputs, seen=seen)
+    for gate in (PLAN_GATE, COMMIT_GATE, DEPLOY_GATE):
+        await ex.run()
+        await ex.approve(gate, approved=True, by="lead-engineer")
+
+    with pytest.raises(WorkflowNodeFailed) as ei:
+        await ex.run()
+    assert VERIFY_NODE in str(ei.value)
+    assert ex.get_status(VERIFY_NODE) == "failed"
+    # 判据是"回传的 agent 一次都没被调用"，不看状态名 —— 下游是 pending 还是 skipped
+    # 是 executor 的实现细节（失败中止 vs 驳回中止不一样），而"有没有发出去"才是要害。
+    assert "ticket-done" not in seen, "冒烟没过却回传了工单 —— 那是这条链上最坏的形态"
+    assert "recap" not in seen
+
+
+async def test_missing_business_probe_falls_back_to_health_only_and_stays_green() -> None:
+    """计划给不出业务探针 ⇒ 只探健康层、`coverage: health_only`、**run 照样绿**。
+
+    这条路径是**合法且常见**的（CPU 打满那类故障没有 HTTP 链路，修复是扩容不是改接口）。
+    它同时锁住"探针解析不出来时**不报错、不编造**"：
+    `probe` 不在 `require` 里，`_walk` 遇缺失键返回 None，agent 收到 null ⇒ 走健康层。
+
+    为什么不是红：**红只会制造噪声、让人去关掉它；可见会让人去看**（`coverage` 一路带到
+    回传描述与复盘里）。代价如实记：这次**确实没验业务链路**，那类故障该用指标/日志验 ——
+    那是另一个手段，不该由这个节点假装自己有。
+    """
+    outputs = {
+        **OK_OUTPUTS,
+        # 计划里没有 `verification_probe`（模型按提示词要求填了 null 的情形之一）
+        "plan": {"plan": {"summary": "扩容（无 HTTP 链路可探）",
+                          "steps": [{"type": "infra_action", "target": "order-service"}],
+                          "verification_probe": None}},
+        VERIFY_NODE: {**OK_OUTPUTS[VERIFY_NODE], "coverage": "health_only",
+                      "probes": [{"path": "/actuator/health", "status": 200, "ok": True}],
+                      "summary": "1/1 探针通过（**只验了存活，没验业务链路**）"},
+    }
+    seen: dict = {}
+    ex = build(outputs=outputs, seen=seen)
+    for gate in (PLAN_GATE, COMMIT_GATE, DEPLOY_GATE):
+        await ex.run()
+        await ex.approve(gate, approved=True, by="lead-engineer")
+    assert await ex.run() == "done"
+
+    assert seen[VERIFY_NODE]["probe"] is None          # 没有被"补"成一条编造的探针
+    assert ex.get_status(VERIFY_NODE) == DONE          # health_only **不判红**
+    assert ex.get_status("ticket-done") == DONE
+    # 但"这次没验业务链路"必须一路可见：回传与复盘都要读得到
+    assert seen["ticket-done"]["verify"]["coverage"] == "health_only"
+    assert seen["recap"]["verify"]["coverage"] == "health_only"
 
 
 async def test_plan_gate_reject_aborts_the_whole_run() -> None:
@@ -459,7 +598,7 @@ async def test_plan_gate_reject_aborts_the_whole_run() -> None:
     assert "approve-plan" in str(ei.value)
     assert ex.get_status(PLAN_GATE) == REJECTED
     assert ex.rejected_abort_node() == PLAN_GATE
-    for nid in ("fix", "remediate", "test", "review", COMMIT_GATE, "commit", "ticket-done"):
+    for nid in ("fix", "remediate", "test", "review", COMMIT_GATE, "commit", VERIFY_NODE, "ticket-done"):
         assert ex.get_status(nid) == SKIPPED, nid
 
 

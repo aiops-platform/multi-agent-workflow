@@ -206,6 +206,88 @@ def test_code_locator_prompt_has_budget_convergence_rule() -> None:
     assert "halt" in sp
 
 
+def test_fix_planner_declares_a_falsifiable_verification_probe() -> None:
+    """`fix-planner` 必须产出**可证伪**的部署后探针（`verification_probe`）—— 三条约束都得在。
+
+    为什么它是提示词契约而不是"随便加个字段"：交付链最后一步（`verify-deploy`）拿它去打冒烟，
+    而**探针的质量完全由这里决定**。没有这三条约束，这条路就退化成"让模型编一个 URL"：
+
+    1. **路径只能取自入参**（工单 / rca / plan 里**出现过**的接口）—— 同 `service-scoper`
+       那条已写死的判据「不要自己添加工具没返回的候选」。编出来的必然 404：**响亮地红，
+       但那是噪声**（它证明的不是"修复失败"，而是"提示词没约束住"）。
+    2. **`broken_expect` 必填且与 `expect` 不同** —— 把"这条探针有没有鉴别力"从**判断题**
+       变成**声明 + 校验**（相同 ⇒ 下游直接拒）。实测反例 `/quotation/exception`：
+       它看着最像"该探的"（故障注入入口、名字带 exception），但修复把它从裸 NPE 500
+       变成了**受控的业务异常 400** —— 那是修复的*设计语义*；配 `expect: 200` 会**永远红**。
+    3. **给不出就明确不给**（`null`）—— CPU 打满那类故障没有 HTTP 链路，静默退化成
+       `coverage: health_only` 是对的；**编一条**才是错的。
+    """
+    sp = SYSTEM_PROMPTS["fix-planner"]
+    assert "verification_probe" in sp
+    # ① 只取自入参
+    assert "路径只能取自入参" in sp
+    assert "不许自己造一条" in sp
+    # ② 两个码都要给、且必须不同（附反例，否则模型不会当回事 —— 与 reviewer/plan 同一手法）
+    assert "broken_expect" in sp
+    assert "必须给、且必须不同" in sp
+    # ③ 给不出就不给
+    assert "给不出就填" in sp
+    # ④ ⭐ **状态码真的要变** ——这条是实测踩出来的（2026-09-28 run_f2ce1b59c9）：
+    # 提示词里原先把 `/quotation/exception` 写成「修复把它从 500 变成了受控的 400」，
+    # 模型**照抄**这个例子产出 `expect: 400` —— 而实测那条路径修复前后**都是 500**
+    # （NPE → 受控 QuotationException，`GlobalExceptionHandler` 把两者都映射成 500；
+    # 不带参数时的 400 其实是 Spring 的「缺必填参数」）。后果是交付链**假红**。
+    # 所以提示词必须点破这类"只改日志签名/异常类型"的修复，并要求填 null。
+    assert "状态码要真的变" in sp
+    assert "只改了日志/异常类型" in sp
+    assert "需用日志验证" in sp
+
+    # schema 与提示词对齐：`null` 合法（D6），而三个字段在对象形态下**全必填**
+    probe = AGENT_SCHEMAS["fix-planner"]["properties"]["plan"]["properties"]["verification_probe"]
+    assert "null" in probe["type"], "verification_probe 必须允许 null（基础设施类故障没有 HTTP 链路）"
+    assert set(probe["properties"]) == {"path", "expect", "broken_expect"}
+    assert set(probe["required"]) == {"path", "expect", "broken_expect"}
+
+
+def test_smoke_tester_is_wired_into_the_verdict_path() -> None:
+    """`smoke-tester`（`verify-deploy` 的 agent）接线完整：注册表 / 提示词 / schema / 判红 四处齐。
+
+    这个 agent **本地零工具**（工具全在 MCP `deploy-ops`，绑定在 `seed/dataplane.yaml`），
+    所以这里只锁"代码里那四处"，绑定由 `tests/test_seed_defaults.py` 那一族守。
+
+    为什么单拎出来测：加一个 agent 要同时改 4 个地方，**漏一处都不报错**——
+    漏 `FIX_AGENTS` ⇒ `AGENT_REGISTRY` 里没有它（`get_agent_spec` KeyError 要到运行期才现形）；
+    漏 `AGENT_SCHEMAS` ⇒ agent 装配出的 schema 是空的（模型不知道要输出什么）；
+    漏 `VERDICT_FIELDS` ⇒ **冒烟不过也判绿**，这条链白加。
+    """
+    from agentflow.executor.dag_executor import SIDE_EFFECT_AGENTS, VERDICT_FIELDS
+
+    assert "smoke-tester" in FIX_AGENTS
+    assert AGENT_STAGES["smoke-tester"] == "verify"       # 与 tester/reviewer 同一段
+    assert AGENT_DESCRIPTIONS["smoke-tester"]
+    assert "smoke-tester" in SYSTEM_PROMPTS
+    assert "smoke-tester" in AGENT_SCHEMAS
+    # 结论字段与 schema 对齐（写错字段名 = 判红永不生效，且不会有任何报错）
+    field = VERDICT_FIELDS["smoke-tester"]
+    assert field in AGENT_SCHEMAS["smoke-tester"]["properties"]
+    assert field in AGENT_SCHEMAS["smoke-tester"]["required"]
+    # 只读（只发 GET）⇒ 不进副作用清单；但它在判红路径里（它答的是"成没成"）
+    assert "smoke-tester" not in SIDE_EFFECT_AGENTS
+
+    sp = SYSTEM_PROMPTS["smoke-tester"]
+    assert "deploy-ops" in sp
+    # 结论只能来自工具的真实返回，且 health_only 不许被说成"业务链路也验过了"
+    assert "只能来自工具的真实返回" in sp
+    # ⚠️ **工具报错也要判红**：出错的失败只活在工具的错误信息里，节点判红读的是 agent 的
+    # `passed` —— 不写这条就等于把"这次没验成"押在模型自觉上（fail-open）。
+    assert "工具报错时同样输出 `passed: false`" in sp
+    assert "pod_not_found" in sp and "deployment_probe_missing" in sp and "forward_failed" in sp
+    assert "不要因为它是 null 就自己造一条路径" in sp
+    assert "coverage: health_only" in sp
+    # 不重试、不回滚：一过性抖动与"服务真的起不来"混在一起，重试只会把后者洗成绿
+    assert "不要重试" in sp
+
+
 def test_resolve_custom_row_null_prompt_falls_back_to_canonical() -> None:
     """自定义行字段清空（NULL）→ 回退到 prompts.py 的 canonical 静态默认（非通用兜底提示）。"""
     rows = [

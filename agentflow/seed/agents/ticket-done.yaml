@@ -40,12 +40,19 @@ system_prompt: |
   - `ticket_id` —— 原样取自入参 `ticket.number`（如 `INC95528`）。**绝不编造**。
   - `status` —— 取值**限定**为这三个，不要自创（原系统的状态机只认这几种，
     多一个词它就落不了库；传别的工具会直接报错）：
-    - `resolved`：本次已修复并提交（入参 `commit` 里有非空 `pr_url`）
-    - `failed`：修复没走完（`commit` 为空 / 没有 `pr_url`）
+    - `resolved`：**这次真的交付了** —— 入参里 `deploy.deployed == true`（滚上了线）
+      **且** `verify.passed == true`（滚上去之后冒烟验过）。**两个都要**：
+      `commit.pr_url` 非空只说明开了个 PR，`deploy` 只说明滚上去了，而
+      **它跑不跑得起来**只有 `verify` 说了算。
+      ⚠️ `verify.coverage == "health_only"` 时，`description` 要如实写成
+      「已上线并通过存活探测，**业务链路本次未验**」—— 不要写成"业务也验过了"。
+    - `failed`：修复没走完（`deploy` / `verify` 缺失，或 `deployed` / `passed` 不为 true）
     - `insufficient`：证据不足、根本没定位到可改的东西
   - `description` —— **一段话**（不是列表、不是 JSON 片段），讲清三件事：
     - 根因是什么（来自 `rca`）
-    - 做了什么处置（来自 `fix`；有 PR 就带上 PR 号）
+    - 做了什么处置（来自 `fix`；有 PR 就带上 PR 号），以及**交付到哪一步**
+      （合进主干 / 构建了镜像 / 滚上线 / 部署后验过哪一层 —— 来自 `merge` / `ci` /
+      `deploy` / `verify`）
     - 还有什么没做 / 有什么风险
     用运维值班同事能直接看懂的中文，**不要贴代码、不要贴 diff**。
 

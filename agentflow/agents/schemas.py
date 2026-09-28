@@ -312,6 +312,27 @@ FixPlanSchema = {
                         "required": ["type", "target", "action"],
                     },
                 },
+                #: **部署后怎么验**（2026-09-28 加）：交给 `verify-deploy` 节点打冒烟。
+                #:
+                #: 为什么放在 `plan` 层而不是每步一个：一个计划里往往既有止血步又有根治步，
+                #: 各自"怎么验"不同，而**交付前只需要一条能证伪整体的探针** ——
+                #: 放在步骤上会冒出"取哪一条"的新问题（`VERIFY_DEPLOY_NODE_PLAN` §4）。
+                #:
+                #: **`null` 是合法且常见的**：CPU 打满那类故障没有 HTTP 链路，
+                #: 修复是扩容不是改接口 —— 那时只探存活，输出带 `coverage: health_only`。
+                "verification_probe": {
+                    "type": ["object", "null"],
+                    "properties": {
+                        # 服务内**相对路径**（如 /quotation?orderId=ORD001）
+                        "path": {"type": "string"},
+                        # 修好之后该返回的码
+                        "expect": {"type": "integer"},
+                        # **故障态**返回的码 —— 必填，且必须与 expect 不同
+                        # （相同 ⇒ 这条探针没有鉴别力，下游会直接拒）
+                        "broken_expect": {"type": "integer"},
+                    },
+                    "required": ["path", "expect", "broken_expect"],
+                },
             },
             "required": ["summary", "steps"],
         }
@@ -435,6 +456,24 @@ DeployResultSchema = {
         "summary": {"type": "string"},
     },
     "required": ["deployed"],
+}
+
+SmokeResultSchema = {
+    "type": "object",
+    "properties": {
+        #: **结论字段**（进 `VERDICT_FIELDS`）：冒烟真的全过了才是 true。
+        "passed": {"type": "boolean"},
+        #: `business`（业务链路也验了）| `health_only`（**只验了存活**）。
+        #: ⚠️ 后者**不判红** —— 基础设施类故障没有 HTTP 链路是合法的，
+        #: 但必须**看得见**。见 `VERIFY_DEPLOY_NODE_PLAN` D6。
+        "coverage": {"type": "string"},
+        "pod": {"type": "string"},
+        "observed_image": {"type": "string"},
+        "probes": {"type": "array", "items": {"type": "object"}},
+        "failed": {"type": "array", "items": {"type": "object"}},
+        "summary": {"type": "string"},
+    },
+    "required": ["passed"],
 }
 
 PostmortemSchema = {

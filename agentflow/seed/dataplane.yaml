@@ -51,3 +51,6 @@ bindings:
   # 写成纯文本 ⇒ 最终表现是"未输出合法 JSON"，中间没有一步会说"绑定缺失"。
   # 已开通租户改这一行要 `make sync-agents TENANT=<id>`（种子只对新租户生效）。
   deployer:        [deploy-ops]
+  # 同 `deployer`：工具全靠 MCP（本节点本地零工具）。它只读，但仍走同一台 server ——
+  # 因为「要探哪个 pod」是集群侧的事实，而 server 侧已经有那份目标表。
+  smoke-tester:    [deploy-ops]

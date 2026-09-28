@@ -1,4 +1,4 @@
-"""19-agent 编队注册表（design §7）。
+"""20-agent 编队注册表（design §7）。
 
 映射 agent 名 → 职责 / 工具可见性 / 输出 Schema。executor 的 node_runner
 通过 ``AGENT_REGISTRY`` 把节点调度到对应职能智能体。
@@ -44,6 +44,7 @@ FIX_AGENTS = [
     "merger",
     "ci-builder",
     "deployer",
+    "smoke-tester",
     "postmortem",
 ]
 
@@ -67,6 +68,7 @@ AGENT_DESCRIPTIONS: dict[str, str] = {
     "merger": "把本次 run 的 PR 合并到主干（校验 origin/分支/HEAD 三者一致，已合并则复用）",
     "ci-builder": "把主干上的代码编译打包并构建成镜像（tag = <服务>:<主干提交前 12 位>）",
     "deployer": "把构建好的镜像滚到集群上（工具全部来自 deploy-ops MCP server，本地无工具）",
+    "smoke-tester": "部署后对刚滚上去的 pod 打冒烟（健康层 + 业务链路；工具同样来自 deploy-ops）",
     "postmortem": "产出复盘报告",
 }
 
@@ -96,6 +98,8 @@ AGENT_STAGES: dict[str, str] = {
     "ci-builder": "deliver",
     # deployer 也在 deliver：committer→merger→ci-builder→deployer 是"把改动变成线上"的全程。
     "deployer": "deliver",
+    # smoke-tester 在 verify 段：与 tester / reviewer 同一段 —— 它回答的是"跑起来能不能响应"。
+    "smoke-tester": "verify",
     "postmortem": "learn",
 }
 

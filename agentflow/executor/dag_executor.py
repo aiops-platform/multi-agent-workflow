@@ -114,6 +114,9 @@ VERDICT_FIELDS = {
     # `deployed: false` ⇒ 节点判红。判据同上面几条：滚不上去而下游继续去回传工单
     # 说「已解决」，是这条链上最坏的形态。
     "deployer": "deployed",
+    # 冒烟没过 ⇒ 节点判红 ⇒ run failed ⇒ **工单不回传**。
+    # 判据同 `tester.passed`：只认 `is False`（缺字段/None 不判）。
+    "smoke-tester": "passed",
 }
 
 #: 「声称改了」≠「真改了」：这几个 agent 的输出里有一个**产物字段**（声称改了哪些文件），
