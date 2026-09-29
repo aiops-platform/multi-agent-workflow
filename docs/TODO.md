@@ -1881,3 +1881,24 @@ HTTP 500  耗时 10.02s     ← 正是那个 10.0s 轮询超时
 **顺带一条同一族的**：镜像现在只 `docker build` 到宿主本地的 docker/podman store，
 由 `minikube image load` 搬进集群 —— **没有 registry**。真形态应当 `docker push` 到 registry、
 集群自己 pull；那要先把 registry 与 k8s 侧凭证理清，与上面是同一件事的两半。
+
+---
+
+## 35. 指标链路的四个已知边界（2026-09-29 实测，**均未修**）
+
+> **谁在什么时刻读它**：接手"指标采集 / CPU 判定"这条链的人。
+> 背景：打通「CPU 持续高 → 自动成单 → 人点 Analyze」的端到端时实测出来的。
+> **①②在别的仓**，记在这里是因为它们直接影响这条链的**判定质量**。
+> 完整上下文见 `docs/todos/METRIC_PIPELINE_BEST_PRACTICE_zh-CN.md`。
+
+| # | 问题 | 位置 | 后果 |
+|---|---|---|---|
+| ① | `query_metrics` 的 `series` **只回传前 120 个点**（截断，不是等距降采样） | `aiops-mcp-servers/…/backends/prometheus.py:177`（`points[:120]`） | 实测 24h @step=30：Prometheus 返回 **988 点**、只回 **120 点**（覆盖窗口**开头那一小时**），而 `value`/`max` 是拿全部 988 点算的 ⇒ **数字来自整窗、曲线来自开头**。`metrics-analyst` 的提示词让它"看形状"，于是会被**静默**误导 |
+| ② | `signal_snapshot` **只写不读**、无保留/归档；且 `snapshot_ts` 存的是**写库时刻**（信号自己的事件时间根本没入库） | `aiops-apm-anomaly-detector/…/storage/snapshots.py`；`V1__init_tables.sql:207` 的注释自己写着"建议按 snapshot_ts 分区/定期归档" | APM 侧**没有可回溯的历史序列**。"真实历史基线"在设计文档里被当成这张表的用途（`apm-alert-module-design.md:640`），而 `simple_compare` 的 baseline 其实是个**静态参数** |
+| ③ | 超集并入的**已知边界**：同时存在两个**互不包含**的 partial 单（{A} 与 {B}）时，新的 {A,B} 只能并进其中一条 | `aiops-apm-anomaly-detector/…/storage/records.py` 的 `_superset_candidate`（注释里也写了） | 另一条要等它的异常消失后由 sweep 关掉 ⇒ 一次故障仍可能留两条记录（比修复前少得多） |
+| ④ | `records._merge_into` 的 **PG SQL 没有真库用例** | `tests/test_pg_integration.py` 是 skip-gated 的道 | 它目前只被**一次活体验证**兜着（`PR-20260929-0382`：两条线差一分钟越线、最终并成一条两个 anomaly） |
+
+**优先级**：**①最高** —— 它会让诊断链**静默给出错的形状判断**（其余三条是覆盖面/概率问题）。
+修法二选一：把 `points[:120]` 换成**等距降采样**，或按窗口长度**自适应 `step_seconds`**。
+
+**都不阻塞这条链当下能用**，所以没有排在 §1–§5 那批生产阻塞项里。
