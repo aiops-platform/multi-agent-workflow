@@ -268,7 +268,7 @@ class PgMCPStore:
         from psycopg import AsyncConnection
         from psycopg.rows import dict_row
 
-        self._conn = await AsyncConnection.connect(self._dsn)
+        self._conn = await AsyncConnection.connect(self._dsn, autocommit=True)
         self._conn.row_factory = dict_row
         await self._conn.execute(_PG_SCHEMA)
         await self._migrate()

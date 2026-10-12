@@ -53,7 +53,7 @@ class KafkaQueue(Queue):
             self._consumers[topic] = KafkaConsumer(
                 topic,
                 bootstrap_servers=self._bootstrap,
-                group_id=self._group_id,
+                group_id=f"{self._group_id}-{topic}",   # 【本机改动】每 topic 独立消费组
                 auto_offset_reset="earliest",
                 enable_auto_commit=True,  # at-least-once：重复消费由 §8.4 幂等兜底
                 value_deserializer=lambda b: json.loads(b.decode("utf-8")),

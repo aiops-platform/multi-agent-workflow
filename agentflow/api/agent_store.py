@@ -277,7 +277,7 @@ class PgAgentConfigStore:
         from psycopg import AsyncConnection
         from psycopg.rows import dict_row
 
-        self._conn = await AsyncConnection.connect(self._dsn)
+        self._conn = await AsyncConnection.connect(self._dsn, autocommit=True)
         self._conn.row_factory = dict_row
         await self._conn.execute(_PG_SCHEMA)
         # 老库结构迁移：表早已存在时 IF NOT EXISTS 不补列 → 按 _MIGRATION_COLUMNS 受保护 ALTER
