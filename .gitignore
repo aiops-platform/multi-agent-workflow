@@ -28,6 +28,11 @@ tmp/
 
 # 沙箱镜像构建产物
 docker/sandbox/wheels/
+# 本机为绕开 services.gradle.org 的 14 KB/s 而预置的 gradle wrapper 缓存
+# （`Dockerfile.java21` 的 COPY 依赖它，目录名就是 distributionUrl 的哈希，与测试床服务逐字一致）。
+# **不进仓库**：146MB / 307 文件的第三方发行版，且只对那条慢链路上有意义。
+# 不 ignore 的实际风险：谁敲一次 `git add -A` 就会把它推进去。
+docker/sandbox/gradle-seed/
 
 # IDE / OS
 .idea/
