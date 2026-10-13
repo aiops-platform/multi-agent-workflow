@@ -343,7 +343,7 @@ class PgTicketStore:
         from psycopg import AsyncConnection
         from psycopg.rows import dict_row
 
-        self._conn = await AsyncConnection.connect(self._dsn)
+        self._conn = await AsyncConnection.connect(self._dsn, autocommit=True)
         self._conn.row_factory = dict_row
         await self._conn.execute(_PG_SCHEMA)
         # 旧库补列，必须早于建索引（与 SQLite 侧同因）；PG 原生支持 IF NOT EXISTS

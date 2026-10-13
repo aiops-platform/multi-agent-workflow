@@ -112,7 +112,7 @@ class PostgresStateStore(StateStore):
     async def connect(self) -> None:
         from psycopg import AsyncConnection
 
-        self._conn = await AsyncConnection.connect(self._dsn)
+        self._conn = await AsyncConnection.connect(self._dsn, autocommit=True)
         await self._conn.execute(_SCHEMA)
         await self._conn.commit()
 
@@ -371,21 +371,25 @@ class PostgresStateStore(StateStore):
 
     # ---- node_traces：节点级事件流水明细（先删后插 → retry/resume 只留末次成功 attempt 全量流水）----
     async def replace_node_traces(self, run_id, node_id, tenant_id, *, rows) -> None:
-        await self._c.execute(
-            "DELETE FROM node_traces WHERE run_id=%s AND node_id=%s", (run_id, node_id)
-        )
-        if rows:
-            # ts 依赖列 DEFAULT now()；seq 按传入顺序从 0 重算。
-            # 注意：psycopg3 AsyncConnection 无 executemany（那是 cursor 的方法）→ 逐行 execute。
-            async with self._conn.cursor() as cur:
-                for i, r in enumerate(rows):
-                    await cur.execute(
-                        "INSERT INTO node_traces(run_id, node_id, tenant_id, seq, kind, name, payload)"
-                        " VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb)",
-                        (run_id, node_id, tenant_id, i, r.get("kind", ""), r.get("name"),
-                         _j(r.get("payload", {}))),
-                    )
-        await self._c.commit()
+        # autocommit 下 DELETE 与 INSERT 会各自立即提交 —— 中途失败会留下
+        # 「删了没插」的空洞。用显式事务块把两者绑回一个原子单元。
+        # （实测 psycopg3 的 transaction() 块在 autocommit 连接上可用且异常能回滚）
+        async with self._conn.transaction():
+            await self._c.execute(
+                "DELETE FROM node_traces WHERE run_id=%s AND node_id=%s", (run_id, node_id)
+            )
+            if rows:
+                # ts 依赖列 DEFAULT now()；seq 按传入顺序从 0 重算。
+                # 注意：psycopg3 AsyncConnection 无 executemany（那是 cursor 的方法）→ 逐行 execute。
+                async with self._conn.cursor() as cur:
+                    for i, r in enumerate(rows):
+                        await cur.execute(
+                            "INSERT INTO node_traces(run_id, node_id, tenant_id, seq, kind, name, payload)"
+                            " VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb)",
+                            (run_id, node_id, tenant_id, i, r.get("kind", ""), r.get("name"),
+                             _j(r.get("payload", {}))),
+                        )
+        # 事务块退出即提交，无需再 commit
 
     async def get_node_traces(self, run_id, node_id=None, *, kind=None, limit=500) -> list[dict]:
         sql = "SELECT * FROM node_traces WHERE run_id=%s"
