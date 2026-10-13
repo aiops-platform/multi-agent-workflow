@@ -920,6 +920,7 @@ async def _with_latest_run(ctx: TenantContext, ticket: dict) -> dict:
             # strict=False：冻结快照
             wf = Workflow.load_yaml(snap["workflow_yaml"], strict=False)
         outcome = _run_outcome(wf, nodes_raw)
+        health = _run_health(nodes_raw)
     except (ValueError, yaml.YAMLError, WorkflowDAGError, KeyError, HTTPException):
         # run 被清理 / 快照坏掉 / 跨租户：如实给 None（前端退回显示工单自己的 status），
         # 而不是让整个列表 500。工单列表是入口页，它挂掉什么都做不了。
@@ -933,6 +934,8 @@ async def _with_latest_run(ctx: TenantContext, ticket: dict) -> dict:
             "run_id": rid,
             "status": _api_run_status(run["status"]),
             **outcome,
+            #: 执行健康度（见 _run_health）—— 与 outcome 互补，工单页也能看到"跑完了但有警告"
+            **health,
         },
     }
 
@@ -1200,6 +1203,67 @@ def _rejected_node(nodes_raw: dict) -> tuple[str, str] | None:
     return None
 
 
+def _run_health(nodes_raw: dict) -> dict:
+    """run 的**执行健康度**：agent 执行期间引擎观测到的错误（**不问模型的判断**）。
+
+    与 `_run_outcome` 同族、同层、同"现算不落库"的理由：判据来自冻结的 checkpoint，不可变、
+    可复现，所以不用动状态机（run.status / TERMINAL / Worker CAS 一律不碰）。
+
+    ## 它补的是什么
+
+    `_run_outcome` 回答"**为什么没有结论**"（中断 / 被否决），但答不了另一种情形：
+    **run 跑完了、结论看着也有，而某个 agent 其实没做成它该做的事**。
+    实测 `run_ff42fb7bb1`：`committer` 的 `ws_open_pr` 两次鉴权失败、代码从未推出去，
+    而 run 报 `done`、页面绿色、复盘还说"已在代码侧收尾" —— 没有任何地方把这件事说出来。
+
+    ## 数据从哪来
+
+    各节点输出里的 `_health`（保留键，**引擎注入**，见 `agents/health.py`）。
+    它随节点输出落库（`nodes.cp`），**零 schema 变更**。
+
+    ## 为什么只读不改
+
+    这一层**只派生展示**，不参与判定 —— 判定在 `dag_executor._raise_on_unmet_delivery`
+    （交付没成就已经把节点判失败了，run 根本走不到这里）。这里是让**没到失败程度**的
+    那些错误（"有错但目标达成了"）也能被看见，正是用户要的"警告并附上错误信息"。
+    """
+    failed_calls: list[dict] = []
+    unmet: list[str] = []
+    for nid, cp in (nodes_raw or {}).items():
+        out = cp.get("output") if isinstance(cp, dict) else None
+        # 保留键名与 agents/health.py 的 HEALTH_KEY、dag_executor.py 的 _HEALTH_KEY 同值
+        health = out.get("_health") if isinstance(out, dict) else None
+        if not isinstance(health, dict):
+            continue
+        unmet.extend(f"{nid}：{t}" for t in (health.get("unmet_delivery") or []))
+        for f in (health.get("failed") or []):
+            failed_calls.append({
+                "node": nid,
+                "agent": health.get("agent"),
+                "tool": f.get("tool"),
+                "impact": f.get("impact"),
+                "state": f.get("state"),
+                # 原始错误文本 —— 用户要求"要能看到错误信息"，这里如实带上
+                "error": f.get("error"),
+            })
+
+    # 上限：一条 run 可能积累很多失败调用，别把列表接口的响应撑爆（详情页看的是全量）
+    cap = 50
+    more = max(0, len(failed_calls) - cap)
+    return {
+        "health": {
+            #: 有工具调用出错（不论是否影响了目标），或承诺交付未完成
+            "degraded": bool(failed_calls) or bool(unmet),
+            #: 逐条错误：节点 / agent / 工具 / 分级 / 原始错误文本
+            "failed_calls": failed_calls[:cap],
+            #: 被截断的条数（未截断时为 None）
+            "failed_calls_truncated": more or None,
+            #: 承诺交付没做成的（正常情况下 run 已经 failed，这里是兜底可见性）
+            "unmet_delivery": unmet,
+        },
+    }
+
+
 def _run_outcome(wf: Workflow | None, nodes_raw: dict) -> dict:
     """run 的结论：**按图走完 / 中途中断 / 被否决**。三个字段一起给，调用方直接展开。
 
@@ -1300,6 +1364,9 @@ async def list_runs(
             #: **列表里也必须给**——Ticket Inbox 要据此把"中断""被否决"从"进行中"里
             #: 分出来，只有 status 的话它只能看到 ``success``，也就是"跑完了、没问题"。
             **_run_outcome(wf, nodes_raw),
+            #: 执行健康度：引擎在 agent 执行中观测到的错误（见 _run_health）。
+            #: **列表里也要给** —— 否则"跑完了但有警告"的 run 在列表中与干净的 run 无法区分。
+            **_run_health(nodes_raw),
             "total_tokens": tokens,
             "total_cost": cost,
             "inputs": run.get("inputs") or {},
@@ -1397,6 +1464,9 @@ async def get_run(run_id: str, ctx: TenantContext = Depends(get_tenant_context))
         #: ⚠️ ``status=success`` **不等于**有结论：审批超时被自动否决后，
         #: 下游照常收敛，run 一样报 success（实测 run_d8f3a5c560）。
         **_run_outcome(wf, nodes_raw),
+        #: 执行健康度：引擎观测到的工具错误 / 未完成的交付（见 _run_health）。
+        #: 与 outcome **互补**：outcome 答"为什么没有结论"，它答"结论背后有没有没做成的事"。
+        **_run_health(nodes_raw),
         #: 中断的落点（未中断时为 null）。**给人和程序同一个判据**——
         #: 不必去数 SKIPPED（那分不清"中断"与"正常跳过"）。
         "halt": (nodes.get(halted_node) or {}).get("output") if halted_node else None,

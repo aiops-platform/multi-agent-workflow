@@ -148,6 +148,11 @@ VERDICT_FIELDS = {
 #: 加一个 agent 就是加一条映射，别在别处写特判。
 ARTIFACT_FIELDS = {"fix-implementer": "files_changed"}
 
+#: 节点输出里**执行健康度**的保留键。与 `agents/health.py` 的 `HEALTH_KEY` **必须一致** ——
+#: 本模块刻意不 import `agents/`（避免反向依赖，与上面几张表就地维护同一个理由），
+#: 所以这里放一个同值常量。**改一处要改两处。**
+_HEALTH_KEY = "_health"
+
 #: 哪些工具算"写下了文件"（判据：它的入参里带着**目标路径**，成功即那份文件变了）。
 #: 加新的写工具时**必须**加进来，否则合法的修复会被判成编造（假阳性）。
 WORKSPACE_WRITE_TOOLS = frozenset({"ws_write_file", "sandbox_write_file"})
@@ -783,6 +788,61 @@ class DAGExecutor:
             output=output,
         )
 
+    def _raise_on_unmet_delivery(self, nid: str, output: Any) -> None:
+        """Agent 的**承诺交付**被调用过、却从未成功 → 判失败。
+
+        这是"agent 的目标是否达成"那一级的引擎侧判据，**不看模型说了什么**：
+        交付类工具（`impact="deliver"`，见 `agents/tools.py`）失败时一定 raise，
+        所以"调用过、从未成功过"是纯可观测事实。
+
+        ## 为什么必须有这一条
+
+        实测 `run_ff42fb7bb1`：`committer` 调了两次 `ws_open_pr`，两次都因鉴权失败；
+        agent 如实报了 `{"pr_url":"","pr_number":0}`，而**引擎判该节点 succeeded**，
+        run 终态 `done`、页面绿色 —— 代码从未推出去，下游复盘还总结成"已在代码侧收尾"。
+        根因是当时的判据全按 **agent 名**查表（`VERDICT_FIELDS` / `ARTIFACT_FIELDS`），
+        而 `committer` 不在任何一张表里。
+
+        本守卫改按 **agent 自报的健康度**判，**与 agent 名解耦** —— agent 用到哪个工具
+        就继承哪个语义，新增 agent 不需要在任何地方登记。
+
+        ## 为什么排在 `_raise_on_negative_verdict` 之前
+
+        三个守卫串行、**第一个 raise 赢**。verdict 守卫的 message 用的是 agent 的**转述**
+        （`output["summary"]`），先跑它会把**原始工具错误文本**丢掉 —— 而 `merger` /
+        `ci-builder` 恰恰同时命中两者，是最需要原始错误的那两个。这里先判、并把
+        `health.failed` 里的原文带进 message，才能满足"错误信息要看得见"。
+
+        ## 判不了就不判
+
+        `_health` 不存在（mock runner / 该 agent 没有任何失败且交付正常）→ 直接放行。
+        与 `_raise_on_unsupported_artifacts` 的"判不了就不判"同一条纪律：**不猜**。
+        """
+        health = output.get(_HEALTH_KEY) if isinstance(output, dict) else None
+        if not isinstance(health, dict):
+            return
+        unmet = [t for t in (health.get("unmet_delivery") or []) if t]
+        if not unmet:
+            return
+
+        # 把**原始错误文本**带上（用户要求："报错同时要能看到错误信息"）——
+        # 取自 health.failed 里同名工具的那些条目，不转述。
+        errs = [f for f in (health.get("failed") or []) if f.get("tool") in unmet]
+        detail = "；".join(
+            f"{e.get('tool')} → {e.get('state') or 'error'}：{(e.get('error') or '(无错误文本)')[:300]}"
+            for e in errs
+        ) or "（健康度里没有对应的错误明细）"
+
+        raise WorkflowNodeFailed(
+            nid,
+            RuntimeError(f"承诺交付未完成：{'、'.join(unmet)}"),
+            message=(
+                f"节点 {nid}（agent {health.get('agent') or '?'}）**没能交付**："
+                f"{'、'.join(unmet)} 被调用过，却从未成功。原始错误：{detail}"
+            ),
+            output=output,
+        )
+
     async def _create_ticket(self, node: Node, params: dict) -> dict:
         """``kind: ticket`` 的节点动作：在租户库里建一张工单。
 
@@ -926,6 +986,10 @@ class DAGExecutor:
                 output = await self._run_with_retry(
                     node, params, external_operation_id=self._external_operation_id(node, ctx)
                 )
+                # ⚠️ **交付守卫排在第一个**：三个守卫串行、第一个 raise 赢，而 verdict 守卫
+                # 的 message 用的是 agent 的**转述** —— 先跑它会把原始工具错误文本丢掉，
+                # 恰恰 merger / ci-builder 最需要那原文。见 `_raise_on_unmet_delivery`。
+                self._raise_on_unmet_delivery(nid, output)
                 self._raise_on_negative_verdict(nid, node.agent, output)
                 # 与上面那条同族、同在 `_run_with_retry` 之外：结论/产物对不上就判失败，
                 # `on_failure: continue` 拦不住（见 `ARTIFACT_FIELDS`）。

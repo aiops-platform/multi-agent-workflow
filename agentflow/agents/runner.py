@@ -18,6 +18,7 @@ from agentscope.model import ChatModelBase, ChatResponse
 
 from ..core.dag import Node
 from ..exec_context import current_tenant
+from .health import attach_health
 from .mcp import build_toolkit
 from .scopes import build_agent, build_permission_context, build_reasoning_model, run_agent
 from .transcript import K_LLM_CALL, K_NODE, K_TOOL_CALL, TraceRecorder, scan_denied_blocks
@@ -224,6 +225,8 @@ class AgentNodeRunner:
             system_prompt=cfg.system_prompt if cfg is not None else None,
             middlewares=[recorder],
         )
+        # 健康度中间件由 build_agent 无条件挂载（见 agents/health.py）；这里只负责取回
+        health_mw = getattr(a, "execution_health", None)
         user = params if isinstance(params, dict) and params else {"params": params}
 
         def _capture(out_obj, error: BaseException | None) -> None:
@@ -283,4 +286,8 @@ class AgentNodeRunner:
             _capture(None, exc)
             raise
         _capture(out, None)
-        return out
+        # 引擎注入健康度：它随 `node_attempts.output` 一起落库，**判据因此可在 resume 时
+        # 重新推导** —— `committer`/`merger`/`deployer` 等 SIDE_EFFECT_AGENTS 的尝试记录
+        # 在守卫之前就写好了，resume 会命中幂等缓存、不调 runner；不落库的话重新推导时
+        # "判不了就放行"，交付失败会被洗成成功。
+        return attach_health(out, health_mw.snapshot() if health_mw is not None else None)

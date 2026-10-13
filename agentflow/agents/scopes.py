@@ -116,19 +116,28 @@ def build_agent(
     system_prompt: str | None = None,
     middlewares: list | None = None,
 ) -> Agent:
+    from .health import ExecutionHealthMiddleware
     from .prompts import SYSTEM_PROMPTS
 
     ctx = permission_context or build_permission_context(name, tenant_id=tenant_id)
-    return Agent(
+    # 执行健康度：**无条件挂在这里**，而不是让调用方传 `middlewares=[...]`。
+    # `build_agent` 是全仓唯一的 agent 工厂（生产与测试都经它），挂这儿 = 每个 agent
+    # **天然继承**这条契约 —— 这才叫继承，而不是"记得加"。见 agents/health.py 的模块文档。
+    health = ExecutionHealthMiddleware(name)
+    a = Agent(
         name=name,
         # system_prompt 显式传入（DB 配置覆盖/自定义 agent）优先，否则用内置静态默认
         system_prompt=system_prompt or SYSTEM_PROMPTS.get(name, "你是 AI 运维平台智能体。"),
         model=model,
         toolkit=toolkit,
-        middlewares=middlewares or [],
+        # 健康度排在**最前**：它是契约，不是可选的采集插件（与 TraceRecorder 职责不同）
+        middlewares=[health, *(middlewares or [])],
         state=AgentState(permission_context=ctx),
         react_config=ReActConfig(max_iters=max_iters),
     )
+    # 暴露给 runner：判据要随节点输出交给 DAG 引擎（Agent 是普通类，可挂属性）
+    a.execution_health = health
+    return a
 
 
 class AgentOutputError(RuntimeError):
