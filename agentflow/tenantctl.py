@@ -353,16 +353,60 @@ def sandbox_workspace_roundtrip(url: str, workspace_root) -> list[str]:
     return []
 
 
+def _git_can_use_gh_credential(host: str = "github.com") -> bool:
+    """git 能不能为 ``host`` 取到一份凭证？**只回答有/无** —— 不返回、不打印、不留存其值。
+
+    ⚠️ 必须带 ``GIT_TERMINAL_PROMPT=0``：没有凭证的机器上 ``git credential fill``
+    会停下来**等用户名输入**，把体检挂死在那儿 —— 而"没有凭证"恰恰是要检出的情况。
+
+    出错一律返回 ``False``（**fail-safe 方向**）：体检里"误报有问题"是可接受的噪音，
+    "误报没事"才是这个函数存在的意义所在。
+    """
+    import os
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            ["git", "credential", "fill"],
+            input=f"protocol=https\nhost={host}\n\n",
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    out = getattr(r, "stdout", "") or ""
+    prefix = "password="
+    return any(
+        line.startswith(prefix) and line[len(prefix):].strip() for line in out.splitlines()
+    )
+
+
 def gh_preflight() -> list[str]:
-    """检查「建 PR」的能力（gh CLI + 凭证）是否就绪；空列表 = 就绪。
+    """检查「建 PR」的能力是否就绪；空列表 = 就绪。
 
     抽成独立函数是因为它有**两个消费方**：`_env_preflight`（provision 时提示）
     与 `scripts/doctor.py`（可安装的那个入口）。两份实现必然漂移。
 
     为什么值得体检：换一台机器就得重来一遍，而缺了它的表现不是报错，
     是**闭环静默断掉**（详见 `_env_preflight` 的 ④）。
+
+    ## 判据是「**git** 能不能用上 gh 的凭证」，不是「gh 登录了没」
+
+    这两件事**不相等**，而差的那一半恰好是 `ws_open_pr` 真正依赖的。那个工具
+    先跑 `git push`、再跑 `gh pr create`；**`gh` 只管自己的子命令**，它不会让
+    `git push` 自动带上凭证 —— git 要用上 gh 的凭证，得先配 `credential.helper`
+    （`gh auth setup-git` 干的就是写这一条）。
+
+    实测（2026-10-13，chenqian）：`gh auth status` 通、旧版预检返回 `[]`（"就绪"），
+    而 `ws_open_pr` 的 `git push` 照样报 `remote: No anonymous write access.`
+    —— 因为 `credential.helper` 是空的，git 压根不会去问 gh。
+    **预检说没事、闭环静默断掉**，正是这个函数最该防的情况，它自己却先犯了。
+
+    所以这里**直接探一下 git**。多花一次子进程，换来判据与真实故障同源。
     """
-    import os
     import shutil
     import subprocess
 
@@ -374,23 +418,37 @@ def gh_preflight() -> list[str]:
                 "装：`make doctor INSTALL=1`（或 brew install gh，见 https://cli.github.com）"
             )
         ]
-    # gh 自己认 GH_TOKEN / GITHUB_TOKEN —— 容器与 CI 里不必跑交互式登录
-    if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
+
+    # 放行**只看** git 探针。gh 自己的登录态仅用来把报错话说准
+    # （"没登"和"登了但 git 用不上"是两条不同的修法，混在一起会指错路）。
+    if _git_can_use_gh_credential():
         return []
+
+    logged_in = False
     try:
         r = subprocess.run(
             [exe, "auth", "status"], capture_output=True, text=True, timeout=10, check=False
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return [f"gh auth status 跑不起来（{type(exc).__name__}: {exc}）"]
-    if r.returncode != 0:
+        logged_in = r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        logged_in = False
+
+    if not logged_in:
         return [
             (
                 "gh 未登录 → 建 PR 会失败（症状同上）。二选一："
                 "① 交互：`gh auth login`；② 无人值守/容器：设 `GH_TOKEN=<PAT>`（需 repo scope）"
             )
         ]
-    return []
+    return [
+        (
+            "gh 已登录，但 **git 用不上它**：`credential.helper` 没配，"
+            "`ws_open_pr` 里先跑的那条 `git push` 会以匿名身份被拒"
+            "（`remote: No anonymous write access`）—— 而它后面的 `gh pr create` 是好的，"
+            "因为 gh 只管自己的子命令。**只设 GH_TOKEN 也不解决这一条。**"
+            "修：`gh auth setup-git`（一次性，写 ~/.gitconfig 的 credential.helper）"
+        )
+    ]
 
 
 async def provision(args) -> int:

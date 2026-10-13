@@ -748,11 +748,26 @@ async def ws_open_pr(service: str, title: str, body: str = "") -> dict:
 
     ## 自己的 `gh` 令牌不进我们的代码
 
-    建 PR 要凭证，而 `gh` CLI **自己**从 keychain 取 token（`gh auth status`
-    显示已登录）。我们不读、不转发、不落任何 GitHub 令牌 —— worker 进程里
-    因此**不存在**一个会被日志/异常/`repr` 带出去的 PAT 变量（§24 密钥卫生）。
+    建 PR 要凭证，而 `gh` CLI 自己取 token（keychain，或 `GH_TOKEN`）。我们不读、
+    不转发、不落任何 GitHub 令牌 —— worker 进程里因此**不存在**一个会被
+    日志/异常/`repr` 带出去的 PAT 变量（§24 密钥卫生）。
     这也是为什么它留在 worker 而不是进沙箱：**持有密钥的一方不执行不可信代码**，
     而沙箱里那份代码是不可信的。
+
+    ⚠️ **上面那句只对 `gh` 子命令成立，对紧邻的 `git push` 不成立 —— 这两条凭证路
+    是分开的，别把它们读成一条。**
+
+    本函数先 `git push`、后 `gh pr create`：
+
+    - `gh pr create` / `gh api`：`gh` **自己**带凭证，上面那段说的是它；
+    - `git push`：**git 不会去问 `gh`**。要用上 gh 的凭证，得先配
+      `credential.helper`（`gh auth setup-git` 写的就是这一条）。
+      没配时 git 以匿名身份推 → `remote: No anonymous write access`。
+
+    实测（2026-10-13，run_ff42fb7bb1）：`gh auth status` 是好的，
+    但 `credential.helper` 是空的，于是**推不出去**；而 `gh_preflight` 当时只查
+    `auth status`，报"就绪" —— 闭环静默断掉。体检的判据已随之改成探 git
+    （见 `tenantctl.gh_preflight`）。
 
     ## 三个边界
 

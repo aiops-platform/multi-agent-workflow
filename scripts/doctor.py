@@ -40,7 +40,7 @@
 | | 查什么 | 判据来源 |
 |---|---|---|
 | `_env_preflight` | 服务/CLI **在不在** | tenantctl（provision 的同一份） |
-| `gh_preflight` | 凭证**登没登** | tenantctl |
+| `gh_preflight` | **git 能不能用上** gh 的凭证 | tenantctl |
 | **`check_toolchain`** | 工具**版本对不对** | **`toolchain.toml`** |
 
 之所以必须单列：**版本漂移是静默的**。本仓实测 —— dev 依赖里 `ruff>=0.5` 无上界，
@@ -105,12 +105,17 @@ def install_gh() -> bool:
 
 
 #: gh 的凭证**装不了**：要么人交互登录，要么有人把 PAT 交出来。
-#: 两种都给出来，让跑这个脚本的人（或另一个 Claude Code）自己选。
-GH_CREDENTIAL_HELP = """  凭证无法自动配置，二选一：
+#: 都给出来，让跑这个脚本的人（或另一个 Claude Code）自己选。
+GH_CREDENTIAL_HELP = """  凭证无法自动配置，按情形选一条：
     ① 交互式（本机开发）    gh auth login
     ② 无人值守 / 容器 / CI  设 GH_TOKEN=<PAT>（需 repo scope）
        —— gh 自己会读这个环境变量，不需要本平台做任何事；
-          容器形态要把它挂进 worker 的 env（见 deploy/worker-deployment.yaml）"""
+          容器形态要把它挂进 worker 的 env（见 deploy/worker-deployment.yaml）
+    ③ **已登录但 git 用不上** gh auth setup-git
+       —— 症状：`gh auth status` 是好的，`ws_open_pr` 却报
+          `remote: No anonymous write access`。原因是 gh 只管**自己的**子命令，
+          `git push` 要用上它的凭证得先配 credential.helper，这条命令就是写它。
+          ②③ 不是二选一：容器里两个都要做。"""
 
 
 def check_toolchain() -> tuple[list[str], list[str]]:
@@ -274,7 +279,11 @@ def main() -> int:
 
     # 只有**凭证**问题才打那段说明 —— "没装 CLI" 的下一步是装，不是登录
     # （判据复用 gh_preflight，不在这里重新判一次）
-    if any("未登录" in p for p in gh_preflight()):
+    #
+    # ⚠️ 判据是「**不是**那条安装提示」，不是「含『未登录』」：`gh_preflight` 现在
+    # 还会报出「gh 登录了、但 git 用不上它」（credential.helper 没配）—— 那条里
+    # 没有"未登录"三个字，按老写法**恰好漏掉的就是这个已经发生过的真实故障**。
+    if any("未安装 gh CLI" not in p for p in gh_preflight()):
         print("\n[gh 凭证]")
         print(GH_CREDENTIAL_HELP)
 

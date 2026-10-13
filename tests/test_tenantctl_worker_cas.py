@@ -448,38 +448,121 @@ def test_gh_preflight_reports_missing_cli(monkeypatch) -> None:
     assert any("gh CLI" in p and "make doctor" in p for p in problems), problems
 
 
-def test_gh_preflight_accepts_token_env(monkeypatch) -> None:
-    """有 `GH_TOKEN` 就算就绪 —— 容器/CI 里不必交互登录。
+class _Proc:
+    """`subprocess.run` 的替身。按 argv[0] 分派，这样一次 monkeypatch 能同时
+    喂给"git 探针"和"gh auth status"两条路 —— 判决正是由**两条路的结果组合**得出的。"""
 
-    判据必须**先看环境变量再看 `auth status`**：无人值守环境本来就没有 keychain，
-    拿 `gh auth status` 的失败去报"未登录"会给出一个在那台机器上根本不成立的建议。
+    def __init__(self, *, git_password: str = "", gh_rc: int = 0) -> None:
+        self.git_password = git_password
+        self.gh_rc = gh_rc
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args, **kw):
+        self.calls.append(list(args))
+
+        class _R:
+            pass
+
+        r = _R()
+        if args[0] == "git":
+            # 探针只看 stdout 里有没有非空 password
+            r.stdout = f"protocol=https\nhost=github.com\npassword={self.git_password}\n"
+            r.returncode = 0
+        else:
+            r.stdout = ""
+            r.returncode = self.gh_rc
+        return r
+
+
+def test_gh_preflight_skips_probe_when_cli_missing(monkeypatch) -> None:
+    """没装 gh 时不必再探 git —— 那是根因，探针只会多跑一次子进程。"""
+    from agentflow import tenantctl
+
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    fake = _Proc()
+    monkeypatch.setattr("subprocess.run", fake)
+    tenantctl.gh_preflight()
+    assert fake.calls == [], f"没装 gh 就不该跑任何子进程，实际跑了 {fake.calls}"
+
+
+def test_gh_preflight_ok_when_git_can_get_credential(monkeypatch) -> None:
+    """就绪的判据：**git 能取到凭证**。"""
+    from agentflow import tenantctl
+
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/gh")
+    monkeypatch.setattr("subprocess.run", _Proc(git_password="ghp_x", gh_rc=0))
+    assert tenantctl.gh_preflight() == []
+
+
+def test_gh_preflight_reports_logged_in_but_git_cannot(monkeypatch) -> None:
+    """**这次事故本身**：`gh` 登录了、`gh auth status` 通过，但 git 取不到凭证。
+
+    旧版判据到 `auth status` 返回 0 就放行了 —— 于是预检说"就绪"，
+    而 `ws_open_pr` 里先跑的 `git push` 照样以匿名身份被拒（实测 run_ff42fb7bb1）。
+    修法不是"去登录 gh"（已经登了），而是 `gh auth setup-git`。
+    """
+    from agentflow import tenantctl
+
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/gh")
+    monkeypatch.setattr("subprocess.run", _Proc(git_password="", gh_rc=0))  # 已登录、但取不到
+    problems = tenantctl.gh_preflight()
+    assert any("git 用不上" in p and "gh auth setup-git" in p for p in problems), problems
+    # 必须**不能**把话说到"去登录"上 —— 那是错的修法，会让人白跑一趟
+    assert not any("未登录" in p for p in problems), problems
+
+
+def test_gh_preflight_rejects_token_env_without_helper(monkeypatch) -> None:
+    """**只设 `GH_TOKEN` 不算就绪。**
+
+    这条原先的断言是反的（有 TOKEN 就返回 `[]`）—— 它编码了"gh 能用 = git 能用"
+    这个错误信念。`GH_TOKEN` 只让 **gh 自己**有用；`git push` 仍要 `credential.helper`。
+    容器/CI 里同样得配（`gh auth setup-git` 或等价的 `git config`）。
     """
     from agentflow import tenantctl
 
     monkeypatch.setenv("GH_TOKEN", "ghp_x")
     monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/gh")
-    # 即便 auth status 会失败，也不该被调用
-    def _boom(*a, **k):  # pragma: no cover
-        raise AssertionError("有 GH_TOKEN 时不该再去问 auth status")
-
-    monkeypatch.setattr("subprocess.run", _boom)
-    assert tenantctl.gh_preflight() == []
+    monkeypatch.setattr("subprocess.run", _Proc(git_password="", gh_rc=0))
+    problems = tenantctl.gh_preflight()
+    assert problems, "只设 GH_TOKEN 但 git 取不到凭证时**必须**报出来"
 
 
 def test_gh_preflight_reports_not_logged_in(monkeypatch) -> None:
-    """装了但没登录 → 两条路都给出来（交互 / 环境变量）。"""
+    """装了、也没登录、git 也取不到 → 两条路都给出来（交互 / 环境变量）。"""
     from agentflow import tenantctl
 
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/gh")
-
-    class _R:
-        returncode = 1
-
-    monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
+    monkeypatch.setattr("subprocess.run", _Proc(git_password="", gh_rc=1))
     problems = tenantctl.gh_preflight()
     assert any("未登录" in p and "gh auth login" in p and "GH_TOKEN" in p for p in problems), problems
+
+
+def test_git_probe_disables_terminal_prompt(monkeypatch) -> None:
+    """探针必须带 `GIT_TERMINAL_PROMPT=0`。
+
+    不带的话，**没有凭证的机器上它会停下来等用户名输入**，把体检挂死在最需要它
+    给出结论的那台机器上。
+    """
+    from agentflow import tenantctl
+
+    seen: dict = {}
+
+    def _run(args, **kw):
+        seen["args"] = list(args)
+        seen["env"] = kw.get("env") or {}
+
+        class _R:
+            stdout = ""
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr("subprocess.run", _run)
+    assert tenantctl._git_can_use_gh_credential() is False
+    assert seen["args"][:2] == ["git", "credential"], seen
+    assert seen["env"].get("GIT_TERMINAL_PROMPT") == "0", seen
 
 
 # ======================================================================
