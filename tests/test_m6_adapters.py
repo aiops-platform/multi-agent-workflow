@@ -157,8 +157,32 @@ class _FakeTraceCursorCtx:
         return False
 
 
+class _FakeTraceTxn:
+    """事务块替身：进入/提交都记一笔，好让测试断言"那两条写在一个原子单元里"。"""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        self._conn.log.append(("txn_begin", ""))
+        return self
+
+    async def __aexit__(self, *exc):
+        # 异常路径不提交（与 psycopg3 的 transaction() 一致：异常则回滚）
+        if exc[0] is None:
+            self._conn.log.append(("txn_commit", ""))
+        else:
+            self._conn.log.append(("txn_rollback", ""))
+        return False
+
+
 class _FakeTraceConn:
-    """极简 psycopg3 AsyncConnection 面：只有 execute/cursor/commit，**没有 executemany**。"""
+    """极简 psycopg3 AsyncConnection 面：execute/cursor/commit/transaction，**没有 executemany**。
+
+    `transaction()` 是"连接开 autocommit"之后 `replace_node_traces` 新增的依赖 ——
+    autocommit 下 DELETE 与 INSERT 会各自立即提交，中途失败会留下「删了没插」的空洞，
+    所以两者被包进显式事务块。假连接必须跟着真实接口长，否则测试测的是旧契约。
+    """
 
     def __init__(self):
         self.log: list[tuple[str, str]] = []
@@ -169,6 +193,9 @@ class _FakeTraceConn:
 
     def cursor(self):
         return _FakeTraceCursorCtx(_FakeTraceCursor(self.log))
+
+    def transaction(self):
+        return _FakeTraceTxn(self)
 
     async def commit(self):
         self.committed = True
@@ -193,7 +220,15 @@ async def test_postgres_replace_node_traces_writes_via_cursor() -> None:
     sqls = " ".join(s for _, s in conn.log)
     assert "DELETE FROM node_traces" in sqls
     assert sqls.count("INSERT INTO node_traces") == 2  # 逐行插（seq 0,1）
-    assert conn.committed
+    # 原子性：DELETE 与 INSERT 必须在**同一个事务块**里 —— autocommit 下不包块的话，
+    # 中途失败会留下「删了没插」的空洞（只留末次 attempt 的流水就没了）。
+    assert ("txn_begin", "") in conn.log and ("txn_commit", "") in conn.log
+    assert ("txn_rollback", "") not in conn.log
+    # DELETE 必须**在事务块开始之后** —— 否则那两条写又回到各自立即提交的状态
+    assert conn.log.index(("txn_begin", "")) < next(
+        i for i, (k, s) in enumerate(conn.log) if k == "conn_execute" and "DELETE" in s
+    )
+    # 不再断言 conn.committed：实现已改为「事务块退出即提交」，末尾不再显式 commit()
 
 
 class _SettingsStub:
