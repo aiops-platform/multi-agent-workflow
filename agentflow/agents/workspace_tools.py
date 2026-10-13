@@ -46,8 +46,20 @@ _BUILD_TIMEOUT_SEC = 300
 # 120 秒会把「还在编译」误报成「测试失败」。
 _TEST_TIMEOUT_SEC = 300
 
-# git 子命令白名单（§4.6：无 pull/fetch/reset——run 期间禁止漂移）
-_GIT_ALLOWED = {"status", "diff", "add", "commit", "push", "rev-parse", "branch", "checkout", "log"}
+# git 子命令白名单（§4.6：无 pull/fetch/reset——run 期间禁止漂移）。
+#
+# `show` 是 2026-10-13 补的：它是**纯只读**（读对象、不碰网络、不改工作区），与已在表内的
+# `log`/`diff`/`status`/`rev-parse` 同类，漏掉纯属疏忽。实测 `run_bc41d9c418` 的 fix 节点：
+# agent 先 `log --oneline -5` 看到最近一次提交恰是同一个病灶（temp-leak 导致磁盘写满），
+# 想 `show --stat` 看它改了什么 → 被拒 → 只好改用 `log -1 -p <sha> -- <path>` 绕路，多烧一轮。
+# 那是**合格的排查行为**被工具面挡了，不是 agent 乱来。
+#
+# `checkout` 是同一次改动**移出**的：它没有任何安全形态 —— 裸调用就移动 HEAD
+# （`checkout <sha>` / `checkout <branch>`），`checkout -- <path>` 直接丢弃工作区改动
+# （刚写好的修复白做），`-f` 更强。而 §4.6 的不变式正是「run 期间 HEAD 必须等于 base_sha」。
+# 工作区该在哪个分支由 `WorkspaceManager.prepare_one` 建好（走 GitShell，不经这里），
+# 提示词里也从没让 agent 自己 checkout —— 所以这条纯粹是暴露面。
+_GIT_ALLOWED = {"status", "diff", "show", "add", "commit", "push", "rev-parse", "branch", "log"}
 
 #: `ws_git` / `ws_open_pr` 起的**子进程墙钟上限**（秒）。必须存在：git 与 gh 的若干路径
 #: 会停在交互式输入上（编辑器 / 凭证提示 / 分页器 / gh 的"选哪个仓"），没有它 = 节点
@@ -616,8 +628,28 @@ async def ws_git(service: str, args: list[str], message: str = "") -> dict:
         raise WorkspaceToolError("git 参数为空")
     sub = args[0]
     if sub not in _GIT_ALLOWED:
+        # 话术要点：**列出允许的子命令**，而不是只解释白名单的由来。
+        # 原话术写的是"（禁止 pull/fetch/reset）"——那解释的是**这条白名单为什么存在**，
+        # 不是**这次为什么被拒**。实测 `run_bc41d9c418`：agent 被拒的 `show` 跟那三条毫无关系，
+        # 读到的信息量为零，只能自己另找等价写法（`log -1 -p <sha> -- <path>`）。
+        # 报错的第一职责是让调用方**能自我纠正**。
         raise WorkspaceToolError(
-            f"git 子命令不在白名单: {sub!r}（禁止 pull/fetch/reset——§4.6 版本冻结）"
+            f"git 子命令不在白名单: {sub!r}。"
+            f"允许的是：{', '.join(sorted(_GIT_ALLOWED))}"
+            "（无 pull/fetch/reset——§4.6 版本冻结：run 期间工作区 HEAD 必须等于 base_sha）"
+        )
+    if sub == "branch" and any(not a.startswith("-") for a in args[1:]):
+        # `branch` 只放行**只读**用法。判据是"有没有位置参数"，一条规则盖住所有写形态：
+        #   branch <名字>      → 新建分支
+        #   branch -D <名字>   → 删分支（**会删掉本 run 的分支**，随后的 ws_open_pr 直接失效）
+        #   branch -m/-M a b   → 改名
+        # 纯 flag 调用（`branch` / `branch -a` / `branch -vv` / `branch --list`）是读，放行。
+        # §4.6 的不变式是「本 run 期间 HEAD 与分支都不得漂移」——`-D` 恰好能破坏它。
+        raise WorkspaceToolError(
+            "git branch 只允许**只读**用法（可带 flag，不可带位置参数）——"
+            "§4.6 版本冻结：本 run 的分支由工作区准备建好，不允许新建/删除/改名。"
+            f"被拒的参数：{[a for a in args[1:] if not a.startswith('-')]!r}。"
+            "要看分支请用 `['branch', '-a']`。"
         )
     if sub == "commit" and not (_commit_message_in_args(args) or message):
         # 两种传法都收（`['commit','-m','…']` 与 `message='…'`）：签名上摆着 message，
