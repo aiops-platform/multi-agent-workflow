@@ -357,6 +357,98 @@ async def test_ws_git_stdin_message_fails_loudly(tmp_path, monkeypatch) -> None:
 
 
 # ----------------------------------------------------------------------
+# ws_git 子命令白名单：show 放行 / checkout 拒绝 / branch 只读
+# ----------------------------------------------------------------------
+def test_git_whitelist_includes_show_and_excludes_checkout() -> None:
+    """`show` 是纯只读，该在表里；`checkout` 没有任何安全形态，不该在表里。
+
+    实测背景 `run_bc41d9c418` 的 fix 节点：agent 先 `log --oneline -5` 看到最近一次提交
+    恰是**同一个病灶**（temp-leak 导致磁盘写满），想 `show --stat` 看它改了什么 →
+    被白名单拒 → 只好绕成 `log -1 -p <sha> -- <path>`，多烧一轮。
+    那是**合格的排查行为**被工具面挡了，不是 agent 乱来。
+    """
+    from agentflow.agents.workspace_tools import _GIT_ALLOWED
+
+    assert "show" in _GIT_ALLOWED
+    assert "checkout" not in _GIT_ALLOWED, (
+        "checkout 裸调用就移 HEAD、`checkout -- <path>` 丢弃工作区改动，"
+        "与 §4.6「run 期间 HEAD 必须等于 base_sha」直接冲突"
+    )
+
+
+async def test_ws_git_show_is_allowed(tmp_path, monkeypatch) -> None:
+    """`show` 真的能跑（不只是常量表里有名字）。"""
+    from agentflow.agents.workspace_tools import ws_git
+
+    service, _repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    try:
+        out = await ws_git(service, ["show", "--stat", "HEAD"])
+        assert out.get("rc") == 0
+    finally:
+        _reset(toks)
+
+
+async def test_ws_git_rejection_lists_what_is_allowed(tmp_path, monkeypatch) -> None:
+    """被拒时的报错**必须列出允许的子命令** —— 报错的第一职责是让调用方能自我纠正。
+
+    原话术是"（禁止 pull/fetch/reset）"，那解释的是**白名单为什么存在**，
+    不是**这次为什么被拒**：实测被拒的 `show` 跟那三条毫无关系，读到的信息量为零。
+    """
+    from agentflow.agents.workspace_tools import WorkspaceToolError, ws_git
+
+    service, _repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(WorkspaceToolError) as ei:
+            await ws_git(service, ["checkout", "main"])
+        msg = str(ei.value)
+        assert "不在白名单" in msg and "'checkout'" in msg
+        # 关键：把**允许的**列出来
+        assert "允许的是：" in msg
+        assert "show" in msg and "diff" in msg and "log" in msg
+    finally:
+        _reset(toks)
+
+
+@pytest.mark.parametrize("args", [
+    ["branch", "-a"],       # 列全部
+    ["branch", "-vv"],      # 带跟踪信息
+    ["branch", "--list"],   # 显式列
+    ["branch"],             # 裸调用 = 列出
+])
+async def test_ws_git_branch_readonly_forms_are_allowed(args, tmp_path, monkeypatch) -> None:
+    """`branch` 的**读**用法放行（纯 flag，无位置参数）。"""
+    from agentflow.agents.workspace_tools import ws_git
+
+    service, _repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    try:
+        out = await ws_git(service, list(args))
+        assert out.get("rc") == 0
+    finally:
+        _reset(toks)
+
+
+@pytest.mark.parametrize("args", [
+    ["branch", "new-branch"],     # 新建
+    ["branch", "-D", "somebr"],   # 删（**会删掉本 run 的分支** → 后续 ws_open_pr 直接失效）
+    ["branch", "-m", "a", "b"],   # 改名
+])
+async def test_ws_git_branch_write_forms_are_rejected(args, tmp_path, monkeypatch) -> None:
+    """`branch` 的**写**用法拒绝 —— 一条规则盖住所有形态：**不许有位置参数**。
+
+    §4.6 的不变式是「本 run 期间 HEAD 与分支都不得漂移」。`-D` 恰好能破坏它，
+    而工作区该在哪个分支是 `WorkspaceManager.prepare_one` 建好的，不需要 agent 自己动。
+    """
+    from agentflow.agents.workspace_tools import WorkspaceToolError, ws_git
+
+    service, _repo, toks = _prepared_workspace(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(WorkspaceToolError, match="只允许"):
+            await ws_git(service, list(args))
+    finally:
+        _reset(toks)
+
+
+# ----------------------------------------------------------------------
 # 测试命令只能来自部署配置（不接受 LLM 传参）
 # ----------------------------------------------------------------------
 def test_ws_run_tests_has_no_command_parameter() -> None:

@@ -11,6 +11,18 @@ from dataclasses import dataclass
 from typing import Any
 
 
+#: 工具失败的**后果分级** —— 引擎判"agent 的目标是否达成"的依据（见 agents/health.py）。
+#:
+#: ⚠️ 这三个值**必须在 TOOL_REGISTRY 里逐条显式声明**，没有"合理默认"这回事：
+#: `ToolSpec.impact` 的默认值是空串，未声明会被契约测试（tests/test_tool_impact.py）拦下。
+#: 之所以做成"必须声明"而不是"给个默认"，是因为**默认值会让漏声明的新工具静默走进盲区**
+#: —— 而"新 agent 不必逐表登记"正是这套机制存在的理由，它自己更不能靠人记得填。
+IMPACT_READ = "read"        # 只读。失败只记健康度（探索时试错是常态，不该判故障）
+IMPACT_EFFECT = "effect"    # 有副作用。失败记健康度；**不**单独判节点成败（可能只是换条路走）
+IMPACT_DELIVER = "deliver"  # 承诺交付。**被调用过、却从未成功 ⇒ 目标未达成 ⇒ 节点失败**
+IMPACTS = frozenset({IMPACT_READ, IMPACT_EFFECT, IMPACT_DELIVER})
+
+
 @dataclass
 class ToolSpec:
     name: str
@@ -21,6 +33,10 @@ class ToolSpec:
     level: str = "L1"  # L1 只读 | L2 执行
     needs_approval: bool = False
     description: str = ""
+    #: 失败后果分级，取值见上面三个 IMPACT_* 常量。**空串 = 未声明**，契约测试会拦。
+    #: 与 `level` 正交：`level` 管"经哪条路执行"（并被 UI 拿去算自治 tier），
+    #: 这个管"失败了算不算没做成"。
+    impact: str = ""
 
 
 TOOL_REGISTRY: dict[str, ToolSpec] = {
@@ -37,6 +53,8 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         ["knowledge-lookup", "root-cause"],
         timeout=30,
         level="L1", description="知识图谱检索",
+    
+        impact="read",
     ),
     # ---- L2 执行工具（M4 接入沙箱 / Action Executor）----
     "sandbox_run_shell": ToolSpec(
@@ -44,45 +62,61 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         ["fix-implementer", "tester"],
         timeout=300, rate_limit=10, result_limit=1_000_000,
         level="L2", description="沙箱内执行 shell",
+    
+        impact="effect",
     ),
     "sandbox_run_python": ToolSpec(
         "sandbox_run_python",
         ["fix-implementer", "tester"],
         timeout=300, rate_limit=10,
         level="L2", description="沙箱内执行 python",
+    
+        impact="effect",
     ),
     "sandbox_write_file": ToolSpec(
         "sandbox_write_file",
         ["fix-implementer"],
         timeout=60,
         level="L2", description="沙箱内写文件（writable_allowlist 内）",
+    
+        impact="effect",
     ),
     "scale_deployment": ToolSpec(
         "scale_deployment",
         ["infra-remediator"],
         timeout=60, needs_approval=True,
         level="L2", description="扩缩容 Deployment（参数白名单）",
+    
+        impact="effect",
     ),
     "restart_pod": ToolSpec(
         "restart_pod",
         ["infra-remediator"],
         timeout=60, needs_approval=True,
         level="L2", description="重启 Pod（白名单）",
+    
+        impact="effect",
     ),
     # ---- 工作区工具（修复侧；§8.7 真实读写代码，实现见 workspace_tools.py）----
     # 路径/命令白名单在 workspace_tools 内强制（工作区前缀 + git 子命令白名单）。
     "ws_read_file": ToolSpec(
         "ws_read_file", ["fix-implementer", "tester", "reviewer", "code-locator"],
         timeout=30, level="L1", description="读本次 run 工作区内文件",
+    
+        impact="read",
     ),
     "ws_list_files": ToolSpec(
         "ws_list_files", ["fix-implementer", "tester", "reviewer", "code-locator"],
         timeout=30, level="L1", description="列出工作区内文件",
+    
+        impact="read",
     ),
     "ws_write_file": ToolSpec(
         "ws_write_file", ["fix-implementer"],
         timeout=60, needs_approval=True, level="L2",
         description="写工作区内文件（越界拒绝）",
+    
+        impact="effect",
     ),
     "ws_run_tests": ToolSpec(
         "ws_run_tests", ["tester", "fix-implementer"],
@@ -90,11 +124,15 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         # 描述要如实：命令**由部署配置给定**，调用方不能传。旧文案"白名单前缀"会让
         # 模型以为自己能指定命令——而那个"白名单"里含 `bash `，等于没有。
         description="执行该服务在部署配置中登记的测试命令（命令固定，不接受传参）",
+    
+        impact="effect",
     ),
     "ws_git": ToolSpec(
         "ws_git", ["committer", "fix-implementer"],
         timeout=120, needs_approval=True, level="L2",
         description="工作区内 git 操作（子命令白名单，无 pull/fetch/reset）",
+    
+        impact="effect",
     ),
     "ws_open_pr": ToolSpec(
         "ws_open_pr", ["committer"],
@@ -102,18 +140,24 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         # 「推分支」与「开 PR」收成一个工具：`ticket-done` 判"已交付"靠的是 pr_url，
         # 而"能推、但不能开 PR"会留下一个**系统性为空**的字段（见 workspace_tools.ws_open_pr）。
         description="把本次 run 的分支推到远端并开 PR（base 取仓库默认分支；已存在则复用）",
+    
+        impact="deliver",
     ),
     "patch_resources": ToolSpec(
         "patch_resources",
         ["infra-remediator"],
         timeout=60, needs_approval=True,
         level="L2", description="调整资源配额（范围受限）",
+    
+        impact="effect",
     ),
     "ws_build_artifact": ToolSpec(
         "ws_build_artifact", ["ci-builder"],
         timeout=300, level="L2",
         # 描述要如实：命令**由部署配置给定**（AGENTFLOW_BUILD_CMDS），调用方不能传。
         description="在本次 run 的工作区编译打包（命令固定，不接受传参）",
+    
+        impact="effect",
     ),
     # ---- 发布工具（实现见 release_tools.py）----
     # `ws_merge_pr` 是本仓第一个**动 git 主干**的工具：不可逆，所以合并方式固定 squash、
@@ -122,6 +166,8 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         "ws_merge_pr", ["merger"],
         timeout=120, needs_approval=True, level="L2",
         description="把本次 run 的 PR 合并到主干（squash；已合并则复用既有结果）",
+    
+        impact="deliver",
     ),
     # 与 `ws_build_artifact` 同属 ci 节点，但**这个进不了沙箱**（要 docker daemon/socket）
     # —— 所以它不叫 ws_*，走的是 release_tools 那条宿主侧的线。
@@ -129,6 +175,8 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         "ws_build_image", ["ci-builder"],
         timeout=900, level="L2",
         description="把工作区构建成镜像，tag = <service>:<主干合并提交前 12 位>",
+    
+        impact="deliver",
     ),
 }
 
